@@ -7,9 +7,6 @@
 logs/
 *.log
 
-# Output files
-outputs/
-contract_search_results/
 
 # Python
 __pycache__/

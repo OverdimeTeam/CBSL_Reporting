@@ -119,6 +119,17 @@ class NBDMF23IAAutomation:
         self.month_year = f"{month}-{year}"
         self.exceptions = []
         
+        # Per-run log file setup
+        self.run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.logs_dir = Path(__file__).parent / "logs"
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.run_log_file = self.logs_dir / f"NBD_MF_23_IA_{self.run_timestamp}.log"
+        self._file_log_handler = logging.FileHandler(self.run_log_file, encoding='utf-8')
+        self._file_log_handler.setLevel(logging.INFO)
+        self._file_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(self._file_log_handler)
+        logger.info(f"Run log file: {self.run_log_file}")
+        
         # File paths
         self.main_file = self._find_file_by_prefix("Prod. wise Class. of Loans")
         self.disbursement_file = self._find_file_by_prefix("Disbursement with Budget")
@@ -163,12 +174,20 @@ class NBDMF23IAAutomation:
             if self.excel_app:
                 self.excel_app.Quit()
                 logger.info("Excel application closed")
-                
+            
         except Exception as e:
             logger.error(f"Error closing Excel: {e}")
         finally:
             self.excel_app = None
             self.workbook = None
+            # Detach file log handler at end of run
+            try:
+                if hasattr(self, '_file_log_handler') and self._file_log_handler:
+                    logger.removeHandler(self._file_log_handler)
+                    self._file_log_handler.close()
+                    logger.info(f"Run log saved to: {self.run_log_file}")
+            except Exception:
+                pass
     
     def get_worksheet(self, sheet_name: str):
         """Get a worksheet by name"""
@@ -431,33 +450,88 @@ class NBDMF23IAAutomation:
             self.log_exception("1", f"Failed to copy disbursement data: {str(e)}")
             raise
     
+    def _normalize_contract(self, value):
+        """Normalize contract id for reliable matching across files.
+        - Uppercase, trim spaces
+        - Remove non-alphanumerics
+        - Convert numeric-like floats to int strings (e.g., 12345.0 -> '12345')
+        - Drop known sentinel '65535'
+        """
+        if value is None:
+            return None
+        try:
+            # Handle numeric-like
+            if isinstance(value, float):
+                if value.is_integer():
+                    s = str(int(value))
+                else:
+                    s = ("%f" % value).rstrip('0').rstrip('.')
+            elif isinstance(value, int):
+                s = str(value)
+            else:
+                s = str(value).strip().upper().replace(" ", "")
+                if s.startswith("'"):
+                    s = s[1:]
+                s = ''.join(ch for ch in s if ch.isalnum())
+            if s == '65535':
+                return None
+            return s
+        except Exception:
+            return None
+
+    def _zero_stripped(self, norm: str):
+        """Return a variant with leading zeros stripped for broader matching."""
+        if not norm:
+            return norm
+        i = 0
+        while i < len(norm) and norm[i] == '0':
+            i += 1
+        return norm[i:] if i > 0 else norm
+
     def step_2_vlookup_net_portfolio(self):
-        """Step 2: VLOOKUP data from Net Portfolio file to IA Working Sheet"""
+        """Step 2: VLOOKUP data from Net Portfolio file to IA Working Sheet (simulated in Python)"""
         try:
             logger.info("Step 2: Performing VLOOKUP from Net Portfolio file...")
             
-            # Find the Net Portfolio file dynamically
+            # Find the Net Portfolio file dynamically (prefix match allows 'Net Portfolio-...')
             net_portfolio_file = self._find_file_by_prefix("Net Portfolio")
             if not net_portfolio_file:
                 raise FileNotFoundError("Net Portfolio file not found")
             
             logger.info(f"Using Net Portfolio file: {net_portfolio_file}")
             
-            # Read net portfolio data using bulk method
-            net_portfolio_data = self.read_bulk_data_from_excel(net_portfolio_file)
+            # Read only required columns for speed
+            # Contract number is in column E (0-based index 4)
+            # Keep usecols order so index 0 is the contract key for fast access
+            # Mapped value columns (absolute Excel columns): C=2, AB=27, AM=38, AH=33, F=5, AI=34, H=7
+            np_usecols = [4, 2, 27, 38, 33, 5, 34, 7]
+            
+            # Try to read the worksheet named 'Net Portfolio'. If not found, read the first sheet.
+            try:
+                net_portfolio_data = self.read_bulk_data_from_excel(net_portfolio_file, sheet_name="Net Portfolio", usecols=np_usecols)
+            except Exception as read_err:
+                logger.warning(f"'Net Portfolio' sheet not found or failed to read ({read_err}); falling back to first sheet")
+                net_portfolio_data = self.read_bulk_data_from_excel(net_portfolio_file, usecols=np_usecols)
             
             if not net_portfolio_data:
                 logger.warning("No data found in Net Portfolio file")
                 return
             
-            # Get contract numbers from IA Working sheet (Column A, starting from row 3)
+            # Get all contract numbers from IA Working sheet (Column A, starting from row 3)
             contracts = []
+            normalized_contracts = set()
             row = 3
             while True:
                 contract = self.read_cell_value("IA Working", row, 1)  # Column A
                 if not contract:
                     break
-                contracts.append((row, contract))
+                norm = self._normalize_contract(contract)
+                norm_z = self._zero_stripped(norm) if norm else None
+                contracts.append((row, contract, norm, norm_z))
+                if norm:
+                    normalized_contracts.add(norm)
+                if norm_z:
+                    normalized_contracts.add(norm_z)
                 row += 1
             
             if not contracts:
@@ -466,67 +540,150 @@ class NBDMF23IAAutomation:
             
             logger.info(f"Found {len(contracts)} contracts in IA Working sheet")
             
-            # Create lookup dictionary for faster matching
-            # Map: Contract Number (A) -> {column mappings}
-            lookup_dict = {}
+            # Create per-column lookup dicts using normalized contract keys (with zero-stripped aliases)
+            client_code_lookup = {}
+            equipment_lookup = {}
+            purpose_lookup = {}
+            frequency_lookup = {}
+            contract_period_lookup = {}
+            interest_rate_lookup = {}
+            contract_amount_lookup = {}
+            
+            added = 0
             for row_data in net_portfolio_data:
-                if len(row_data) > 38:  # Ensure we have enough columns for AM (index 38)
-                    contract_key = row_data[0]  # Column A (Contract Number)
-                    if contract_key:  # Only add if contract key exists
-                        lookup_dict[contract_key] = {
-                            'client_code': row_data[2] if len(row_data) > 2 else None,      # Column C (CLIENT_CODE)
-                            'equipment': row_data[25] if len(row_data) > 25 else None,      # Column AB (EQT_DESC)
-                            'purpose': row_data[38] if len(row_data) > 38 else None,        # Column AM (PURPOSE)
-                            'frequency': row_data[33] if len(row_data) > 33 else None,      # Column AH (CON_RNTFREQ)
-                            'contract_period': row_data[5] if len(row_data) > 5 else None,  # Column F (CONTRACT_PERIOD)
-                            'interest_rate': row_data[34] if len(row_data) > 34 else None, # Column AI (CON_INTRATE)
-                            'contract_amount': row_data[7] if len(row_data) > 7 else None   # Column H (CONTRACT_AMOUNT)
-                        }
+                if not row_data or len(row_data) < 2:
+                    continue
+                raw_key = row_data[0]
+                norm_key = self._normalize_contract(raw_key)
+                if not norm_key:
+                    continue
+                norm_key_z = self._zero_stripped(norm_key)
+                # Only keep rows whose contracts exist in IA Working set
+                if norm_key not in normalized_contracts and norm_key_z not in normalized_contracts:
+                    continue
+                
+                # Helper to assign to both key variants
+                def assign(dct, val):
+                    if val is None:
+                        return
+                    if norm_key in normalized_contracts:
+                        dct[norm_key] = val
+                    if norm_key_z in normalized_contracts:
+                        dct[norm_key_z] = val
+                
+                # Index mapping after usecols (contract key at index 0 now):
+                # 0: Contract(E), 1: CLIENT_CODE(C), 2: EQT_DESC(AB), 3: PURPOSE(AM),
+                # 4: CON_RNTFREQ(AH), 5: CONTRACT_PERIOD(F), 6: CON_INTRATE(AI), 7: CONTRACT_AMOUNT(H)
+                assign(client_code_lookup, row_data[1] if len(row_data) > 1 else None)
+                assign(equipment_lookup, row_data[2] if len(row_data) > 2 else None)
+                assign(purpose_lookup, row_data[3] if len(row_data) > 3 else None)
+                assign(frequency_lookup, row_data[4] if len(row_data) > 4 else None)
+                assign(contract_period_lookup, row_data[5] if len(row_data) > 5 else None)
+                assign(interest_rate_lookup, row_data[6] if len(row_data) > 6 else None)
+                assign(contract_amount_lookup, row_data[7] if len(row_data) > 7 else None)
+                added += 1
             
-            logger.info(f"Created lookup dictionary with {len(lookup_dict)} contracts from Net Portfolio")
+            logger.info("Created lookup dictionaries (normalized + zero-stripped):")
+            logger.info(f"  Client Code: {len(client_code_lookup)}")
+            logger.info(f"  Equipment: {len(equipment_lookup)}")
+            logger.info(f"  Purpose: {len(purpose_lookup)}")
+            logger.info(f"  Frequency: {len(frequency_lookup)}")
+            logger.info(f"  Contract Period: {len(contract_period_lookup)}")
+            logger.info(f"  Interest Rate: {len(interest_rate_lookup)}")
+            logger.info(f"  Contract Amount: {len(contract_amount_lookup)}")
             
-            # Process each contract and write data to the correct columns
+            # If matches look suspiciously low, auto-detect contract column and rebuild
+            min_reasonable = 100
+            if sum(len(d) for d in [client_code_lookup, equipment_lookup, purpose_lookup, frequency_lookup, contract_period_lookup, interest_rate_lookup, contract_amount_lookup]) < min_reasonable:
+                logger.warning("Low match count detected; attempting auto-detect of contract column on Net Portfolio sheet")
+                try:
+                    # Read full sheet to probe columns
+                    full_data = self.read_bulk_data_from_excel(net_portfolio_file)
+                    if full_data:
+                        # Determine candidate contract column by maximum overlap with IA normalized set
+                        max_overlap = -1
+                        best_col = 0
+                        # Limit scan to first 20 columns to keep reasonable
+                        scan_cols = min(20, max(len(r) for r in full_data if isinstance(r, (list, tuple))))
+                        for col_idx in range(scan_cols):
+                            overlap = 0
+                            for r in full_data[:1000]:  # sample
+                                if isinstance(r, (list, tuple)) and len(r) > col_idx:
+                                    nk = self._normalize_contract(r[col_idx])
+                                    nkz = self._zero_stripped(nk) if nk else None
+                                    if nk in normalized_contracts or nkz in normalized_contracts:
+                                        overlap += 1
+                            if overlap > max_overlap:
+                                max_overlap = overlap
+                                best_col = col_idx
+                        logger.info(f"Auto-detected contract column index: {best_col} with overlap {max_overlap}")
+                        # Rebuild lookups using detected contract column and absolute value columns
+                        client_code_lookup.clear(); equipment_lookup.clear(); purpose_lookup.clear(); frequency_lookup.clear(); contract_period_lookup.clear(); interest_rate_lookup.clear(); contract_amount_lookup.clear()
+                        for r in full_data:
+                            if not isinstance(r, (list, tuple)) or len(r) <= best_col:
+                                continue
+                            raw_key = r[best_col]
+                            nk = self._normalize_contract(raw_key)
+                            if not nk:
+                                continue
+                            nkz = self._zero_stripped(nk)
+                            if nk not in normalized_contracts and nkz not in normalized_contracts:
+                                continue
+                            def assign2(dct, val):
+                                if val is None:
+                                    return
+                                if nk in normalized_contracts:
+                                    dct[nk] = val
+                                if nkz in normalized_contracts:
+                                    dct[nkz] = val
+                            # Absolute indices: C=2, AB=27, AM=38, AH=33, F=5, AI=34, H=7
+                            assign2(client_code_lookup, r[2] if len(r) > 2 else None)
+                            assign2(equipment_lookup, r[27] if len(r) > 27 else None)
+                            assign2(purpose_lookup, r[38] if len(r) > 38 else None)
+                            assign2(frequency_lookup, r[33] if len(r) > 33 else None)
+                            assign2(contract_period_lookup, r[5] if len(r) > 5 else None)
+                            assign2(interest_rate_lookup, r[34] if len(r) > 34 else None)
+                            assign2(contract_amount_lookup, r[7] if len(r) > 7 else None)
+                        logger.info("Rebuilt lookups using auto-detected contract column")
+                except Exception as probe_err:
+                    logger.warning(f"Auto-detect fallback failed: {probe_err}")
+
+            # Prepare bulk write data arrays for each target column
+            client_code_data, equipment_data, purpose_data, frequency_data, contract_period_data, interest_rate_data, contract_amount_data = ([] for _ in range(7))
+            for row, contract, norm, norm_z in contracts:
+                key = norm if norm in client_code_lookup or norm in equipment_lookup or norm in purpose_lookup or norm in frequency_lookup or norm in contract_period_lookup or norm in interest_rate_lookup or norm in contract_amount_lookup else norm_z
+                client_code_data.append([client_code_lookup.get(key)])
+                equipment_data.append([equipment_lookup.get(key)])
+                purpose_data.append([purpose_lookup.get(key)])
+                frequency_data.append([frequency_lookup.get(key)])
+                contract_period_data.append([contract_period_lookup.get(key)])
+                interest_rate_data.append([interest_rate_lookup.get(key)])
+                contract_amount_data.append([contract_amount_lookup.get(key)])
+            
+            # Bulk write columns (C, D, E, I, J, M, P)
+            self.write_bulk_data("IA Working", 3, 3, client_code_data)       # Column C
+            self.write_bulk_data("IA Working", 3, 4, equipment_data)         # Column D
+            self.write_bulk_data("IA Working", 3, 5, purpose_data)           # Column E
+            self.write_bulk_data("IA Working", 3, 9, frequency_data)         # Column I
+            self.write_bulk_data("IA Working", 3, 10, contract_period_data)  # Column J
+            self.write_bulk_data("IA Working", 3, 13, interest_rate_data)    # Column M
+            self.write_bulk_data("IA Working", 3, 16, contract_amount_data)  # Column P
+            
+            # Count contracts with at least one mapped value
             processed_count = 0
-            for row, contract in contracts:
-                if contract in lookup_dict:
-                    data = lookup_dict[contract]
-                    
-                    # Write data to the specific columns (all starting from 3rd row)
-                    # Column C (Client Code) - from CLIENT_CODE (C column of Net Portfolio)
-                    if data['client_code'] is not None:
-                        self.write_cell_value("IA Working", row, 3, data['client_code'])
-                    
-                    # Column D (Equipment) - from EQT_DESC (AB column of Net Portfolio)
-                    if data['equipment'] is not None:
-                        self.write_cell_value("IA Working", row, 4, data['equipment'])
-                    
-                    # Column E (Purpose) - from PURPOSE (AM column of Net Portfolio)
-                    if data['purpose'] is not None:
-                        self.write_cell_value("IA Working", row, 5, data['purpose'])
-                    
-                    # Column I (Frequency) - from CON_RNTFREQ (AH column of Net Portfolio)
-                    if data['frequency'] is not None:
-                        self.write_cell_value("IA Working", row, 9, data['frequency'])
-                    
-                    # Column J (Contract Period) - from CONTRACT_PERIOD (F column of Net Portfolio)
-                    if data['contract_period'] is not None:
-                        self.write_cell_value("IA Working", row, 10, data['contract_period'])
-                    
-                    # Column M (Contractual Interest Rate) - from CON_INTRATE (AI column of Net Portfolio)
-                    if data['interest_rate'] is not None:
-                        self.write_cell_value("IA Working", row, 13, data['interest_rate'])
-                    
-                    # Column P (Contract Amount) - from CONTRACT_AMOUNT (H column of Net Portfolio)
-                    if data['contract_amount'] is not None:
-                        self.write_cell_value("IA Working", row, 16, data['contract_amount'])
-                    
+            for _, _, norm, norm_z in contracts:
+                if (
+                    (norm and (
+                        norm in client_code_lookup or norm in equipment_lookup or norm in purpose_lookup or norm in frequency_lookup or norm in contract_period_lookup or norm in interest_rate_lookup or norm in contract_amount_lookup
+                    )) or (
+                        norm_z and (
+                            norm_z in client_code_lookup or norm_z in equipment_lookup or norm_z in purpose_lookup or norm_z in frequency_lookup or norm_z in contract_period_lookup or norm_z in interest_rate_lookup or norm_z in contract_amount_lookup
+                        )
+                    )
+                ):
                     processed_count += 1
-                    
-                else:
-                    # Contract not found in Net Portfolio - log for debugging
-                    logger.debug(f"Contract {contract} not found in Net Portfolio - skipping VLOOKUP")
             
-            logger.info(f"Step 2 completed: VLOOKUP completed for {processed_count} out of {len(contracts)} contracts")
+            logger.info(f"Step 2 completed: VLOOKUP filled data for {processed_count} contracts (simulated, per column)")
             
         except Exception as e:
             self.log_exception("2", f"Failed to perform Net Portfolio VLOOKUP: {str(e)}")
@@ -642,159 +799,309 @@ class NBDMF23IAAutomation:
         try:
             logger.info("Step 5: Reorganizing rows with special values...")
             
-            # Get all rows from IA Working sheet
-            all_rows = []
+            # Read only Column B values first to identify rows to move (much faster)
+            rows_to_move = []
             row = 3
             while True:
                 contract = self.read_cell_value("IA Working", row, 1)  # Column A
                 if not contract:
                     break
                 
-                # Read all column values for this row
-                row_data = []
-                for col in range(1, 26):  # Read columns A-Z (1-26)
-                    value = self.read_cell_value("IA Working", row, col)
-                    row_data.append(value)
+                # Only read Column B value to check if row needs to be moved
+                b_value = self.read_cell_value("IA Working", row, 2)  # Column B
+                if b_value in ["00", "rg"]:
+                    rows_to_move.append(row)
                 
-                all_rows.append((row, row_data))
                 row += 1
             
-            if not all_rows:
-                logger.info("No rows found in IA Working sheet")
+            if not rows_to_move:
+                logger.info("Step 5 completed: No rows to reorganize")
                 return
             
-            # Find rows with "00" or "rg" in column B
-            rows_to_move = []
-            for row_num, row_data in all_rows:
-                b_value = row_data[1] if len(row_data) > 1 else None  # Column B (index 1)
-                if b_value in ["00", "rg"]:
-                    rows_to_move.append((row_num, row_data))
+            logger.info(f"Found {len(rows_to_move)} rows to reorganize")
             
-            if rows_to_move:
-                # Get the last row number to append new rows
-                last_row = all_rows[-1][0] + 1
+            # Get the last row number to append new rows
+            last_row = row - 1  # Last row with data
+            
+            # Read all data for rows that need to be moved in bulk
+            new_rows_data = []
+            for row_num in rows_to_move:
+                # Read entire row data at once
+                row_data = []
+                for col in range(1, 27):  # Columns A-Z (1-26)
+                    value = self.read_cell_value("IA Working", row_num, col)
+                    row_data.append(value)
                 
-                # Create new rows with updated values
-                new_rows_data = []
-                for row_num, row_data in rows_to_move:
-                    new_row_data = row_data.copy()
-                    # Update values
-                    if new_row_data[1] == "00":  # Column B
-                        new_row_data[1] = "FDL"
-                    elif new_row_data[1] == "rg":  # Column B
-                        new_row_data[1] = "Margin Trading"
-                    new_rows_data.append(new_row_data)
+                # Update Column B value
+                if row_data[1] == "00":  # Column B (index 1)
+                    row_data[1] = "FDL"
+                elif row_data[1] == "rg":  # Column B (index 1)
+                    row_data[1] = "Margin Trading"
                 
-                # Write new rows in bulk
-                for i, new_row_data in enumerate(new_rows_data):
-                    target_row = last_row + i
-                    # Write each column value
-                    for col_idx, value in enumerate(new_row_data):
-                        if col_idx < 26:  # Ensure we don't exceed column Z
-                            self.write_cell_value("IA Working", target_row, col_idx + 1, value)
+                new_rows_data.append(row_data)
+            
+            # Write all new rows in bulk at the bottom, skipping one blank line
+            if new_rows_data:
+                # Calculate target range for bulk write (leave one blank row)
+                start_row = last_row + 2
+                end_row = start_row + len(new_rows_data) - 1
                 
-                # Clear original rows with special values
-                for row_num, _ in rows_to_move:
-                    # Clear the entire row
-                    self.clear_range("IA Working", row_num, row_num, 1, 26)
+                # Prepare data in the correct format for bulk write (26 columns)
+                bulk_data = []
+                for row_data in new_rows_data:
+                    # Ensure we have exactly 26 columns
+                    while len(row_data) < 26:
+                        row_data.append(None)
+                    bulk_data.append(row_data[:26])  # Truncate to 26 columns if longer
                 
-                logger.info(f"Step 5 completed: {len(rows_to_move)} rows reorganized")
-            else:
-                logger.info("Step 5 completed: No rows to reorganize")
+                # Bulk write all new rows at once
+                target_range = f"A{start_row}:Z{end_row}"
+                worksheet = self.get_worksheet("IA Working")
+                worksheet.Range(target_range).Value = bulk_data
+                
+                logger.info(f"Bulk wrote {len(new_rows_data)} rows to {target_range} (after one blank row)")
+            
+            # Clear original rows with special values one-by-one to avoid clearing in-between rows
+            worksheet = self.get_worksheet("IA Working")
+            for r in sorted(rows_to_move, reverse=True):
+                worksheet.Range(f"A{r}:Z{r}").ClearContents()
+            logger.info(f"Cleared {len(rows_to_move)} original rows")
+            
+            logger.info(f"Step 5 completed: {len(rows_to_move)} rows reorganized using bulk operations with line skipping")
             
         except Exception as e:
             self.log_exception("5", f"Failed to reorganize special values: {str(e)}")
+            # Log additional debugging information
+            logger.error(f"Step 5 error details: {str(e)}")
+            logger.error(f"Rows to move count: {len(rows_to_move) if 'rows_to_move' in locals() else 'Not defined'}")
             raise
     
     def step_6_handle_na_contracts(self):
-        """Step 6: Handle #N/A contracts using bot API"""
+        """Step 6: Handle missing core fields using bot API (C,D,I,J,L,P) with retries"""
         try:
-            logger.info("Step 6: Handling #N/A contracts using bot API...")
+            logger.info("Step 6: Finding rows with missing C,D,I,J,L,P and fetching via bot...")
             
-            # Find contracts with #N/A in column C
-            na_contracts = []
+            # Find contracts with blanks in required columns
+            targets = []
             row = 3
             while True:
                 contract = self.read_cell_value("IA Working", row, 1)  # Column A
                 if not contract:
                     break
                 
-                c_value = self.read_cell_value("IA Working", row, 3)  # Column C
-                if c_value == "#N/A":
-                    na_contracts.append((row, contract))
+                # Read required columns
+                c_val = self.read_cell_value("IA Working", row, 3)   # C - client_code
+                d_val = self.read_cell_value("IA Working", row, 4)   # D - equipment
+                i_val = self.read_cell_value("IA Working", row, 9)   # I - frequency
+                j_val = self.read_cell_value("IA Working", row, 10)  # J - contract_period
+                l_val = self.read_cell_value("IA Working", row, 12)  # L - interest_rate
+                p_val = self.read_cell_value("IA Working", row, 16)  # P - contract_amount
+                
+                def _is_blank(v):
+                    return v is None or (isinstance(v, str) and v.strip() in ("", "#N/A"))
+                
+                if any([_is_blank(c_val), _is_blank(d_val), _is_blank(i_val), _is_blank(j_val), _is_blank(l_val), _is_blank(p_val)]):
+                    # Normalize contract string for bot requests/logging
+                    c_str = str(contract).strip()
+                    targets.append((row, c_str))
                 row += 1
             
-            if na_contracts:
-                # Call bot API to get contract data
-                contract_numbers = [contract for _, contract in na_contracts]
+            if not targets:
+                logger.info("Step 6: No rows with missing data in C,D,I,J,L,P")
+                return
+            
+            # De-duplicate contracts preserving first occurrence order
+            seen = set()
+            unique_targets = []
+            for row_idx, c in targets:
+                if c not in seen:
+                    seen.add(c)
+                    unique_targets.append((row_idx, c))
+            if len(unique_targets) != len(targets):
+                logger.info(f"Step 6: De-duplicated contracts: {len(targets)} -> {len(unique_targets)}")
+            targets = unique_targets
+            
+            requested_contracts = [c for _, c in targets]
+            logger.info(f"Step 6: Sending {len(requested_contracts)} contracts to bot for enrichment: sample {requested_contracts[:10]}")
+            
+            # Retry logic: attempt fetching data up to 3 times, narrowing to still-missing contracts
+            contract_data = {}
+            max_retries = 3
+            base_delay_sec = 5
+            missing_contracts = list(requested_contracts)
+            for attempt in range(1, max_retries + 1):
+                if not missing_contracts:
+                    break
                 try:
-                    contract_data = run_contract_search_bot(contract_numbers)
-                    
-                    # Update worksheet with returned data
-                    for row, contract in na_contracts:
-                        if contract in contract_data:
-                            data = contract_data[contract]
-                            
-                            # Update cells with bot data
-                            self.write_cell_value("IA Working", row, 3, data.get('client_code', ''))      # Column C
-                            self.write_cell_value("IA Working", row, 4, data.get('equipment', ''))        # Column D
-                            self.write_cell_value("IA Working", row, 10, data.get('contract_period', '')) # Column J
-                            self.write_cell_value("IA Working", row, 9, data.get('frequency', ''))        # Column I
-                            
-                            contract_amount = data.get('contract_amount', 0)
-                            at_limit = data.get('AT_limit', 0)
-                            
-                            if contract_amount == 0 and at_limit:
-                                self.write_cell_value("IA Working", row, 13, at_limit)  # Column M
-                            else:
-                                self.write_cell_value("IA Working", row, 16, contract_amount)  # Column P
-                    
-                    logger.info(f"Step 6 completed: Updated {len(na_contracts)} contracts with bot data")
-                    
+                    logger.info(f"Bot fetch attempt {attempt}/{max_retries} for {len(missing_contracts)} contracts")
+                    fetched = run_contract_search_bot(missing_contracts)
+                    returned_keys = list(fetched.keys()) if isinstance(fetched, dict) else []
+                    logger.info(f"Bot returned {len(returned_keys)} results on attempt {attempt}: sample {returned_keys[:10]}")
+                    if isinstance(fetched, dict):
+                        for k, v in fetched.items():
+                            # Normalize key
+                            key = str(k).strip()
+                            if key not in contract_data and v:
+                                contract_data[key] = v
+                    else:
+                        logger.warning("Bot returned unexpected payload; expected dict")
                 except Exception as bot_error:
-                    self.log_exception("6", f"Bot data generation failed: {str(bot_error)}")
-                    logger.warning("Bot data generation failed, continuing without contract data update")
-            else:
-                logger.info("Step 6 completed: No #N/A contracts found")
+                    self.log_exception("6", f"Bot invocation failed on attempt {attempt}: {str(bot_error)}")
+                
+                # Determine which contracts still have no data
+                still_missing = [c for c in missing_contracts if c not in contract_data]
+                logger.info(f"After attempt {attempt}: processed {len(missing_contracts) - len(still_missing)}, remaining {len(still_missing)}: sample {still_missing[:10]}")
+                missing_contracts = still_missing
+                if missing_contracts and attempt < max_retries:
+                    delay = base_delay_sec * attempt
+                    logger.info(f"Retrying bot for {len(missing_contracts)} contracts after {delay}s")
+                    time.sleep(delay)
+            
+            if missing_contracts:
+                logger.warning(f"Bot data missing for {len(missing_contracts)} contracts after retries: sample {missing_contracts[:10]}")
+            
+            # Update worksheet with returned data
+            def _apply_data_to_row(row_idx, data):
+                if self.read_cell_value("IA Working", row_idx, 3) in (None, '', '#N/A'):
+                    self.write_cell_value("IA Working", row_idx, 3, data.get('client_code', ''))      # C
+                if self.read_cell_value("IA Working", row_idx, 4) in (None, '', '#N/A'):
+                    self.write_cell_value("IA Working", row_idx, 4, data.get('equipment', ''))        # D
+                if self.read_cell_value("IA Working", row_idx, 10) in (None, '', '#N/A'):
+                    self.write_cell_value("IA Working", row_idx, 10, data.get('contract_period', '')) # J
+                if self.read_cell_value("IA Working", row_idx, 9) in (None, '', '#N/A'):
+                    self.write_cell_value("IA Working", row_idx, 9, data.get('frequency', ''))        # I
+                if self.read_cell_value("IA Working", row_idx, 12) in (None, '', '#N/A'):
+                    self.write_cell_value("IA Working", row_idx, 12, data.get('interest_rate', ''))   # L
+                existing_p = self.read_cell_value("IA Working", row_idx, 16)
+                if existing_p in (None, '', '#N/A', 0, '0'):
+                    amount = data.get('contract_amount')
+                    if amount in (None, '', '#N/A', 0, '0'):
+                        amount = data.get('AT_limit')
+                    if amount is not None:
+                        self.write_cell_value("IA Working", row_idx, 16, amount)  # P
+
+            updated = 0
+            for row_idx, contract in targets:
+                data = contract_data.get(contract)
+                if not data:
+                    continue
+                _apply_data_to_row(row_idx, data)
+                updated += 1
+
+            # Second pass: if still missing any of C,D,I,J,L,P, try bot again with retries
+            second_targets = []
+            for row_idx, contract in targets:
+                c2 = self.read_cell_value("IA Working", row_idx, 3)
+                d2 = self.read_cell_value("IA Working", row_idx, 4)
+                i2 = self.read_cell_value("IA Working", row_idx, 9)
+                j2 = self.read_cell_value("IA Working", row_idx, 10)
+                l2 = self.read_cell_value("IA Working", row_idx, 12)
+                p2 = self.read_cell_value("IA Working", row_idx, 16)
+                if any(v in (None, '', '#N/A', 0, '0') for v in (c2, d2, i2, j2, l2, p2)):
+                    second_targets.append((row_idx, contract))
+
+            if second_targets:
+                logger.info(f"Step 6: Second enrichment pass for {len(second_targets)} rows")
+                missing = [c for _, c in second_targets]
+                second_data = {}
+                for attempt in range(1, max_retries + 1):
+                    if not missing:
+                        break
+                    try:
+                        logger.info(f"Second pass bot fetch attempt {attempt}/{max_retries} for {len(missing)} contracts")
+                        fetched2 = run_contract_search_bot(missing)
+                        rkeys2 = list(fetched2.keys()) if isinstance(fetched2, dict) else []
+                        logger.info(f"Second pass returned {len(rkeys2)} results on attempt {attempt}: sample {rkeys2[:10]}")
+                        if isinstance(fetched2, dict):
+                            for k, v in fetched2.items():
+                                key = str(k).strip()
+                                if key not in second_data and v:
+                                    second_data[key] = v
+                    except Exception as bot_error:
+                        self.log_exception("6", f"Second pass bot failed on attempt {attempt}: {str(bot_error)}")
+                    missing = [c for c in missing if c not in second_data]
+                    logger.info(f"Second pass after attempt {attempt}: remaining {len(missing)}")
+                    if missing and attempt < max_retries:
+                        delay = base_delay_sec * attempt
+                        logger.info(f"Retrying second pass after {delay}s for {len(missing)} contracts")
+                        time.sleep(delay)
+
+                for row_idx, contract in second_targets:
+                    data = second_data.get(contract)
+                    if not data:
+                        continue
+                    _apply_data_to_row(row_idx, data)
+
+            total_requested = len(requested_contracts)
+            total_processed = len({c for c in requested_contracts if c in contract_data})
+            logger.info(f"Step 6 completed: requested {total_requested}, processed {total_processed}, missing {total_requested - total_processed}")
             
         except Exception as e:
-            self.log_exception("6", f"Failed to handle #N/A contracts: {str(e)}")
+            self.log_exception("6", f"Failed to handle missing contracts via bot: {str(e)}")
             raise
     
     def step_7_check_blank_cells(self):
         """Step 7: Check for blank cells and report exceptions"""
         try:
-            logger.info("Step 7: Checking for blank cells...")
+            logger.info("Step 7: Checking for blank cells (bulk)...")
+            
+            # Clean up any 65535 artifacts before validation
+            self._cleanup_65535_artifacts()
+            
+            # Determine last data row using Column A
+            last_row = self.find_last_row("IA Working", 1)
+            if last_row < 3:
+                logger.info("Step 7: No data rows found")
+                return
+            
+            # Read the entire data block in one go: A3:Z{last_row}
+            worksheet = self.get_worksheet("IA Working")
+            range_str = f"A3:Z{last_row}"
+            data = worksheet.Range(range_str).Value
+            
+            if not data:
+                logger.info("Step 7: No data in range")
+                return
+            
+            # Normalize Excel COM return shape to a list of rows
+            if isinstance(data, tuple):
+                if data and not isinstance(data[0], (tuple, list)):
+                    rows = [list(data)]
+                else:
+                    rows = [list(r) for r in data]
+            else:
+                rows = data
             
             blank_cells = []
-            row = 3
+            start_row_index = 3
             
-            # Check all columns except E (column 5)
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
+            for offset, row_vals in enumerate(rows):
+                row_num = start_row_index + offset
+                if not isinstance(row_vals, (list, tuple)):
+                    row_vals = [row_vals]
+                
+                # Contract number in Column A (index 0)
+                contract = row_vals[0] if len(row_vals) > 0 else None
                 if not contract:
-                    break
+                    continue
                 
-                # Check columns A-Z (1-26) except column E (5)
+                # Scan columns A..Z (1..26) except column E (5) and Z (26)
                 for col in range(1, 27):
-                    if col != 5:  # Skip column E
-                        cell_value = self.read_cell_value("IA Working", row, col)
-                        if cell_value is None or str(cell_value).strip() == "":
-                            blank_cells.append({
-                                'row': row,
-                                'column': col,
-                                'contract': contract
-                            })
-                
-                row += 1
+                    if col in (5, 26):
+                        continue
+                    value = row_vals[col - 1] if len(row_vals) >= col else None
+                    if value is None or (isinstance(value, str) and value.strip() == ""):
+                        blank_cells.append({
+                            'row': row_num,
+                            'column': col,
+                            'contract': contract
+                        })
             
             if blank_cells:
                 for blank in blank_cells:
-                    self.log_exception("7", 
-                                     f"Blank cell found at {chr(64 + blank['column'])}{blank['row']}", 
-                                     blank['contract'])
+                    self.log_exception("7", f"Blank cell found at {chr(64 + blank['column'])}{blank['row']}", blank['contract'])
             
-            logger.info(f"Step 7 completed: Found {len(blank_cells)} blank cells")
+            logger.info(f"Step 7 completed: Found {len(blank_cells)} blank cells via bulk read")
             
         except Exception as e:
             self.log_exception("7", f"Failed to check blank cells: {str(e)}")
@@ -964,6 +1271,9 @@ class NBDMF23IAAutomation:
                 
                 row += 1
             
+            # Cache for reuse in Step 11 to avoid re-scan
+            self._vehicles_machinery_rows = vehicles_machinery_rows
+            
             logger.info(f"Step 10 completed: Found {len(vehicles_machinery_rows)} Vehicles and Machinery rows")
             return vehicles_machinery_rows
             
@@ -986,61 +1296,74 @@ class NBDMF23IAAutomation:
             else:
                 logger.warning("Portfolio Report Recovery file not found - will skip fallback mapping")
             
-            # Get Vehicles and Machinery rows
-            vehicles_rows = self.step_10_filter_vehicles_machinery()
+            # Get Vehicles and Machinery rows from cache if available
+            vehicles_rows = getattr(self, '_vehicles_machinery_rows', None)
+            if vehicles_rows is None:
+                vehicles_rows = self.step_10_filter_vehicles_machinery()
             
-            # Create lookup dictionaries for faster matching
+            # Create lookup dictionaries using normalized contract number from Column H (index 7)
             po_lookup_dict = {}
             for row_data in po_listing_data:
-                if len(row_data) > 33:  # Ensure we have enough columns for AH (index 33)
-                    contract_a = row_data[0] if len(row_data) > 0 else None  # Column A
-                    contract_b = row_data[1] if len(row_data) > 1 else None  # Column B
+                if isinstance(row_data, (list, tuple)) and len(row_data) > 33:
+                    contract_h = row_data[7] if len(row_data) > 7 else None  # Column H
+                    key = self._normalize_contract(contract_h)
                     sell_price = row_data[33] if len(row_data) > 33 else None  # Column AH
-                    if contract_a and contract_b and contract_a == contract_b:
-                        po_lookup_dict[contract_a] = sell_price
+                    if key and sell_price is not None:
+                        po_lookup_dict[key] = sell_price
             
             portfolio_lookup_dict = {}
             if portfolio_recovery_data:
                 for row_data in portfolio_recovery_data:
-                    if len(row_data) > 33:  # Ensure we have enough columns
-                        contract_a = row_data[0] if len(row_data) > 0 else None  # Column A
-                        contract_b = row_data[1] if len(row_data) > 1 else None  # Column B
+                    if isinstance(row_data, (list, tuple)) and len(row_data) > 33:
+                        contract_h = row_data[7] if len(row_data) > 7 else None  # Column H
+                        key = self._normalize_contract(contract_h)
                         sell_price = row_data[33] if len(row_data) > 33 else None  # Column AH
-                        if contract_a and contract_b and contract_a == contract_b:
-                            portfolio_lookup_dict[contract_a] = sell_price
+                        if key and sell_price is not None:
+                            portfolio_lookup_dict[key] = sell_price
             
             # Process each Vehicles and Machinery row
+            missing_contracts = []
+            updated_rows = []
             for row in vehicles_rows:
                 contract = self.read_cell_value("IA Working", row, 1)  # Column A
+                key = self._normalize_contract(contract)
+                if not key:
+                    continue
                 
-                # First try Po Listing
-                if contract in po_lookup_dict:
-                    sell_price = po_lookup_dict[contract]
-                    self.write_cell_value("IA Working", row, 22, sell_price)  # Column V (index 21)
-                else:
-                    # Try Portfolio Recovery as fallback
-                    if contract in portfolio_lookup_dict:
-                        sell_price = portfolio_lookup_dict[contract]
-                        self.write_cell_value("IA Working", row, 22, sell_price)  # Column V (index 21)
-                    else:
-                        logger.warning(f"No Po Listing or Portfolio Recovery data found for contract {contract}")
-            
-            # Convert V column to numbers from row 3
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
+                sell_price = po_lookup_dict.get(key)
+                if sell_price is None:
+                    sell_price = portfolio_lookup_dict.get(key)
                 
-                v_value = self.read_cell_value("IA Working", row, 22)  # Column V (index 21)
-                if v_value and str(v_value).replace('.', '').replace('-', '').isdigit():
+                if sell_price is not None:
+                    # Skip if V cell has formula; preserve formulas
+                    if self.cell_has_formula("IA Working", row, 22):
+                        continue
+                    # Ensure numeric type
                     try:
-                        numeric_value = float(v_value)
-                        self.write_cell_value("IA Working", row, 22, numeric_value)  # Column V
-                    except ValueError:
+                        if isinstance(sell_price, str):
+                            sell_price = float(sell_price.replace(',', '').strip())
+                    except Exception:
                         pass
-                
-                row += 1
+                    self.write_cell_value("IA Working", row, 22, sell_price)  # Column V (index 21)
+                    updated_rows.append(row)
+                else:
+                    missing_contracts.append(contract)
+            
+            # Convert V column to numbers only for updated rows (and only if not formulas)
+            for row in updated_rows:
+                if self.cell_has_formula("IA Working", row, 22):
+                    continue
+                v_value = self.read_cell_value("IA Working", row, 22)  # Column V (index 21)
+                if isinstance(v_value, str):
+                    v_clean = v_value.replace(',', '').strip()
+                    try:
+                        v_value = float(v_clean)
+                    except Exception:
+                        continue
+                    self.write_cell_value("IA Working", row, 22, v_value)
+            
+            if missing_contracts:
+                logger.warning(f"No Po Listing or Portfolio Recovery data found for {len(missing_contracts)} contracts (sample: {missing_contracts[:20]})")
             
             logger.info("Step 11 completed: Po Listing mapping and Portfolio Recovery fallback")
             
@@ -1182,22 +1505,22 @@ class NBDMF23IAAutomation:
             logger.warning("WorkHub24 API not implemented - minimum rate needs manual input")
             
             # Placeholder for minimum rate
-            self.minimum_rate = 15.00  # Default value, should come from API
+            self.minimum_rate = 42.00  # Default value, should come from API
             logger.info(f"Using default minimum rate: {self.minimum_rate}%")
             
         except Exception as e:
             self.log_exception("14", f"Failed to import minimum rate: {str(e)}")
             self.log_exception("14", f"Step 14 failed: {str(e)}")
             # Set a default minimum rate to continue processing
-            self.minimum_rate = 15.00
+            self.minimum_rate = 42.00
     
     def step_15_check_interest_rates(self):
         """Step 15: Check interest rates against minimum rate"""
         try:
             logger.info("Step 15: Checking interest rates against minimum rate...")
             
-            # TODO: Get minimum rate from step 14
-            minimum_rate = 15.00  # Placeholder - should come from step 14
+            # Use the minimum rate from step 14, default to 42.00 if not set
+            minimum_rate = getattr(self, 'minimum_rate', 42.00)
             
             # Check L column values from row 3
             row = 3
@@ -1233,6 +1556,7 @@ class NBDMF23IAAutomation:
                 c39_value = self.read_cell_value("NBD-MF-23-IA", 39, 3)  # Row 39, Column C (index 3)
                 
                 if c39_value != 0:
+                    # Do not modify the workbook; just record for the exception report
                     self.log_exception("16", f"C39 cell value is {c39_value}, expected 0")
                     logger.error(f"Final validation failed: C39 = {c39_value}")
                 else:
@@ -1245,6 +1569,36 @@ class NBDMF23IAAutomation:
         except Exception as e:
             self.log_exception("16", f"Failed to validate C39 cell: {str(e)}")
             raise
+    
+    def step_17_cleanup_formatting(self):
+        """Cleanup: fix percent scaling in columns M and N, remove 65535 artifacts"""
+        try:
+            sheet = "IA Working"
+            worksheet = self.get_worksheet(sheet)
+            start_row = 3
+            last_row = self.find_last_row(sheet, col=1)
+
+            # 1) Fix percent scaling in columns M (13) and N (14): always divide by 100, but skip formulas
+            for row in range(start_row, last_row + 1):
+                for col in (13, 14):
+                    try:
+                        if self.cell_has_formula(sheet, row, col):
+                            continue
+                        val = self.read_cell_value(sheet, row, col)
+                        if isinstance(val, (int, float)):
+                            self.write_cell_value(sheet, row, col, float(val) / 100.0)
+                        elif isinstance(val, str) and val.strip():
+                            s = val.replace('%', '').replace(',', '').strip()
+                            num = float(s)
+                            self.write_cell_value(sheet, row, col, num / 100.0)
+                    except Exception:
+                        # Ignore parse errors for individual cells
+                        continue
+
+            logger.info("Cleanup step completed: percent scaling fixed")
+        except Exception as e:
+             self.log_exception("17", f"Cleanup formatting failed: {str(e)}")
+             raise
     
     def generate_exception_report(self):
         """Generate Excel report of all exceptions"""
@@ -1321,6 +1675,7 @@ class NBDMF23IAAutomation:
             self.step_14_minimum_rate_api()
             self.step_15_check_interest_rates()
             self.step_16_final_validation()
+            self.step_17_cleanup_formatting()
             
             # Generate exception report
             self.generate_exception_report()
@@ -1328,7 +1683,8 @@ class NBDMF23IAAutomation:
             logger.info("NBD-MF-23-IA automation completed successfully!")
             
         except Exception as e:
-            logger.error(f"Automation failed: {str(e)}")
+            logger.error(f"Automation failed: {e}")
+            # Ensure exception report is still generated
             self.generate_exception_report()
             raise
         finally:
@@ -1556,6 +1912,21 @@ class NBDMF23IAAutomation:
                 
         except Exception as e:
             logger.warning(f"Could not restore Excel performance: {e}")
+
+    def _cleanup_65535_artifacts(self):
+        """No-op: 65535 values are allowed; preserve all data and formulas."""
+        try:
+            return
+        except Exception:
+            return
+
+    def cell_has_formula(self, sheet_name: str, row: int, col: int):
+        """Return True if the specified cell contains a formula."""
+        try:
+            worksheet = self.get_worksheet(sheet_name)
+            return bool(worksheet.Cells(row, col).HasFormula)
+        except Exception:
+            return False
 
 
 def main():
