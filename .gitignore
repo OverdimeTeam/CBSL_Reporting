@@ -7,7 +7,6 @@
 logs/
 *.log
 
-
 # Python
 __pycache__/
 *.py[cod]
@@ -58,3 +57,12 @@ Thumbs.db
 *.tmp
 *.temp
 .cache/
+
+# Excel files
+*.xls
+*.xlsx
+*.xlsm
+
+# Working directories and outputs
+working/
+outputs/

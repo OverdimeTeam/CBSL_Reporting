@@ -1,28 +1,45 @@
 import os
-import sys
+import glob
+import pandas as pd
+from datetime import datetime, date
+import numpy as np
+import subprocess
 import json
 import logging
-from datetime import datetime
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-import pandas as pd
-import openpyxl
-from openpyxl import Workbook, load_workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
-import requests
-from contextlib import contextmanager
-import win32com.client
-import time
+import sys
+import traceback
+from typing import Dict, Optional, Tuple, Any
 
-# Add bots directory to path for imports
-bots_dir = Path(__file__).parent.parent / "bots"
-sys.path.append(str(bots_dir))
+# Create logs folder if it doesn't exist
+logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(logs_dir, exist_ok=True)
 
-# Configure logging first
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Create timestamp-based log file name
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = os.path.join(logs_dir, f"NBD_MF23_IA_Report_{timestamp}.log")
+
+# Enhanced logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
+    handlers=[
+        logging.FileHandler(log_file, mode='w', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
 logger = logging.getLogger(__name__)
+logger.info("="*80)
+logger.info("STARTING NEW SESSION - NBD_MF23_IA_Report")
+logger.info("Logging initialized. Logs are being written to %s", log_file)
+logger.info("="*80)
 
-# Import bot modules
+# Add the parent "bots" folder relative to this file
+current_dir = os.path.dirname(__file__)
+bot_dir = os.path.join(current_dir, "..", "bots")
+sys.path.insert(0, os.path.abspath(bot_dir))
+
+# Import bot modules with error handling
 try:
     import na_contract_numbers_search_bot_api as na_contract_bot
     logger.info("Successfully imported na_contract_numbers_search_bot_api module")
@@ -31,1954 +48,1738 @@ except ImportError as e:
     na_contract_bot = None
 
 try:
-    import IA_Working_Initial_valuation_bot as valuation_bot
+    import IA_Working_Initial_valuation_bot as initial_valuation_bot
     logger.info("Successfully imported IA_Working_Initial_valuation_bot module")
 except ImportError as e:
     logger.warning(f"Could not import IA_Working_Initial_valuation_bot: {e}")
-    valuation_bot = None
+    initial_valuation_bot = None
 
-# Scienter bot not implemented yet - will be added later
-logger.info("Scienter bot not yet implemented - will be added later")
 
-# Context manager for error handling
-@contextmanager
-def error_handler(automation_instance, step_name, contract_number=None):
-    """Context manager for consistent error handling across all steps"""
-    try:
-        yield
-    except Exception as e:
-        automation_instance.log_exception(step_name, str(e), contract_number)
-        raise
+class NBD_MF23_IA_Report:
+    def __init__(self, base_dir=r"working\monthly", working_dir=None):
+        """Initialize the report generator with error handling.
 
-# Function to run the contract search bot
-def run_contract_search_bot(contract_numbers):
-    """Run the contract search bot with the given contract numbers"""
-    if na_contract_bot:
-        try:
-            logger.info("Running na_contract_numbers_search_bot_api...")
-            # Call the main function of the bot
-            na_contract_bot.main()
-            logger.info("Contract search bot completed successfully")
-            # Note: The bot saves results to files, so we need to read them back
-            return _read_contract_search_results(contract_numbers)
-        except Exception as e:
-            logger.error(f"Contract search bot failed: {e}")
-            return _generate_mock_data(contract_numbers)
-    else:
-        logger.warning("Contract search bot not available - using mock data")
-        return _generate_mock_data(contract_numbers)
-
-# Function to run the valuation bot
-def run_valuation_bot_wrapper(contract_numbers):
-    """Run the valuation bot with the given contract numbers"""
-    if valuation_bot:
-        try:
-            logger.info("Running IA_Working_Initial_valuation_bot...")
-            # Call the run_valuation_bot function of the bot
-            results = valuation_bot.run_valuation_bot(contract_numbers)
-            logger.info("Valuation bot completed successfully")
-            return results
-        except Exception as e:
-            logger.error(f"Valuation bot failed: {e}")
-            return {}
-    else:
-        logger.warning("Valuation bot not available")
-        return {}
-
-def _read_contract_search_results(contract_numbers):
-    """Read the results from the contract search bot output files"""
-    try:
-        # This would read the actual output files from the bot
-        # For now, return mock data until we implement file reading
-        logger.warning("Reading bot results not yet implemented - using mock data")
-        return _generate_mock_data(contract_numbers)
-    except Exception as e:
-        logger.error(f"Failed to read bot results: {e}")
-        return _generate_mock_data(contract_numbers)
-
-def _generate_mock_data(contract_numbers):
-    """Generate mock data for contracts"""
-    mock_data = {}
-    for contract in contract_numbers:
-        mock_data[contract] = {
-            'client_code': f'MOCK_{contract[-4:]}',
-            'equipment': 'Mock Equipment',
-            'contract_period': 12,
-            'frequency': 'M',
-            'interest_rate': 15.0,
-            'contract_amount': 100000,
-            'AT_limit': 100000
-        }
-    return mock_data
-
-class NBDMF23IAAutomation:
-    def __init__(self, working_dir: str, month: str, year: str = "2025"):
-        self.working_dir = Path(working_dir)
-        self.month = month
-        self.year = year
-        self.month_year = f"{month}-{year}"
-        self.exceptions = []
-        
-        # Per-run log file setup
-        self.run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.logs_dir = Path(__file__).parent / "logs"
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.run_log_file = self.logs_dir / f"NBD_MF_23_IA_{self.run_timestamp}.log"
-        self._file_log_handler = logging.FileHandler(self.run_log_file, encoding='utf-8')
-        self._file_log_handler.setLevel(logging.INFO)
-        self._file_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logger.addHandler(self._file_log_handler)
-        logger.info(f"Run log file: {self.run_log_file}")
-        
-        # File paths
-        self.main_file = self._find_file_by_prefix("Prod. wise Class. of Loans")
-        self.disbursement_file = self._find_file_by_prefix("Disbursement with Budget")
-        self.net_portfolio_file = self._find_file_by_prefix("Net Portfolio")
-        self.po_listing_file = self._find_file_by_prefix("Po Listing - Internal")
-        self.info_request_file = self._find_file_by_prefix("Copy of Information Request from Credit")
-        self.portfolio_recovery_file = self._find_file_by_prefix("Portfolio Report Recovery", required=False)
-        
-        # Excel COM objects
-        self.excel_app = None
-        self.workbook = None
-        self.workbook_path = None
-        
-        # Bot directories
-        self.bots_dir = Path(__file__).parent.parent / "bots"
-        
-    def initialize_excel(self):
-        """Initialize Excel COM application and open the workbook"""
-        try:
-            logger.info("Initializing Excel COM application...")
-            self.excel_app = win32com.client.Dispatch("Excel.Application")
-            self.excel_app.Visible = False
-            self.excel_app.DisplayAlerts = False
-            
-            # Open the workbook
-            self.workbook_path = str(self.main_file.absolute())
-            self.workbook = self.excel_app.Workbooks.Open(self.workbook_path)
-            logger.info(f"Successfully opened workbook: {self.main_file.name}")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Excel: {e}")
-            raise
-    
-    def close_excel(self):
-        """Close Excel application and clean up"""
-        try:
-            if self.workbook:
-                self.workbook.Save()
-                self.workbook.Close()
-                logger.info("Workbook saved and closed")
-            
-            if self.excel_app:
-                self.excel_app.Quit()
-                logger.info("Excel application closed")
-            
-        except Exception as e:
-            logger.error(f"Error closing Excel: {e}")
-        finally:
-            self.excel_app = None
-            self.workbook = None
-            # Detach file log handler at end of run
-            try:
-                if hasattr(self, '_file_log_handler') and self._file_log_handler:
-                    logger.removeHandler(self._file_log_handler)
-                    self._file_log_handler.close()
-                    logger.info(f"Run log saved to: {self.run_log_file}")
-            except Exception:
-                pass
-    
-    def get_worksheet(self, sheet_name: str):
-        """Get a worksheet by name"""
-        try:
-            worksheet = self.workbook.Worksheets(sheet_name)
-            return worksheet
-        except Exception as e:
-            logger.error(f"Failed to get worksheet '{sheet_name}': {e}")
-            raise
-    
-    def write_cell_value(self, sheet_name: str, row: int, col: int, value):
-        """Write a value to a specific cell"""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            worksheet.Cells(row, col).Value = value
-        except Exception as e:
-            logger.error(f"Failed to write to cell {chr(64 + col)}{row}: {e}")
-            raise
-    
-    def write_cell_formula(self, sheet_name: str, row: int, col: int, formula: str):
-        """Write a formula to a specific cell"""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            worksheet.Cells(row, col).Formula = formula
-        except Exception as e:
-            logger.error(f"Failed to write formula to cell {chr(64 + col)}{row}: {e}")
-            raise
-    
-    def fill_down_formula(self, sheet_name: str, start_row: int, end_row: int, col: int, formula: str):
-        """Fill down a formula from start_row to end_row in the specified column"""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            
-            # Write the formula to the first row
-            worksheet.Cells(start_row, col).Formula = formula
-            
-            # Select the range and fill down (Ctrl+D equivalent)
-            range_obj = worksheet.Range(f"{chr(64 + col)}{start_row}:{chr(64 + col)}{end_row}")
-            range_obj.FillDown()
-            
-            logger.info(f"Filled down formula from row {start_row} to {end_row} in column {chr(64 + col)}")
-            
-        except Exception as e:
-            logger.error(f"Failed to fill down formula: {e}")
-            raise
-    
-    def copy_range_values(self, sheet_name: str, source_range: str, target_range: str):
-        """Copy values from source range to target range"""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            source = worksheet.Range(source_range)
-            target = worksheet.Range(target_range)
-            
-            source.Copy(target)
-            logger.info(f"Copied values from {source_range} to {target_range}")
-            
-        except Exception as e:
-            logger.error(f"Failed to copy range: {e}")
-            raise
-    
-    def find_last_row(self, sheet_name: str, col: int = 1):
-        """Find the last row with data in the specified column"""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            last_row = worksheet.Cells(worksheet.Rows.Count, col).End(-4162).Row  # xlUp = -4162
-            return last_row
-        except Exception as e:
-            logger.error(f"Failed to find last row: {e}")
-            raise
-    
-    def read_cell_value(self, sheet_name: str, row: int, col: int):
-        """Read a value from a specific cell"""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            return worksheet.Cells(row, col).Value
-        except Exception as e:
-            logger.error(f"Failed to read cell {chr(64 + col)}{row}: {e}")
-            raise
-    
-    def read_range_values(self, sheet_name: str, start_row: int, end_row: int, start_col: int, end_col: int):
-        """Read values from a range of cells"""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            range_obj = worksheet.Range(f"{chr(64 + start_col)}{start_row}:{chr(64 + end_col)}{end_row}")
-            return range_obj.Value
-        except Exception as e:
-            logger.error(f"Failed to read range: {e}")
-            raise
-    
-    def clear_range(self, sheet_name: str, start_row: int, end_row: int, start_col: int, end_col: int):
-        """Clear values from a range of cells"""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            range_obj = worksheet.Range(f"{chr(64 + start_col)}{start_row}:{chr(64 + end_col)}{end_row}")
-            range_obj.ClearContents()
-            logger.info(f"Cleared range {chr(64 + start_col)}{start_row}:{chr(64 + end_col)}{end_row}")
-        except Exception as e:
-            logger.error(f"Failed to clear range: {e}")
-            raise
-    
-    def apply_vlookup_formula(self, sheet_name: str, target_col: int, lookup_value_col: int, 
-                             table_array: str, col_index: int, start_row: int, end_row: int):
-        """Apply VLOOKUP formula to a range of cells with Fill Down (Ctrl+D)"""
-        try:
-            # Create VLOOKUP formula
-            formula = f'=VLOOKUP({chr(64 + lookup_value_col)}{start_row},{table_array},{col_index},FALSE)'
-            
-            # Apply formula to first row
-            self.write_cell_formula(sheet_name, start_row, target_col, formula)
-            
-            # Fill down the formula to all rows (Ctrl+D equivalent)
-            self.fill_down_formula(sheet_name, start_row, end_row, target_col, formula)
-            
-            logger.info(f"Applied VLOOKUP formula to column {chr(64 + target_col)} from row {start_row} to {end_row}")
-            
-        except Exception as e:
-            logger.error(f"Failed to apply VLOOKUP formula: {e}")
-            raise
-    
-    def apply_calculation_formula(self, sheet_name: str, target_col: int, formula: str, 
-                                start_row: int, end_row: int):
-        """Apply a calculation formula to a range of cells with Fill Down (Ctrl+D)"""
-        try:
-            # Apply formula to first row
-            self.write_cell_formula(sheet_name, start_row, target_col, formula)
-            
-            # Fill down the formula to all rows (Ctrl+D equivalent)
-            self.fill_down_formula(sheet_name, start_row, end_row, target_col, formula)
-            
-            logger.info(f"Applied calculation formula to column {chr(64 + target_col)} from row {start_row} to {end_row}")
-            
-        except Exception as e:
-            logger.error(f"Failed to apply calculation formula: {e}")
-            raise
-    
-    def demonstrate_pywin32_features(self):
-        """Demonstrate pywin32 features including formulas and Fill Down"""
-        try:
-            logger.info("Demonstrating pywin32 features...")
-            
-            # Example 1: Apply VLOOKUP formula with Fill Down
-            # This would look up values from another sheet/range
-            # self.apply_vlookup_formula("IA Working", 3, 1, "NetPortfolio!A:C", 2, 3, 100)
-            
-            # Example 2: Apply calculation formula with Fill Down
-            # This would calculate a value based on other cells
-            # self.apply_calculation_formula("IA Working", 22, "=P3/V3", 3, 100)
-            
-            # Example 3: Write individual cell values
-            self.write_cell_value("IA Working", 1, 1, "Contract Number")
-            self.write_cell_value("IA Working", 1, 2, "Status")
-            
-            # Example 4: Clear a range of cells
-            # self.clear_range("IA Working", 3, 10, 5, 8)
-            
-            logger.info("pywin32 features demonstration completed")
-            
-        except Exception as e:
-            logger.error(f"Failed to demonstrate pywin32 features: {e}")
-            raise
-    
-    def _find_file_by_prefix(self, prefix: str, required: bool = True) -> Path:
-        """Find a file that starts with the given prefix in the working directory"""
-        for file_path in self.working_dir.iterdir():
-            if file_path.is_file() and file_path.name.startswith(prefix):
-                logger.info(f"Found file: {file_path.name}")
-                return file_path
-        
-        # If no file found and it's required, raise an error
-        if required:
-            available_files = [f.name for f in self.working_dir.iterdir() if f.is_file()]
-            raise FileNotFoundError(f"No file found starting with '{prefix}' in {self.working_dir}. Available files: {available_files}")
-        else:
-            # Return None for optional files
-            logger.info(f"Optional file '{prefix}' not found - continuing without it")
-            return None
-    
-    def toggle_module_requirement(self, module_name: str, required: bool = True):
-        """Easily toggle whether a module is required or optional"""
-        logger.info(f"Setting {module_name} requirement to: {required}")
-        # This method can be extended to dynamically change module requirements
-        # For now, it just logs the change for debugging purposes
-    
-    def check_module_status(self):
-        """Check the status of all required modules and bots"""
-        status = {
-            'na_contract_bot': 'Available' if na_contract_bot else 'Not Available',
-            'valuation_bot': 'Available' if valuation_bot else 'Not Available',
-            'scienter_bot': 'Not Implemented',
-            'workhub24_api': 'Not Implemented'
-        }
-        
-        logger.info("Module Status Check:")
-        for module, status_text in status.items():
-            logger.info(f"  {module}: {status_text}")
-        
-        return status
-    
-    def log_exception(self, step: str, message: str, contract_number: str = None):
-        """Log exceptions for reporting"""
-        exception_info = {
-            'step': step,
-            'message': message,
-            'contract_number': contract_number,
-            'timestamp': datetime.now().isoformat()
-        }
-        self.exceptions.append(exception_info)
-        logger.error(f"Step {step}: {message} - Contract: {contract_number}")
-    
-    def get_exception_summary(self):
-        """Get a summary of all exceptions by step"""
-        if not self.exceptions:
-            return "No exceptions recorded"
-        
-        step_counts = {}
-        for exception in self.exceptions:
-            if isinstance(exception, dict) and 'step' in exception:
-                step = exception['step']
-                step_counts[step] = step_counts.get(step, 0) + 1
-        
-        summary = "Exception Summary:\n"
-        for step, count in sorted(step_counts.items()):
-            summary += f"  Step {step}: {count} exceptions\n"
-        
-        return summary
-    
-    def step_1_copy_disbursement_data(self):
-        """Step 1: Copy data from Disbursement workbook to IA Working sheet"""
-        try:
-            logger.info("Step 1: Copying disbursement data...")
-            
-            # Initialize Excel if not already done
-            if not self.workbook:
-                self.initialize_excel()
-            
-            # Read disbursement data using bulk method for better performance
-            disbursement_data = self.read_bulk_data_from_excel(self.disbursement_file, sheet_name="month")
-            
-            # Extract required columns (A, H, AC) - Contract No, Net Amount, Base Rate
-            contract_numbers = [row[0] if len(row) > 0 else None for row in disbursement_data]  # Column A
-            net_amounts = [row[7] if len(row) > 7 else None for row in disbursement_data]      # Column H
-            base_rates = [row[28] if len(row) > 28 else None for row in disbursement_data]     # Column AC
-            
-            # Prepare data for bulk writing - organize by columns
-            column_a_data = [[contract] for contract in contract_numbers if contract is not None]
-            column_o_data = [[amount] for amount in net_amounts if amount is not None]
-            column_n_data = [[rate] for rate in base_rates if rate is not None]
-            
-            # Write data in bulk starting from row 3
-            if column_a_data:
-                self.write_bulk_data("IA Working", 3, 1, column_a_data)      # Column A
-            if column_o_data:
-                self.write_bulk_data("IA Working", 3, 15, column_o_data)     # Column O
-            if column_n_data:
-                self.write_bulk_data("IA Working", 3, 14, column_n_data)     # Column N
-            
-            logger.info(f"Step 1 completed: Bulk copied {len(contract_numbers)} records to IA Working sheet")
-            
-        except Exception as e:
-            self.log_exception("1", f"Failed to copy disbursement data: {str(e)}")
-            raise
-    
-    def _normalize_contract(self, value):
-        """Normalize contract id for reliable matching across files.
-        - Uppercase, trim spaces
-        - Remove non-alphanumerics
-        - Convert numeric-like floats to int strings (e.g., 12345.0 -> '12345')
-        - Drop known sentinel '65535'
+        Args:
+            base_dir: Base directory for default folder searching (used in standalone mode)
+            working_dir: Direct path to working directory (used when called from app.py)
         """
-        if value is None:
-            return None
         try:
-            # Handle numeric-like
-            if isinstance(value, float):
-                if value.is_integer():
-                    s = str(int(value))
-                else:
-                    s = ("%f" % value).rstrip('0').rstrip('.')
-            elif isinstance(value, int):
-                s = str(value)
-            else:
-                s = str(value).strip().upper().replace(" ", "")
-                if s.startswith("'"):
-                    s = s[1:]
-                s = ''.join(ch for ch in s if ch.isalnum())
-            if s == '65535':
-                return None
-            return s
-        except Exception:
-            return None
+            self.base_dir = base_dir
+            self.working_dir = working_dir
+            self.ia_folder = self._find_ia_folder()
+            logger.info(f"Initialized NBD_MF23_IA_Report with base_dir: {base_dir}")
+            if working_dir:
+                logger.info(f"Using working_dir from app.py: {working_dir}")
+            logger.info(f"IA folder found at: {self.ia_folder}")
+        except Exception as e:
+            logger.error(f"Failed to initialize NBD_MF23_IA_Report: {e}")
+            raise
 
-    def _zero_stripped(self, norm: str):
-        """Return a variant with leading zeros stripped for broader matching."""
-        if not norm:
-            return norm
-        i = 0
-        while i < len(norm) and norm[i] == '0':
-            i += 1
-        return norm[i:] if i > 0 else norm
-
-    def step_2_vlookup_net_portfolio(self):
-        """Step 2: VLOOKUP data from Net Portfolio file to IA Working Sheet (simulated in Python)"""
-        try:
-            logger.info("Step 2: Performing VLOOKUP from Net Portfolio file...")
-            
-            # Find the Net Portfolio file dynamically (prefix match allows 'Net Portfolio-...')
-            net_portfolio_file = self._find_file_by_prefix("Net Portfolio")
-            if not net_portfolio_file:
-                raise FileNotFoundError("Net Portfolio file not found")
-            
-            logger.info(f"Using Net Portfolio file: {net_portfolio_file}")
-            
-            # Read only required columns for speed
-            # Contract number is in column E (0-based index 4)
-            # Keep usecols order so index 0 is the contract key for fast access
-            # Mapped value columns (absolute Excel columns): C=2, AB=27, AM=38, AH=33, F=5, AI=34, H=7
-            np_usecols = [4, 2, 27, 38, 33, 5, 34, 7]
-            
-            # Try to read the worksheet named 'Net Portfolio'. If not found, read the first sheet.
+    @staticmethod
+    def parse_date(date_input):
+        """Parse date from various formats - for use by app.py or command line."""
+        if isinstance(date_input, date):
+            return date_input
+        elif isinstance(date_input, str):
             try:
-                net_portfolio_data = self.read_bulk_data_from_excel(net_portfolio_file, sheet_name="Net Portfolio", usecols=np_usecols)
-            except Exception as read_err:
-                logger.warning(f"'Net Portfolio' sheet not found or failed to read ({read_err}); falling back to first sheet")
-                net_portfolio_data = self.read_bulk_data_from_excel(net_portfolio_file, usecols=np_usecols)
-            
-            if not net_portfolio_data:
-                logger.warning("No data found in Net Portfolio file")
-                return
-            
-            # Get all contract numbers from IA Working sheet (Column A, starting from row 3)
-            contracts = []
-            normalized_contracts = set()
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                norm = self._normalize_contract(contract)
-                norm_z = self._zero_stripped(norm) if norm else None
-                contracts.append((row, contract, norm, norm_z))
-                if norm:
-                    normalized_contracts.add(norm)
-                if norm_z:
-                    normalized_contracts.add(norm_z)
-                row += 1
-            
-            if not contracts:
-                logger.warning("No contracts found in IA Working sheet")
-                return
-            
-            logger.info(f"Found {len(contracts)} contracts in IA Working sheet")
-            
-            # Create per-column lookup dicts using normalized contract keys (with zero-stripped aliases)
-            client_code_lookup = {}
-            equipment_lookup = {}
-            purpose_lookup = {}
-            frequency_lookup = {}
-            contract_period_lookup = {}
-            interest_rate_lookup = {}
-            contract_amount_lookup = {}
-            
-            added = 0
-            for row_data in net_portfolio_data:
-                if not row_data or len(row_data) < 2:
-                    continue
-                raw_key = row_data[0]
-                norm_key = self._normalize_contract(raw_key)
-                if not norm_key:
-                    continue
-                norm_key_z = self._zero_stripped(norm_key)
-                # Only keep rows whose contracts exist in IA Working set
-                if norm_key not in normalized_contracts and norm_key_z not in normalized_contracts:
-                    continue
-                
-                # Helper to assign to both key variants
-                def assign(dct, val):
-                    if val is None:
-                        return
-                    if norm_key in normalized_contracts:
-                        dct[norm_key] = val
-                    if norm_key_z in normalized_contracts:
-                        dct[norm_key_z] = val
-                
-                # Index mapping after usecols (contract key at index 0 now):
-                # 0: Contract(E), 1: CLIENT_CODE(C), 2: EQT_DESC(AB), 3: PURPOSE(AM),
-                # 4: CON_RNTFREQ(AH), 5: CONTRACT_PERIOD(F), 6: CON_INTRATE(AI), 7: CONTRACT_AMOUNT(H)
-                assign(client_code_lookup, row_data[1] if len(row_data) > 1 else None)
-                assign(equipment_lookup, row_data[2] if len(row_data) > 2 else None)
-                assign(purpose_lookup, row_data[3] if len(row_data) > 3 else None)
-                assign(frequency_lookup, row_data[4] if len(row_data) > 4 else None)
-                assign(contract_period_lookup, row_data[5] if len(row_data) > 5 else None)
-                assign(interest_rate_lookup, row_data[6] if len(row_data) > 6 else None)
-                assign(contract_amount_lookup, row_data[7] if len(row_data) > 7 else None)
-                added += 1
-            
-            logger.info("Created lookup dictionaries (normalized + zero-stripped):")
-            logger.info(f"  Client Code: {len(client_code_lookup)}")
-            logger.info(f"  Equipment: {len(equipment_lookup)}")
-            logger.info(f"  Purpose: {len(purpose_lookup)}")
-            logger.info(f"  Frequency: {len(frequency_lookup)}")
-            logger.info(f"  Contract Period: {len(contract_period_lookup)}")
-            logger.info(f"  Interest Rate: {len(interest_rate_lookup)}")
-            logger.info(f"  Contract Amount: {len(contract_amount_lookup)}")
-            
-            # If matches look suspiciously low, auto-detect contract column and rebuild
-            min_reasonable = 100
-            if sum(len(d) for d in [client_code_lookup, equipment_lookup, purpose_lookup, frequency_lookup, contract_period_lookup, interest_rate_lookup, contract_amount_lookup]) < min_reasonable:
-                logger.warning("Low match count detected; attempting auto-detect of contract column on Net Portfolio sheet")
+                # Try MM/DD/YYYY format first (command line)
+                return datetime.strptime(date_input, "%m/%d/%Y").date()
+            except ValueError:
                 try:
-                    # Read full sheet to probe columns
-                    full_data = self.read_bulk_data_from_excel(net_portfolio_file)
-                    if full_data:
-                        # Determine candidate contract column by maximum overlap with IA normalized set
-                        max_overlap = -1
-                        best_col = 0
-                        # Limit scan to first 20 columns to keep reasonable
-                        scan_cols = min(20, max(len(r) for r in full_data if isinstance(r, (list, tuple))))
-                        for col_idx in range(scan_cols):
-                            overlap = 0
-                            for r in full_data[:1000]:  # sample
-                                if isinstance(r, (list, tuple)) and len(r) > col_idx:
-                                    nk = self._normalize_contract(r[col_idx])
-                                    nkz = self._zero_stripped(nk) if nk else None
-                                    if nk in normalized_contracts or nkz in normalized_contracts:
-                                        overlap += 1
-                            if overlap > max_overlap:
-                                max_overlap = overlap
-                                best_col = col_idx
-                        logger.info(f"Auto-detected contract column index: {best_col} with overlap {max_overlap}")
-                        # Rebuild lookups using detected contract column and absolute value columns
-                        client_code_lookup.clear(); equipment_lookup.clear(); purpose_lookup.clear(); frequency_lookup.clear(); contract_period_lookup.clear(); interest_rate_lookup.clear(); contract_amount_lookup.clear()
-                        for r in full_data:
-                            if not isinstance(r, (list, tuple)) or len(r) <= best_col:
-                                continue
-                            raw_key = r[best_col]
-                            nk = self._normalize_contract(raw_key)
-                            if not nk:
-                                continue
-                            nkz = self._zero_stripped(nk)
-                            if nk not in normalized_contracts and nkz not in normalized_contracts:
-                                continue
-                            def assign2(dct, val):
-                                if val is None:
-                                    return
-                                if nk in normalized_contracts:
-                                    dct[nk] = val
-                                if nkz in normalized_contracts:
-                                    dct[nkz] = val
-                            # Absolute indices: C=2, AB=27, AM=38, AH=33, F=5, AI=34, H=7
-                            assign2(client_code_lookup, r[2] if len(r) > 2 else None)
-                            assign2(equipment_lookup, r[27] if len(r) > 27 else None)
-                            assign2(purpose_lookup, r[38] if len(r) > 38 else None)
-                            assign2(frequency_lookup, r[33] if len(r) > 33 else None)
-                            assign2(contract_period_lookup, r[5] if len(r) > 5 else None)
-                            assign2(interest_rate_lookup, r[34] if len(r) > 34 else None)
-                            assign2(contract_amount_lookup, r[7] if len(r) > 7 else None)
-                        logger.info("Rebuilt lookups using auto-detected contract column")
-                except Exception as probe_err:
-                    logger.warning(f"Auto-detect fallback failed: {probe_err}")
+                    # Try YYYY-MM-DD format (app.py)
+                    return datetime.strptime(date_input, "%Y-%m-%d").date()
+                except ValueError:
+                    raise ValueError(f"Invalid date format: {date_input}. Expected MM/DD/YYYY or YYYY-MM-DD")
+        else:
+            raise ValueError(f"Invalid date type: {type(date_input)}. Expected string or date object")
 
-            # Prepare bulk write data arrays for each target column
-            client_code_data, equipment_data, purpose_data, frequency_data, contract_period_data, interest_rate_data, contract_amount_data = ([] for _ in range(7))
-            for row, contract, norm, norm_z in contracts:
-                key = norm if norm in client_code_lookup or norm in equipment_lookup or norm in purpose_lookup or norm in frequency_lookup or norm in contract_period_lookup or norm in interest_rate_lookup or norm in contract_amount_lookup else norm_z
-                client_code_data.append([client_code_lookup.get(key)])
-                equipment_data.append([equipment_lookup.get(key)])
-                purpose_data.append([purpose_lookup.get(key)])
-                frequency_data.append([frequency_lookup.get(key)])
-                contract_period_data.append([contract_period_lookup.get(key)])
-                interest_rate_data.append([interest_rate_lookup.get(key)])
-                contract_amount_data.append([contract_amount_lookup.get(key)])
+    def _find_ia_folder(self):
+        """Find the dynamic NBD_MF_23_IA folder inside working directory."""
+        try:
+            # If working_dir is provided by app.py, use it directly (app.py already provides the NBD_MF_23_IA path)
+            if self.working_dir:
+                ia_folder_path = self.working_dir
+                if not os.path.exists(ia_folder_path):
+                    os.makedirs(ia_folder_path)
+                    logger.info(f"Created IA folder at: {ia_folder_path}")
+                else:
+                    logger.info(f"Found IA folder at: {ia_folder_path}")
+                return ia_folder_path
+
+            # Otherwise, use the old logic for standalone execution
+            # Step 1: Go back to root (one level above report_automations)
+            root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+            # Step 2: Construct path to working/monthly
+            monthly_dir = os.path.join(root_dir, "working", "monthly")
+            if not os.path.exists(monthly_dir):
+                error_msg = f"'monthly' folder not found in '{monthly_dir}'."
+                logger.error(error_msg)
+                raise FileNotFoundError(error_msg)
+
+            # Step 3: Get the only dynamic folder inside monthly
+            monthly_folders = [f for f in glob.glob(os.path.join(monthly_dir, "*")) if os.path.isdir(f)]
+            if not monthly_folders:
+                error_msg = f"No subfolder found inside '{monthly_dir}'."
+                logger.error(error_msg)
+                raise FileNotFoundError(error_msg)
+
+            if len(monthly_folders) > 1:
+                logger.warning(f"Multiple folders found in '{monthly_dir}'. Using the first one: {monthly_folders[0]}")
+
+            dynamic_folder = monthly_folders[0]
+
+            # Step 4: Inside dynamic folder, find/create NBD_MF_23_IA
+            ia_folder_path = os.path.join(dynamic_folder, "NBD_MF_23_IA")
+            if not os.path.exists(ia_folder_path):
+                os.makedirs(ia_folder_path)
+                logger.info(f"Created IA folder at: {ia_folder_path}")
+            else:
+                logger.info(f"Found IA folder at: {ia_folder_path}")
+
+            return ia_folder_path
+
+        except Exception as e:
+            logger.error(f"Error finding IA folder: {e}")
+            raise
+
+
+    def _find_file(self, keyword: str) -> str:
+        """Find a file containing the keyword in the IA folder with detailed logging."""
+        try:
+            logger.debug(f"Searching for file with keyword: '{keyword}' in {self.ia_folder}")
+
+            files = os.listdir(self.ia_folder)
+            # Filter out temporary Excel files that start with ~$
+            matching_files = [f for f in files if keyword in f and not f.startswith('~$')]
+
+            if not matching_files:
+                error_msg = f"No file found with keyword: '{keyword}' in {self.ia_folder}"
+                logger.error(error_msg)
+                logger.error(f"Available files (excluding ~$ temp files): {[f for f in files if not f.startswith('~$')]}")
+                raise FileNotFoundError(error_msg)
+
+            if len(matching_files) > 1:
+                logger.warning(f"Multiple files found with keyword '{keyword}': {matching_files}. Using first match.")
+
+            selected_file = os.path.join(self.ia_folder, matching_files[0])
+            logger.debug(f"Found file: {selected_file}")
+            return selected_file
+
+        except Exception as e:
+            logger.error(f"Error finding file with keyword '{keyword}': {e}")
+            raise
+
+    # === File Loaders with Enhanced Error Handling ===
+    def load_disbursement(self):
+        """Load disbursement data with error handling."""
+        try:
+            logger.info("Loading Disbursement with Budget file...")
+            file_disbursement = self._find_file("Disbursement with Budget")
             
-            # Bulk write columns (C, D, E, I, J, M, P)
-            self.write_bulk_data("IA Working", 3, 3, client_code_data)       # Column C
-            self.write_bulk_data("IA Working", 3, 4, equipment_data)         # Column D
-            self.write_bulk_data("IA Working", 3, 5, purpose_data)           # Column E
-            self.write_bulk_data("IA Working", 3, 9, frequency_data)         # Column I
-            self.write_bulk_data("IA Working", 3, 10, contract_period_data)  # Column J
-            self.write_bulk_data("IA Working", 3, 13, interest_rate_data)    # Column M
-            self.write_bulk_data("IA Working", 3, 16, contract_amount_data)  # Column P
+            df = pd.read_excel(
+                file_disbursement,
+                sheet_name="month",
+                usecols="A,H,AC"
+            )
             
-            # Count contracts with at least one mapped value
-            processed_count = 0
-            for _, _, norm, norm_z in contracts:
-                if (
-                    (norm and (
-                        norm in client_code_lookup or norm in equipment_lookup or norm in purpose_lookup or norm in frequency_lookup or norm in contract_period_lookup or norm in interest_rate_lookup or norm in contract_amount_lookup
-                    )) or (
-                        norm_z and (
-                            norm_z in client_code_lookup or norm_z in equipment_lookup or norm_z in purpose_lookup or norm_z in frequency_lookup or norm_z in contract_period_lookup or norm_z in interest_rate_lookup or norm_z in contract_amount_lookup
+            # Validate required columns
+            required_cols = ["CONTRACT NO", "Net Amount", "Base Rate"]
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                raise ValueError(f"Missing required columns in Disbursement file: {missing_cols}")
+            
+            df_filtered = df[df["CONTRACT NO"].notna()]
+            logger.info(f"Successfully loaded Disbursement data: {len(df_filtered)} rows")
+            return df_filtered
+            
+        except Exception as e:
+            logger.error(f"Failed to load Disbursement data: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    def load_information_request_from_credit(self):
+        """Load information request from credit with error handling."""
+        try:
+            logger.info("Loading Information Request from Credit file...")
+            file_path = self._find_file("Information Request from Credit")
+            
+            df = pd.read_excel(
+                file_path,
+                sheet_name="Disbursements",
+                usecols="C,G",
+                skiprows=4
+            )
+            
+            # Rename columns if needed
+            if len(df.columns) == 2:
+                df.columns = ["Contract No", "Micro/Small/Medium"]
+            
+            df_filtered = df[df["Contract No"].notna()]
+            logger.info(f"Successfully loaded Information Request data: {len(df_filtered)} rows")
+            return df_filtered
+            
+        except Exception as e:
+            logger.error(f"Failed to load Information Request from Credit: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    def load_net_portfolio(self):
+        """Load net portfolio with error handling."""
+        try:
+            logger.info("Loading Net Portfolio file...")
+            file_path = self._find_file("Net Portfolio")
+            
+            df = pd.read_excel(
+                file_path,
+                usecols="E,C,F,H,AB,AH,AI,AM"
+            )
+            
+            # Validate required columns
+            required_cols = ["CLIENT_CODE", "CONTRACT_NO"]
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                logger.warning(f"Missing expected columns in Net Portfolio: {missing_cols}")
+            
+            df_filtered = df[df["CLIENT_CODE"].notna()]
+            logger.info(f"Successfully loaded Net Portfolio data: {len(df_filtered)} rows")
+            return df_filtered
+            
+        except Exception as e:
+            logger.error(f"Failed to load Net Portfolio: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    def load_yard_and_Property_List(self):
+        """Load yard and property list with comprehensive error handling."""
+        try:
+            logger.info("Loading CBSL Provision Comparison file...")
+            file_path = self._find_file("CBSL Provision Comparison")
+            
+            # Load Property Mortgage
+            try:
+                df_propertyMortgage = pd.read_excel(
+                    file_path,
+                    sheet_name="PropertyMortgage",
+                    usecols="A",
+                    skiprows=5,
+                    header=None
+                )
+                df_propertyMortgage.columns = ["Property Mortgage List"]
+                logger.info(f"Loaded PropertyMortgage: {len(df_propertyMortgage)} rows")
+            except Exception as e:
+                logger.warning(f"Could not load PropertyMortgage sheet: {e}. Creating empty dataframe.")
+                df_propertyMortgage = pd.DataFrame(columns=["Property Mortgage List"])
+
+            # Load Repossessed List
+            try:
+                df_repossessedList = pd.read_excel(
+                    file_path,
+                    sheet_name="RepossessedList",
+                    usecols="A",
+                    skiprows=5,
+                    header=None
+                )
+                df_repossessedList.columns = ["Yard Contract"]
+                logger.info(f"Loaded RepossessedList: {len(df_repossessedList)} rows")
+            except Exception as e:
+                logger.warning(f"Could not load RepossessedList sheet: {e}. Creating empty dataframe.")
+                df_repossessedList = pd.DataFrame(columns=["Yard Contract"])
+
+            # Build combined dataframe
+            df_yard_and_property_list = pd.DataFrame()
+            df_yard_and_property_list["Yard Contract"] = df_repossessedList["Yard Contract"]
+            df_yard_and_property_list[""] = [""] + ["Yard"] * (max(0, len(df_repossessedList) - 1))
+            df_yard_and_property_list["Empty"] = ""
+            
+            max_len = max(len(df_repossessedList), len(df_propertyMortgage))
+            df_yard_and_property_list = df_yard_and_property_list.reindex(range(max_len))
+            df_yard_and_property_list["Property Mortgage List"] = df_propertyMortgage.reindex(range(max_len))["Property Mortgage List"].fillna("")
+            
+            logger.info(f"Successfully created yard and property list: {len(df_yard_and_property_list)} rows")
+            return df_yard_and_property_list
+            
+        except Exception as e:
+            logger.error(f"Failed to load Yard and Property List: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    def load_product_cat(self):
+        """Load product category with error handling."""
+        try:
+            logger.info("Loading Prod. wise Class. of Loans file...")
+            file_path = self._find_file("Prod. wise Class. of Loans")
+            
+            df = pd.read_excel(
+                file_path,
+                sheet_name="Product_Cat",
+                usecols="E,F,L,M,P,R,S"
+            )
+            
+            # Rename columns
+            df = df.rename(columns={
+                "SPECIAL CATEGORIES (CONTRACT WISE) *Add here to pick contract wise cat": "SPECIAL CATEGORIES",
+                df.columns[-1]: "M"
+            })
+            
+            logger.info(f"Successfully loaded Product_Cat data: {len(df)} rows, columns: {df.columns.tolist()}")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Failed to load Product_Cat: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    def load_C1_C2_Working(self):
+        """Load C1 & C2 Working with error handling."""
+        try:
+            logger.info("Loading C1 & C2 Working sheet...")
+            file_path = self._find_file("Prod. wise Class. of Loans")
+            
+            df = pd.read_excel(
+                file_path,
+                sheet_name="C1 & C2 Working",
+                header=1,
+                usecols="A, AB, AD"
+            )
+            
+            # Rename columns
+            df = df.rename(columns={
+                df.columns[0]: "Contract No",
+                df.columns[1]: "Gross Exposure",
+                df.columns[2]: "PD Category" if len(df.columns) > 2 else None
+            })
+            
+            # Keep all contract rows (removed filtering of LR/Margin Trading to ensure proper mapping)
+            logger.info(f"Keeping all contracts including LR and Margin Trading for proper PD Category and Gross Exposure mapping")
+            
+            logger.info(f"Successfully loaded C1 & C2 Working data: {len(df)} rows")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Failed to load C1 & C2 Working: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+    def load_po_listing(self):
+        """Load PO listing with error handling."""
+        try:
+            logger.info("Loading Po Listing - Internal file...")
+            file_path = self._find_file("Po Listing - Internal")
+            df = pd.read_excel(file_path, usecols="H, AH")
+            # Assign proper column names: H = Contract No, AH = SELL_PRICE
+            df.columns = ["CONTRACT_NO", "SELL_PRICE"]
+            df_filtered = df[df["CONTRACT_NO"].notna() & df["SELL_PRICE"].notna()]
+            logger.info(f"Successfully loaded PO Listing data: {len(df_filtered)} rows with valid Contract No and SELL_PRICE")
+            return df_filtered
+        except Exception as e:
+            logger.error(f"Failed to load PO Listing: {e}")
+            logger.warning("Returning empty DataFrame for PO Listing")
+            return pd.DataFrame(columns=["CONTRACT_NO", "SELL_PRICE"])
+
+    def load_portfolio_report_recovery(self):
+        """Load portfolio report recovery with error handling."""
+        try:
+            logger.info("Loading Portfolio Report Recovery - Internal file...")
+            file_path = self._find_file("Portfolio Report Recovery - Internal")
+            df = pd.read_excel(file_path, usecols="A,B")
+            df.columns = ["CONTRACT_NO", "SELL_PRICE"]
+            df_filtered = df[df["CONTRACT_NO"].notna()]
+            logger.info(f"Successfully loaded Portfolio Report Recovery: {len(df_filtered)} rows")
+            return df_filtered
+        except FileNotFoundError:
+            logger.warning("Portfolio Report Recovery file not found. Returning empty DataFrame.")
+            return pd.DataFrame(columns=["CONTRACT_NO", "SELL_PRICE"])
+        except Exception as e:
+            logger.error(f"Failed to load Portfolio Report Recovery: {e}")
+            return pd.DataFrame(columns=["CONTRACT_NO", "SELL_PRICE"])
+
+    def safe_apply(self, df: pd.DataFrame, func, axis=1, default_value=None) -> pd.Series:
+        """Safely apply a function to a dataframe with error handling."""
+        try:
+            return df.apply(func, axis=axis)
+        except Exception as e:
+            logger.error(f"Error in apply function: {e}")
+            logger.error(f"Function: {func.__name__ if hasattr(func, '__name__') else 'lambda'}")
+            logger.error(traceback.format_exc())
+            if default_value is not None:
+                return pd.Series([default_value] * len(df), index=df.index)
+            raise
+
+    def classify_collateral_excel_formula(self, row, property_mortgage_list, vehicles_machinery_list):
+        """
+        Classify collateral following Excel formula EXACTLY:
+        =IF(ISNUMBER(MATCH(A3,'YardandProperty List'!D:D,0)),"Immovable Properties",
+            IF(ISNUMBER(MATCH(T3,Product_Cat!$P$2:$P$9,0)),"Vehicles and Machinery",
+                IF(B3="Margin Trading","Shares and Debt Securities-Listed",
+                    IF(B3="FDL","Deposits (Cash-Backed)","Personal and Corporate Guarantees"))))
+
+        Where: A3=Contract No, T3=PD Category, B3=Product
+        """
+        try:
+            # Extract values exactly as in Excel formula
+            contract_no = str(row["Contract No"]).strip() if pd.notna(row["Contract No"]) else ""  # A3
+            pd_category = str(row["PD Category"]).strip() if pd.notna(row["PD Category"]) else ""  # T3
+            product = str(row["Product"]).strip() if pd.notna(row["Product"]) else ""  # B3
+
+            # Log the values being checked for this row
+            logger.debug(f"Classifying: Contract={contract_no}, PD_Category={pd_category}, Product={product}")
+
+            # Step 1: IF(ISNUMBER(MATCH(A3,'YardandProperty List'!D:D,0)),"Immovable Properties"
+            if contract_no and contract_no in property_mortgage_list:
+                logger.debug(f"  → Immovable Properties (Contract {contract_no} in property list)")
+                return "Immovable Properties"
+
+            # Step 2: IF(ISNUMBER(MATCH(T3,Product_Cat!$P$2:$P$9,0)),"Vehicles and Machinery"
+            if pd_category and pd_category in vehicles_machinery_list:
+                logger.debug(f"  → Vehicles and Machinery (PD Category '{pd_category}' in vehicles list)")
+                return "Vehicles and Machinery"
+
+            # Step 3: IF(B3="Margin Trading","Shares and Debt Securities-Listed"
+            if product == "Margin Trading":
+                logger.debug(f"  → Shares and Debt Securities-Listed (Product = 'Margin Trading')")
+                return "Shares and Debt Securities-Listed"
+
+            # Step 4: IF(B3="FDL","Deposits (Cash-Backed)"
+            if product == "FDL":
+                logger.debug(f"  → Deposits (Cash-Backed) (Product = 'FDL')")
+                return "Deposits (Cash-Backed)"
+
+            # Step 5: Default case
+            logger.debug(f"  → Personal and Corporate Guarantees (default case)")
+            return "Personal and Corporate Guarantees"
+
+        except Exception as e:
+            logger.error(f"Error classifying collateral for row: {e}")
+            logger.error(f"Row data: Contract={row.get('Contract No')}, PD={row.get('PD Category')}, Product={row.get('Product')}")
+            return "Personal and Corporate Guarantees"
+
+    def build_prod_loans(self, df_disbursement, df_net_portfolio, df_information_request_from_credit,
+                        df_product_cat, df_C1_C2_Working, df_yard_and_property_list,
+                        df_po_listing, df_portfolio_report_recovery):
+        """Build production loans dataframe with comprehensive error handling."""
+        
+        logger.info("="*80)
+        logger.info("STARTING build_prod_loans METHOD")
+        logger.info("="*80)
+        
+        try:
+            # Initialize dataframe
+            df_prod_loans = pd.DataFrame()
+            df_prod_loans["Contract No"] = df_disbursement["CONTRACT NO"]
+
+            logger.info(f"INITIAL CONTRACT COUNT: {len(df_prod_loans)} contracts from disbursement")
+            
+            # Process each column with error handling
+            try:
+                df_prod_loans["Disbursed Amount (Net of DC)"] = (
+                    pd.to_numeric(df_disbursement["Net Amount"], errors="coerce")
+                    .round(0)
+                    .astype("Int64")
+                )
+                logger.info("✓ Disbursed Amount column created")
+            except Exception as e:
+                logger.error(f"Error creating Disbursed Amount column: {e}")
+                df_prod_loans["Disbursed Amount (Net of DC)"] = None
+            
+            df_prod_loans["Base Rate"] = df_disbursement["Base Rate"]
+            
+            # Product column with replacement
+            try:
+                # Extract product codes and show samples for debugging
+                df_prod_loans["Product"] = df_prod_loans["Contract No"].astype(str).str[2:4]
+
+                # Show sample contract numbers and their extracted codes
+                sample_contracts = df_prod_loans[["Contract No", "Product"]].head(10)
+                logger.info(f"Sample contract numbers and extracted product codes:\n{sample_contracts.to_string()}")
+
+                # Show unique product codes before replacement
+                unique_products_before = df_prod_loans["Product"].unique()
+                logger.info(f"Unique product codes before replacement: {unique_products_before}")
+
+                df_prod_loans["Product"] = df_prod_loans["Product"].replace({
+                    "00": "FDL",
+                    "rg": "Margin Trading"
+                })
+
+                # Debug product classifications
+                product_counts = df_prod_loans["Product"].value_counts()
+                logger.info("✓ Product column created with replacements")
+                logger.info(f"Product distribution: {product_counts.to_dict()}")
+
+                fdl_count = len(df_prod_loans[df_prod_loans["Product"] == "FDL"])
+                margin_trading_count = len(df_prod_loans[df_prod_loans["Product"] == "Margin Trading"])
+                logger.info(f"FDL contracts: {fdl_count}, Margin Trading contracts: {margin_trading_count}")
+            except Exception as e:
+                logger.error(f"Error creating Product column: {e}")
+                df_prod_loans["Product"] = ""
+            
+            # Build mapping dictionaries
+            try:
+                mapping_dicts = {
+                    "Client Code": dict(zip(df_net_portfolio["CONTRACT_NO"], df_net_portfolio["CLIENT_CODE"])),
+                    "Contract Period": dict(zip(df_net_portfolio["CONTRACT_NO"], df_net_portfolio["CONTRACT_PERIOD"])),
+                    "Contract Amount": dict(zip(df_net_portfolio["CONTRACT_NO"], df_net_portfolio["CONTRACT_AMOUNT"])),
+                    "Equipment": dict(zip(df_net_portfolio["CONTRACT_NO"], df_net_portfolio["EQT_DESC"])),
+                    "Frequency": dict(zip(df_net_portfolio["CONTRACT_NO"], df_net_portfolio["CON_RNTFREQ"])),
+                    "Contractual Interest Rate": dict(zip(df_net_portfolio["CONTRACT_NO"], df_net_portfolio["CON_INTRATE"])),
+                    "Purpose": dict(zip(df_net_portfolio["CONTRACT_NO"], df_net_portfolio["PURPOSE"]))
+                }
+                
+                for col, mapping in mapping_dicts.items():
+                    df_prod_loans[col] = df_prod_loans["Contract No"].map(mapping).fillna("")
+                    logger.info(f"✓ Mapped {col} column ({len([v for v in mapping.values() if v])} mappings)")
+
+                logger.info("✓ All net portfolio mappings completed")
+            except Exception as e:
+                logger.error(f"Error in net portfolio mappings: {e}")
+            
+            # Clean Client Code
+            df_prod_loans["Client Code"] = df_prod_loans["Client Code"].astype(str).str.replace(r"\.0$", "", regex=True)
+            
+            # Fill incomplete contracts
+            df_prod_loans = self.fill_incomplete_contracts(df_prod_loans, na_contract_bot)
+            
+            # Corporate Clients classification
+            try:
+                df_prod_loans["Corporate Clients"] = df_prod_loans["Client Code"].str[0].apply(
+                    lambda x: "Corporate Client" if x == "2" else "Non-Corporate"
+                )
+                logger.info("✓ Corporate Clients classification completed")
+            except Exception as e:
+                logger.error(f"Error in Corporate Clients classification: {e}")
+                df_prod_loans["Corporate Clients"] = "Non-Corporate"
+            
+            # Calculate rates and tenure
+            try:
+                df_prod_loans["Contractual Interest Rate"] = pd.to_numeric(df_prod_loans["Contractual Interest Rate"], errors="coerce")
+                df_prod_loans["Base Rate"] = pd.to_numeric(df_prod_loans["Base Rate"], errors="coerce")
+                df_prod_loans["Minimum Rate (Final)"] = df_prod_loans[["Contractual Interest Rate", "Base Rate"]].min(axis=1)
+                
+                df_prod_loans["Contract Period"] = pd.to_numeric(df_prod_loans["Contract Period"], errors="coerce")
+                conditions = [
+                    df_prod_loans["Frequency"] == "D",
+                    df_prod_loans["Frequency"] == "Q",
+                    df_prod_loans["Frequency"] == "M",
+                    df_prod_loans["Frequency"] == "W"
+                ]
+                choices = [
+                    df_prod_loans["Contract Period"] / 30,
+                    df_prod_loans["Contract Period"] * 3,
+                    df_prod_loans["Contract Period"],
+                    df_prod_loans["Contract Period"] / 4
+                ]
+                df_prod_loans["Tenure (Months)"] = np.select(conditions, choices, default=0)
+                logger.info("✓ Rate and tenure calculations completed")
+            except Exception as e:
+                logger.error(f"Error in rate/tenure calculations: {e}")
+            
+            # MSME Classification
+            try:
+                contract_to_msme = dict(
+                    zip(df_information_request_from_credit["Contract No"], 
+                        df_information_request_from_credit["Micro/Small/Medium"])
+                )
+                df_prod_loans["MSME Classification"] = df_prod_loans["Contract No"].map(contract_to_msme).fillna("0")
+                logger.info("✓ MSME Classification completed")
+            except Exception as e:
+                logger.error(f"Error in MSME Classification: {e}")
+                df_prod_loans["MSME Classification"] = "0"
+            
+            # EIR Calculation with error handling
+            try:
+                df_prod_loans["Minimum Rate (Final)"] = pd.to_numeric(df_prod_loans["Minimum Rate (Final)"], errors="coerce")
+                df_prod_loans["Tenure (Months)"] = pd.to_numeric(df_prod_loans["Tenure (Months)"], errors="coerce")
+                
+                # Avoid division by zero
+                mask = df_prod_loans["Tenure (Months)"] > 0
+                df_prod_loans.loc[mask, "EIR (%)"] = (
+                    (1 + df_prod_loans.loc[mask, "Minimum Rate (Final)"] / 100 / 
+                    (12 / df_prod_loans.loc[mask, "Tenure (Months)"])) ** 
+                    (12 / df_prod_loans.loc[mask, "Tenure (Months)"]) - 1
+                ) * 100
+
+                # Convert to numeric & round
+                df_prod_loans["EIR (%)"] = pd.to_numeric(df_prod_loans["EIR (%)"], errors="coerce").round(2)
+
+                # 👉 Divide by 100 when saving (decimal form instead of percentage)
+                df_prod_loans["EIR (Decimal)"] = df_prod_loans["EIR (%)"] / 10000
+
+                logger.info("✓ EIR calculation completed")
+
+            except Exception as e:
+                logger.error(f"Error in EIR calculation: {e}")
+                df_prod_loans["EIR (%)"] = ""
+                df_prod_loans["EIR (Decimal)"] = ""
+
+            
+            # Type of Loans classification
+            try:
+                special_cat_map = dict(zip(df_product_cat["SPECIAL CATEGORIES"], df_product_cat["M"]))
+                lookup_map = dict(zip(df_product_cat["LOOKUP"], df_product_cat["Classification"]))
+                
+                df_prod_loans["Type of Loans (1.3.1.0.0.0)"] = self.safe_apply(
+                    df_prod_loans,
+                    lambda row: (
+                        special_cat_map.get(row["Contract No"])
+                        if special_cat_map.get(row["Contract No"]) is not None else (
+                            "Margin Trading Loans" if row["Product"] in ["MT", "Margin Trading"]
+                            else "Loans against Cash/Deposits" if row["Product"] in ["FDL", "FD Loan"]
+                            else lookup_map.get(
+                                f"{row['Product']}{row['Equipment']}{row['Purpose']}{row['Corporate Clients']}",
+                                None
+                            )
                         )
+                    ),
+                    default_value=None
+                )
+                logger.info("✓ Type of Loans classification completed")
+            except Exception as e:
+                logger.error(f"Error in Type of Loans classification: {e}")
+
+            # PD Category mapping (MUST happen before Collateral classification)
+            try:
+                logger.info("Mapping PD Category (required for Collateral classification)...")
+                contract_to_pd_category = dict(
+                    zip(df_C1_C2_Working["Contract No"], df_C1_C2_Working["PD Category"])
+                )
+                equipment_to_category = dict(
+                    zip(df_product_cat["EQT_DESC"], df_product_cat["Classification"])
+                )
+                df_prod_loans["PD Category"] = df_prod_loans["Contract No"].map(contract_to_pd_category)
+                df_prod_loans["PD Category"] = df_prod_loans["PD Category"].fillna(
+                    df_prod_loans["Equipment"].map(equipment_to_category)
+                )
+                logger.info(f"✓ PD Category mapping completed. Non-null values: {df_prod_loans['PD Category'].notna().sum()}")
+            except Exception as e:
+                logger.error(f"Error in PD Category mapping: {e}")
+                df_prod_loans["PD Category"] = ""
+
+            # Collateral/Security Type classification
+            try:
+                logger.info("="*60)
+                logger.info("STARTING COLLATERAL/SECURITY TYPE CLASSIFICATION")
+                logger.info("="*60)
+                logger.info(f"Current df_prod_loans columns: {df_prod_loans.columns.tolist()}")
+                logger.info(f"df_prod_loans shape: {df_prod_loans.shape}")
+
+                # Get lists for classification
+                property_mortgage_list = df_yard_and_property_list["Property Mortgage List"].dropna().astype(str).str.strip().tolist()
+                logger.info(f"Property Mortgage List loaded: {len(property_mortgage_list)} items")
+                if property_mortgage_list:
+                    logger.info(f"Sample Property Mortgage contracts: {property_mortgage_list[:5]}")
+
+                # Get Column P values (df_product_cat columns debugging)
+                logger.info(f"df_product_cat columns: {df_product_cat.columns.tolist()}")
+                logger.info(f"df_product_cat shape: {df_product_cat.shape}")
+
+                if len(df_product_cat.columns) > 4:
+                    p_column = df_product_cat.iloc[:, 4]
+                    p_column_name = df_product_cat.columns[4]
+                    logger.info(f"Using column at index 4: '{p_column_name}'")
+
+                    # Show all values in P column
+                    logger.info(f"All values in P column:\n{p_column.to_string()}")
+
+                    vehicles_machinery_list = p_column.iloc[0:9].dropna().astype(str).str.strip().tolist()
+                    vehicles_machinery_list = [x for x in vehicles_machinery_list if x and x != 'nan']
+                    logger.info(f"Vehicles & Machinery List (P1:P9): {vehicles_machinery_list}")
+                else:
+                    vehicles_machinery_list = []
+                    logger.warning("df_product_cat has insufficient columns for P column lookup")
+
+                # Log exact matches that will be checked
+                logger.info("EXACT MATCHES TO BE CHECKED:")
+                logger.info(f"  Property Mortgage matches: Contract No must be IN {property_mortgage_list[:10]}...")
+                logger.info(f"  Vehicles & Machinery matches: PD Category must be IN {vehicles_machinery_list}")
+                logger.info(f"  Margin Trading matches: Product must EQUAL 'Margin Trading'")
+                logger.info(f"  FDL matches: Product must EQUAL 'FDL'")
+
+                # Check if PD Category column exists (required for classification)
+                if "PD Category" not in df_prod_loans.columns:
+                    logger.warning("PD Category column not found! Creating empty column...")
+                    df_prod_loans["PD Category"] = ""
+
+                # Show sample PD Category values for debugging
+                logger.info("Sample PD Category values in df_prod_loans:")
+                pd_sample = df_prod_loans["PD Category"].dropna().head(10).tolist()
+                logger.info(f"PD Categories: {pd_sample}")
+                logger.info(f"Total non-null PD Categories: {df_prod_loans['PD Category'].notna().sum()}")
+
+                # Apply classification using EXACT Excel formula logic
+                logger.info("Applying Collateral/Security Type classification (Excel formula)...")
+                df_prod_loans["Collateral/Security Type"] = self.safe_apply(
+                    df_prod_loans,
+                    lambda row: self.classify_collateral_excel_formula(
+                        row, property_mortgage_list, vehicles_machinery_list
+                    ),
+                    default_value="Personal and Corporate Guarantees"
+                )
+
+                # Log sample classifications for debugging
+                logger.info("SAMPLE CLASSIFICATIONS (first 10 rows):")
+                for idx in range(min(10, len(df_prod_loans))):
+                    row = df_prod_loans.iloc[idx]
+                    classification = row["Collateral/Security Type"]
+                    logger.info(f"  Row {idx+1}: Contract={row['Contract No']}, PD={row.get('PD Category', 'N/A')}, Product={row.get('Product', 'N/A')} → {classification}")
+
+                # Log classification results
+                classification_counts = df_prod_loans["Collateral/Security Type"].value_counts()
+                logger.info("="*40)
+                logger.info("COLLATERAL CLASSIFICATION RESULTS:")
+                logger.info("="*40)
+                for ctype, count in classification_counts.items():
+                    logger.info(f"  {ctype}: {count}")
+                logger.info("="*40)
+
+                # Special check for Vehicles and Machinery
+                vehicles_count = classification_counts.get("Vehicles and Machinery", 0)
+                logger.info(f"Found {vehicles_count} Vehicles and Machinery contracts (Expected: 6426)")
+
+                if vehicles_count < 6426:
+                    # Find PD Categories that are NOT in vehicles_machinery_list but should be
+                    non_vm_contracts = df_prod_loans[df_prod_loans["Collateral/Security Type"] != "Vehicles and Machinery"]
+                    unique_pd_categories = non_vm_contracts["PD Category"].dropna().unique()
+
+                    logger.warning(f"MISSING {6426 - vehicles_count} Vehicles and Machinery contracts!")
+                    logger.warning(f"PD Categories in non-Vehicles contracts: {list(unique_pd_categories)}")
+                    logger.warning(f"Current vehicles_machinery_list: {vehicles_machinery_list}")
+
+                    # Show specific contracts that might be missing
+                    potential_missing = non_vm_contracts[non_vm_contracts["PD Category"].notna()]
+                    if len(potential_missing) > 0:
+                        logger.warning("Sample contracts with PD Categories that aren't classified as Vehicles and Machinery:")
+                        for idx in range(min(5, len(potential_missing))):
+                            row = potential_missing.iloc[idx]
+                            logger.warning(f"  Contract={row['Contract No']}, PD={row.get('PD Category', 'N/A')}, Current Classification={row['Collateral/Security Type']}")
+                else:
+                    logger.info(f"✓ Found expected {vehicles_count} Vehicles and Machinery contracts")
+
+            except Exception as e:
+                logger.error(f"Error in Collateral/Security Type classification: {e}")
+                df_prod_loans["Collateral/Security Type"] = "Personal and Corporate Guarantees"
+            
+            # Initial Valuation =====================================================
+            try:
+                logger.info("Starting Initial Valuation processing...")
+                df_prod_loans["Initial Valuation"] = None
+                mask = df_prod_loans["Collateral/Security Type"] == "Vehicles and Machinery"
+                
+                # Step 1: PO Listing (SELL_PRICE)
+                if not df_po_listing.empty and "CONTRACT_NO" in df_po_listing.columns and "SELL_PRICE" in df_po_listing.columns:
+                    contract_to_sell_price = dict(
+                        zip(df_po_listing["CONTRACT_NO"].astype(str),
+                            pd.to_numeric(df_po_listing["SELL_PRICE"], errors='coerce'))
                     )
-                ):
-                    processed_count += 1
-            
-            logger.info(f"Step 2 completed: VLOOKUP filled data for {processed_count} contracts (simulated, per column)")
-            
-        except Exception as e:
-            self.log_exception("2", f"Failed to perform Net Portfolio VLOOKUP: {str(e)}")
-            raise
-    
-    def step_3_po_listing_vlookup(self):
-        """Step 3: VLOOKUP from Po Listing for Vehicles and Machinery"""
-        try:
-            logger.info("Step 3: Bulk VLOOKUP from Po Listing for Vehicles and Machinery...")
-            
-            # Read Po Listing data using bulk method
-            po_listing_data = self.read_bulk_data_from_excel(self.po_listing_file)
-            
-            # Get all rows from IA Working sheet where Column U = "Vehicles and Machinery"
-            vehicles_machinery_rows = []
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
+                    # Remove any NaN or invalid values from the mapping
+                    contract_to_sell_price = {k: v for k, v in contract_to_sell_price.items() if pd.notna(v) and v > 0}
+
+                    df_prod_loans.loc[mask, "Initial Valuation"] = (
+                        df_prod_loans.loc[mask, "Contract No"].astype(str).map(contract_to_sell_price)
+                    )
+
+                    po_applied = df_prod_loans.loc[mask, "Initial Valuation"].notna().sum()
+                    logger.info(f"✓ Applied Initial Valuation from PO Listing (SELL_PRICE): {po_applied} contracts")
+                else:
+                    logger.warning("PO Listing data not available or missing required columns")
                 
-                u_value = self.read_cell_value("IA Working", row, 21)  # Column U
-                if u_value == "Vehicles and Machinery":
-                    vehicles_machinery_rows.append((row, contract))
-                row += 1
-            
-            if not vehicles_machinery_rows:
-                logger.info("No rows found with 'Vehicles and Machinery' in Column U")
-                return
-            
-            # Create lookup dictionary for Po Listing data
-            po_lookup_dict = {}
-            for row_data in po_listing_data:
-                if len(row_data) > 33:  # Ensure we have enough columns
-                    contract_key = row_data[7] if len(row_data) > 7 else None  # Column H
-                    sell_price = row_data[33] if len(row_data) > 33 else None  # Column AH
-                    if contract_key:
-                        po_lookup_dict[contract_key] = sell_price
-            
-            # Prepare bulk data for Column V
-            sell_price_data = []
-            for row, contract in vehicles_machinery_rows:
-                sell_price = po_lookup_dict.get(contract, None)
-                sell_price_data.append([sell_price])
-            
-            # Write sell price data in bulk to Column V
-            if sell_price_data:
-                self.write_bulk_data("IA Working", 3, 22, sell_price_data)  # Column V (index 21)
-            
-            logger.info(f"Step 3 completed: Bulk Po Listing data imported for {len(vehicles_machinery_rows)} Vehicles and Machinery rows")
-            
-        except Exception as e:
-            self.log_exception("3", f"Failed to perform Po Listing VLOOKUP: {str(e)}")
-            raise
-    
-    def step_4_info_request_vlookup(self):
-        """Step 4: VLOOKUP from Information Request file"""
-        try:
-            logger.info("Step 4: Bulk VLOOKUP from Information Request file...")
-            
-            # Read Information Request data using bulk method
-            info_request_data = self.read_bulk_data_from_excel(self.info_request_file, sheet_name="Disbursements")
-            
-            # Get all contract numbers from IA Working sheet
-            contracts = []
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                contracts.append((row, contract))
-                row += 1
-            
-            if not contracts:
-                logger.warning("No contracts found in IA Working sheet")
-                return
-            
-            # Create lookup dictionary for Information Request data
-            info_lookup_dict = {}
-            for row_data in info_request_data:
-                if len(row_data) > 6:  # Ensure we have enough columns
-                    contract_key = row_data[2] if len(row_data) > 2 else None  # Column C
-                    enterprise_type = row_data[6] if len(row_data) > 6 else None  # Column G
-                    if contract_key:
-                        # Standardize enterprise type values
-                        if enterprise_type:
-                            enterprise_type = str(enterprise_type).strip().upper()
-                            if enterprise_type in ["SMALL", "MICRO", "MEDIUM", "COOPERATE", "OTHER", "ENTERPRISES"]:
-                                if enterprise_type == "COOPERATE" or enterprise_type == "OTHER":
-                                    enterprise_type = "Cooperate/Other Enterprises"
+                # Step 2: Portfolio Report Recovery (SELL_PRICE)
+                if not df_portfolio_report_recovery.empty and "CONTRACT_NO" in df_portfolio_report_recovery.columns and "SELL_PRICE" in df_portfolio_report_recovery.columns:
+                    recovery_lookup = dict(
+                        zip(df_portfolio_report_recovery["CONTRACT_NO"].astype(str),
+                            pd.to_numeric(df_portfolio_report_recovery["SELL_PRICE"], errors='coerce'))
+                    )
+                    # Remove any NaN or invalid values from the mapping
+                    recovery_lookup = {k: v for k, v in recovery_lookup.items() if pd.notna(v) and v > 0}
+
+                    missing_mask = mask & (
+                        df_prod_loans["Initial Valuation"].isna() |
+                        (df_prod_loans["Initial Valuation"] == 0) |
+                        (df_prod_loans["Initial Valuation"] == "") |
+                        (df_prod_loans["Initial Valuation"] == "Not Valued") |
+                        (df_prod_loans["Initial Valuation"] == "#N/A") |
+                        (df_prod_loans["Initial Valuation"].astype(str).str.strip() == "") |
+                        (df_prod_loans["Initial Valuation"].astype(str).str.upper() == "NOT VALUED") |
+                        (df_prod_loans["Initial Valuation"].astype(str).str.upper() == "#N/A")
+                    )
+
+                    df_prod_loans.loc[missing_mask, "Initial Valuation"] = (
+                        df_prod_loans.loc[missing_mask, "Contract No"].astype(str).map(recovery_lookup)
+                    )
+
+                    recovery_applied = df_prod_loans.loc[missing_mask, "Initial Valuation"].notna().sum()
+                    logger.info(f"✓ Applied Initial Valuation from Portfolio Report Recovery (SELL_PRICE): {recovery_applied} contracts")
+                else:
+                    logger.warning("Portfolio Report Recovery data not available or missing required columns")
+                
+                # Step 3: Scienter Bot for ALL LR contracts with missing Initial Valuation
+                still_missing_mask = mask & (
+                    df_prod_loans["Initial Valuation"].isna() |
+                    (df_prod_loans["Initial Valuation"] == 0) |
+                    (df_prod_loans["Initial Valuation"] == "") |
+                    (df_prod_loans["Initial Valuation"] == "Not Valued") |
+                    (df_prod_loans["Initial Valuation"] == "#N/A") |
+                    (df_prod_loans["Initial Valuation"].astype(str).str.strip() == "") |
+                    (df_prod_loans["Initial Valuation"].astype(str).str.upper() == "NOT VALUED") |
+                    (df_prod_loans["Initial Valuation"].astype(str).str.upper() == "#N/A")
+                )
+
+                # Filter for LR-type contracts only
+                lr_mask = still_missing_mask & df_prod_loans["Contract No"].astype(str).str.startswith("LR")
+
+                if lr_mask.any():
+                    lr_contracts = df_prod_loans.loc[lr_mask, "Contract No"].astype(str).tolist()
+                    logger.info(f"Found {len(lr_contracts)} LR-type contracts needing valuation")
+                    logger.info(f"LR contracts to process: {lr_contracts}")
+
+                    # Load Scienter bot
+                    scienter_bot = self.load_scienter_valuation()
+
+                    if scienter_bot:
+                        try:
+                            # Fetch valuations for ALL LR contracts from Scienter bot
+                            logger.info(f"Sending {len(lr_contracts)} LR contracts to Scienter bot...")
+                            lr_valuations = self.fetch_lr_valuations(lr_contracts, scienter_bot)
+
+                            # Paste the returned data for each LR contract to Initial Valuation column
+                            applied_count = 0
+                            for contract, value in lr_valuations.items():
+                                df_prod_loans.loc[df_prod_loans["Contract No"] == contract, "Initial Valuation"] = value
+                                logger.info(f"Scienter bot: {contract} = {value}")
+                                applied_count += 1
+
+                            logger.info(f"✓ Applied {applied_count} valuations from Scienter bot for LR contracts")
+                        except Exception as e:
+                            logger.error(f"Error running Scienter bot: {e}")
+                            logger.error(traceback.format_exc())
+                    else:
+                        logger.warning("Scienter bot not loaded, skipping LR contract valuation")
+                else:
+                    logger.info("No LR-type contracts require Scienter bot processing")
+                
+                # Step 4: initial_valuation_bot for ALL non-LR contracts with missing Initial Valuation
+                # Update the mask to find non-LR contracts with missing values
+                non_lr_missing_mask = mask & (
+                    df_prod_loans["Initial Valuation"].isna() |
+                    (df_prod_loans["Initial Valuation"] == 0) |
+                    (df_prod_loans["Initial Valuation"] == "") |
+                    (df_prod_loans["Initial Valuation"] == "Not Valued") |
+                    (df_prod_loans["Initial Valuation"] == "#N/A") |
+                    (df_prod_loans["Initial Valuation"].astype(str).str.strip() == "") |
+                    (df_prod_loans["Initial Valuation"].astype(str).str.upper() == "NOT VALUED") |
+                    (df_prod_loans["Initial Valuation"].astype(str).str.upper() == "#N/A")
+                ) & ~df_prod_loans["Contract No"].astype(str).str.startswith("LR")  # Only non-LR contracts
+
+                if non_lr_missing_mask.any() and initial_valuation_bot:
+                    # Get ALL non-LR contracts that need valuation
+                    contracts_to_fetch = df_prod_loans.loc[non_lr_missing_mask, "Contract No"].astype(str).tolist()
+
+                    try:
+                        logger.info(f"Fetching Initial Valuation for {len(contracts_to_fetch)} non-LR contracts via initial_valuation_bot")
+                        logger.info(f"Non-LR contracts to process: {contracts_to_fetch[:20]}...")  # Show first 20
+                        response = initial_valuation_bot.run_valuation_bot(contracts_to_fetch)
+
+                        if isinstance(response, dict):
+                            # Paste the returned data for each non-LR contract to Initial Valuation column
+                            applied_count = 0
+                            for contract, value in response.items():
+                                # Only update if bot returned a valid value
+                                if value and value not in ["", "Not Valued", "#N/A", "N/A"]:
+                                    try:
+                                        numeric_value = pd.to_numeric(value, errors='coerce')
+                                        if pd.notna(numeric_value) and numeric_value > 0:
+                                            df_prod_loans.loc[df_prod_loans["Contract No"] == contract, "Initial Valuation"] = numeric_value
+                                            logger.info(f"initial_valuation_bot: {contract} = {numeric_value}")
+                                            applied_count += 1
+                                        else:
+                                            logger.warning(f"initial_valuation_bot returned invalid/zero value for {contract}: {value}")
+                                    except:
+                                        logger.warning(f"initial_valuation_bot returned non-numeric value for {contract}: {value}")
                                 else:
-                                    enterprise_type = enterprise_type.title()
-                        info_lookup_dict[contract_key] = enterprise_type
-            
-            # Prepare bulk data for Column Y
-            enterprise_type_data = []
-            for row, contract in contracts:
-                enterprise_type = info_lookup_dict.get(contract, None)
-                enterprise_type_data.append([enterprise_type])
-            
-            # Write enterprise type data in bulk to Column Y
-            if enterprise_type_data:
-                self.write_bulk_data("IA Working", 3, 25, enterprise_type_data)  # Column Y (index 24)
-            
-            logger.info(f"Step 4 completed: Bulk Information Request data imported for {len(contracts)} contracts")
-            
-        except Exception as e:
-            self.log_exception("4", f"Failed to perform Information Request VLOOKUP: {str(e)}")
-            raise
-    
-    def step_5_reorganize_special_values(self):
-        """Step 5: Reorganize rows with special values"""
-        try:
-            logger.info("Step 5: Reorganizing rows with special values...")
-            
-            # Read only Column B values first to identify rows to move (much faster)
-            rows_to_move = []
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
+                                    logger.warning(f"initial_valuation_bot returned empty/N/A for {contract}: {value}")
+
+                            logger.info(f"✓ Applied {applied_count} valuations from initial_valuation_bot for non-LR contracts")
+                        else:
+                            logger.warning(f"initial_valuation_bot returned unexpected response type: {type(response)}")
+                    except Exception as e:
+                        logger.error(f"Error running initial_valuation_bot: {e}")
+                        logger.error(traceback.format_exc())
                 
-                # Only read Column B value to check if row needs to be moved
-                b_value = self.read_cell_value("IA Working", row, 2)  # Column B
-                if b_value in ["00", "rg"]:
-                    rows_to_move.append(row)
+                # Log final statistics
+                total_vehicles = mask.sum()
+                valued_count = df_prod_loans.loc[mask, "Initial Valuation"].notna().sum()
+                missing_count = total_vehicles - valued_count
                 
-                row += 1
-            
-            if not rows_to_move:
-                logger.info("Step 5 completed: No rows to reorganize")
-                return
-            
-            logger.info(f"Found {len(rows_to_move)} rows to reorganize")
-            
-            # Get the last row number to append new rows
-            last_row = row - 1  # Last row with data
-            
-            # Read all data for rows that need to be moved in bulk
-            new_rows_data = []
-            for row_num in rows_to_move:
-                # Read entire row data at once
-                row_data = []
-                for col in range(1, 27):  # Columns A-Z (1-26)
-                    value = self.read_cell_value("IA Working", row_num, col)
-                    row_data.append(value)
+                # Breakdown by contract type
+                lr_total = df_prod_loans.loc[mask & df_prod_loans["Contract No"].astype(str).str.startswith("LR")].shape[0]
+                lr_valued = df_prod_loans.loc[mask & df_prod_loans["Contract No"].astype(str).str.startswith("LR"), "Initial Valuation"].notna().sum()
+                non_lr_total = df_prod_loans.loc[mask & ~df_prod_loans["Contract No"].astype(str).str.startswith("LR")].shape[0]
+                non_lr_valued = df_prod_loans.loc[mask & ~df_prod_loans["Contract No"].astype(str).str.startswith("LR"), "Initial Valuation"].notna().sum()
                 
-                # Update Column B value
-                if row_data[1] == "00":  # Column B (index 1)
-                    row_data[1] = "FDL"
-                elif row_data[1] == "rg":  # Column B (index 1)
-                    row_data[1] = "Margin Trading"
+                logger.info("="*60)
+                logger.info("INITIAL VALUATION SUMMARY:")
+                logger.info(f"  Total Vehicles & Machinery: {total_vehicles}")
+                logger.info(f"  Total Valued: {valued_count} ({valued_count/total_vehicles*100:.1f}%)")
+                logger.info(f"  Total Missing: {missing_count} ({missing_count/total_vehicles*100:.1f}%)")
+                logger.info(f"  LR Contracts: {lr_valued}/{lr_total} valued")
+                logger.info(f"  Non-LR Contracts: {non_lr_valued}/{non_lr_total} valued")
+                logger.info("="*60)
                 
-                new_rows_data.append(row_data)
-            
-            # Write all new rows in bulk at the bottom, skipping one blank line
-            if new_rows_data:
-                # Calculate target range for bulk write (leave one blank row)
-                start_row = last_row + 2
-                end_row = start_row + len(new_rows_data) - 1
+                logger.info("✓ Initial Valuation processing completed")
+            except Exception as e:
+                logger.error(f"Error in Initial Valuation processing: {e}")
+                logger.error(traceback.format_exc())
+                df_prod_loans["Initial Valuation"] = None            
+
+            # Other calculations with error handling
+            try:
+                # Annual Interest Cost ========================================================
+                df_prod_loans["Annual Interest Cost"] = (
+                    pd.to_numeric(df_prod_loans["Contract Amount"], errors="coerce") *
+                    pd.to_numeric(df_prod_loans["EIR (%)"], errors="coerce") / 100
+                )
+                df_prod_loans["Annual Interest Cost"] = df_prod_loans["Annual Interest Cost"].round(0).astype("Int64")
+                logger.info("✓ Annual Interest Cost calculated")
                 
-                # Prepare data in the correct format for bulk write (26 columns)
-                bulk_data = []
-                for row_data in new_rows_data:
-                    # Ensure we have exactly 26 columns
-                    while len(row_data) < 26:
-                        row_data.append(None)
-                    bulk_data.append(row_data[:26])  # Truncate to 26 columns if longer
+                # Gross Exposure ===========================================================
+                contract_to_gross_exposure = dict(
+                    zip(df_C1_C2_Working["Contract No"], df_C1_C2_Working["Gross Exposure"])
+                )
+                df_prod_loans["Gross Exposure"] = df_prod_loans["Contract No"].map(contract_to_gross_exposure)
+                df_prod_loans["Gross Exposure"] = df_prod_loans["Gross Exposure"].fillna(df_prod_loans["Contract Amount"])
+                df_prod_loans["Gross Exposure"] = (
+                    pd.to_numeric(df_prod_loans["Gross Exposure"], errors="coerce")
+                    .round(0)
+                    .astype("Int64")
+                )
+                logger.info("✓ Gross Exposure calculated")
                 
-                # Bulk write all new rows at once
-                target_range = f"A{start_row}:Z{end_row}"
-                worksheet = self.get_worksheet("IA Working")
-                worksheet.Range(target_range).Value = bulk_data
+                # Normal/Concessionary classification ===============================================================
+                prod_file_path = self._find_file("Prod. wise Class. of Loans")
+                df_nbd_sheet = pd.read_excel(prod_file_path, sheet_name="NBD-MF-23-IA", header=None)
+                l20_value = df_nbd_sheet.iloc[19, 11]
                 
-                logger.info(f"Bulk wrote {len(new_rows_data)} rows to {target_range} (after one blank row)")
-            
-            # Clear original rows with special values one-by-one to avoid clearing in-between rows
-            worksheet = self.get_worksheet("IA Working")
-            for r in sorted(rows_to_move, reverse=True):
-                worksheet.Range(f"A{r}:Z{r}").ClearContents()
-            logger.info(f"Cleared {len(rows_to_move)} original rows")
-            
-            logger.info(f"Step 5 completed: {len(rows_to_move)} rows reorganized using bulk operations with line skipping")
-            
-        except Exception as e:
-            self.log_exception("5", f"Failed to reorganize special values: {str(e)}")
-            # Log additional debugging information
-            logger.error(f"Step 5 error details: {str(e)}")
-            logger.error(f"Rows to move count: {len(rows_to_move) if 'rows_to_move' in locals() else 'Not defined'}")
-            raise
-    
-    def step_6_handle_na_contracts(self):
-        """Step 6: Handle missing core fields using bot API (C,D,I,J,L,P) with retries"""
-        try:
-            logger.info("Step 6: Finding rows with missing C,D,I,J,L,P and fetching via bot...")
-            
-            # Find contracts with blanks in required columns
-            targets = []
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
+                df_staff_loan = pd.read_excel(prod_file_path, sheet_name="Staff_Loan", usecols="F", skiprows=3)
+                icam_list = df_staff_loan["ICAM"].dropna().tolist()
                 
-                # Read required columns
-                c_val = self.read_cell_value("IA Working", row, 3)   # C - client_code
-                d_val = self.read_cell_value("IA Working", row, 4)   # D - equipment
-                i_val = self.read_cell_value("IA Working", row, 9)   # I - frequency
-                j_val = self.read_cell_value("IA Working", row, 10)  # J - contract_period
-                l_val = self.read_cell_value("IA Working", row, 12)  # L - interest_rate
-                p_val = self.read_cell_value("IA Working", row, 16)  # P - contract_amount
+                def calc_normal_concessionary(row):
+                    try:
+                        if row["Minimum Rate (Final)"] > l20_value:
+                            return "Normal"
+                        elif row["Client Code"] in icam_list:
+                            return "Concessionary"
+                        else:
+                            return "Normal"
+                    except:
+                        return "Normal"
                 
-                def _is_blank(v):
-                    return v is None or (isinstance(v, str) and v.strip() in ("", "#N/A"))
+                df_prod_loans["Normal/Concessionary"] = self.safe_apply(
+                    df_prod_loans, calc_normal_concessionary, default_value="Normal"
+                )
+                logger.info("✓ Normal/Concessionary classification completed")
+
+                # PD Category already mapped earlier (before Collateral classification)
+                logger.info("✓ PD Category mapping already completed earlier")
                 
-                if any([_is_blank(c_val), _is_blank(d_val), _is_blank(i_val), _is_blank(j_val), _is_blank(l_val), _is_blank(p_val)]):
-                    # Normalize contract string for bot requests/logging
-                    c_str = str(contract).strip()
-                    targets.append((row, c_str))
-                row += 1
+            except Exception as e:
+                logger.error(f"Error in final calculations: {e}")
+                logger.error(traceback.format_exc())
             
-            if not targets:
-                logger.info("Step 6: No rows with missing data in C,D,I,J,L,P")
-                return
-            
-            # De-duplicate contracts preserving first occurrence order
-            seen = set()
-            unique_targets = []
-            for row_idx, c in targets:
-                if c not in seen:
-                    seen.add(c)
-                    unique_targets.append((row_idx, c))
-            if len(unique_targets) != len(targets):
-                logger.info(f"Step 6: De-duplicated contracts: {len(targets)} -> {len(unique_targets)}")
-            targets = unique_targets
-            
-            requested_contracts = [c for _, c in targets]
-            logger.info(f"Step 6: Sending {len(requested_contracts)} contracts to bot for enrichment: sample {requested_contracts[:10]}")
-            
-            # Retry logic: attempt fetching data up to 3 times, narrowing to still-missing contracts
-            contract_data = {}
-            max_retries = 3
-            base_delay_sec = 5
-            missing_contracts = list(requested_contracts)
-            for attempt in range(1, max_retries + 1):
-                if not missing_contracts:
-                    break
+            logger.info("="*80)
+            logger.info(f"build_prod_loans COMPLETED - Generated {len(df_prod_loans)} rows")
+            logger.info(f"FINAL COLUMNS: {df_prod_loans.columns.tolist()}")
+            logger.info("="*80)
+
+            # Add LTV % column ================================================
+            def calculate_ltv(row):
                 try:
-                    logger.info(f"Bot fetch attempt {attempt}/{max_retries} for {len(missing_contracts)} contracts")
-                    fetched = run_contract_search_bot(missing_contracts)
-                    returned_keys = list(fetched.keys()) if isinstance(fetched, dict) else []
-                    logger.info(f"Bot returned {len(returned_keys)} results on attempt {attempt}: sample {returned_keys[:10]}")
-                    if isinstance(fetched, dict):
-                        for k, v in fetched.items():
-                            # Normalize key
-                            key = str(k).strip()
-                            if key not in contract_data and v:
-                                contract_data[key] = v
+                    if row["Collateral/Security Type"] == "Vehicles and Machinery":
+                        contract_amount = pd.to_numeric(row["Contract Amount"], errors='coerce')
+                        initial_valuation = pd.to_numeric(row["Initial Valuation"], errors='coerce')
+
+                        if (pd.notna(contract_amount) and pd.notna(initial_valuation) and
+                            initial_valuation != 0 and initial_valuation is not None):
+                            ltv_ratio = (contract_amount / initial_valuation) * 100  # Convert to percentage
+                            return round(ltv_ratio, 2)  # Round to 2 decimal places
+                    return 0.00
+                except Exception as e:
+                    logger.debug(f"Error calculating LTV for contract {row.get('Contract No', 'Unknown')}: {e}")
+                    return 0.00
+
+            df_prod_loans["LTV %"] = df_prod_loans.apply(calculate_ltv, axis=1)
+
+            # WALTV % ==========================================================
+            try:
+                # Ensure Gross Exposure is numeric
+                df_prod_loans["Gross Exposure"] = pd.to_numeric(df_prod_loans["Gross Exposure"], errors='coerce').fillna(0)
+
+                # Compute total gross exposure grouped by Collateral/Security Type
+                total_gross_by_type = df_prod_loans.groupby("Collateral/Security Type")["Gross Exposure"].transform("sum")
+
+                # Formula directly
+                df_prod_loans["WALTV %"] = 0.00
+                mask = df_prod_loans["Collateral/Security Type"] == "Vehicles and Machinery"
+
+                # Only calculate if we have valid data
+                if mask.any() and total_gross_by_type[mask].sum() > 0:
+                    waltv_calculation = (
+                        df_prod_loans.loc[mask, "Gross Exposure"] / total_gross_by_type[mask]
+                    ) * (df_prod_loans.loc[mask, "LTV %"] / 100)  # Convert LTV % back to ratio for calculation
+                    df_prod_loans.loc[mask, "WALTV %"] = (waltv_calculation * 100).round(2)  # Convert to percentage with 2 decimals
+
+                logger.info("✓ WALTV % calculation completed")
+            except Exception as e:
+                logger.error(f"Error in WALTV % calculation: {e}")
+                df_prod_loans["WALTV %"] = 0
+
+
+            # Check specifically for the missing columns
+            required_columns = ["Collateral/Security Type", "Initial Valuation"]
+            missing_columns = [col for col in required_columns if col not in df_prod_loans.columns]
+            if missing_columns:
+                logger.error(f"MISSING REQUIRED COLUMNS: {missing_columns}")
+            else:
+                logger.info("✓ All required columns present")
+
+            # Get minimum rate threshold from master data and validate rates
+            try:
+                # Try to get from master data first, then use command line override if provided
+                minimum_rate_final = self.get_minimum_rate_threshold(df_product_cat)
+
+                # Use command line override if master data extraction failed
+                if hasattr(self, 'minimum_rate_override') and self.minimum_rate_override is not None:
+                    logger.info(f"Using command line minimum rate override: {self.minimum_rate_override}%")
+                    minimum_rate_final = self.minimum_rate_override
+
+                exception_report_path = os.path.join(self.ia_folder, "Minimum_Rate_Exceptions.xlsx")
+
+                logger.info(f"Validating Minimum Rate (Final) against threshold: {minimum_rate_final}%")
+
+                # Ensure required columns exist
+                required_cols = ["Contract No", "Minimum Rate (Final)"]
+                missing_cols = [col for col in required_cols if col not in df_prod_loans.columns]
+                if missing_cols:
+                    logger.warning(f"Missing columns for rate validation: {missing_cols}")
+                else:
+                    # Convert Minimum Rate (Final) to numeric for comparison
+                    df_prod_loans["Minimum Rate (Final)"] = pd.to_numeric(df_prod_loans["Minimum Rate (Final)"], errors='coerce')
+
+                    # Find exceptions where rate > threshold
+                    exceptions_mask = df_prod_loans["Minimum Rate (Final)"] > minimum_rate_final
+                    exceptions = df_prod_loans[exceptions_mask].copy()
+
+                    if not exceptions.empty:
+                        # Add reference column for clarity
+                        exceptions["Expected Max Rate"] = minimum_rate_final
+                        exceptions["Rate Difference"] = exceptions["Minimum Rate (Final)"] - minimum_rate_final
+
+                        # Reorder columns for better readability
+                        exception_cols = ["Contract No", "Product", "Client Code", "Minimum Rate (Final)",
+                                        "Expected Max Rate", "Rate Difference", "Equipment", "Purpose"]
+                        available_cols = [col for col in exception_cols if col in exceptions.columns]
+                        remaining_cols = [col for col in exceptions.columns if col not in available_cols]
+                        exceptions = exceptions[available_cols + remaining_cols]
+
+                        # Export to Excel in same folder
+                        exceptions.to_excel(exception_report_path, index=False)
+                        logger.warning(f"Exception report generated at {exception_report_path} with {len(exceptions)} records exceeding {minimum_rate_final}%")
+                        logger.warning(f"Contracts with high rates: {exceptions['Contract No'].tolist()[:10]}...")  # Show first 10
                     else:
-                        logger.warning("Bot returned unexpected payload; expected dict")
-                except Exception as bot_error:
-                    self.log_exception("6", f"Bot invocation failed on attempt {attempt}: {str(bot_error)}")
-                
-                # Determine which contracts still have no data
-                still_missing = [c for c in missing_contracts if c not in contract_data]
-                logger.info(f"After attempt {attempt}: processed {len(missing_contracts) - len(still_missing)}, remaining {len(still_missing)}: sample {still_missing[:10]}")
-                missing_contracts = still_missing
-                if missing_contracts and attempt < max_retries:
-                    delay = base_delay_sec * attempt
-                    logger.info(f"Retrying bot for {len(missing_contracts)} contracts after {delay}s")
-                    time.sleep(delay)
+                        logger.info(f"✓ All {len(df_prod_loans)} contracts have rates within threshold ({minimum_rate_final}%)")
+
+            except Exception as e:
+                logger.error(f"Error in minimum rate validation: {e}")
+                logger.error(traceback.format_exc())
             
-            if missing_contracts:
-                logger.warning(f"Bot data missing for {len(missing_contracts)} contracts after retries: sample {missing_contracts[:10]}")
-            
-            # Update worksheet with returned data
-            def _apply_data_to_row(row_idx, data):
-                if self.read_cell_value("IA Working", row_idx, 3) in (None, '', '#N/A'):
-                    self.write_cell_value("IA Working", row_idx, 3, data.get('client_code', ''))      # C
-                if self.read_cell_value("IA Working", row_idx, 4) in (None, '', '#N/A'):
-                    self.write_cell_value("IA Working", row_idx, 4, data.get('equipment', ''))        # D
-                if self.read_cell_value("IA Working", row_idx, 10) in (None, '', '#N/A'):
-                    self.write_cell_value("IA Working", row_idx, 10, data.get('contract_period', '')) # J
-                if self.read_cell_value("IA Working", row_idx, 9) in (None, '', '#N/A'):
-                    self.write_cell_value("IA Working", row_idx, 9, data.get('frequency', ''))        # I
-                if self.read_cell_value("IA Working", row_idx, 12) in (None, '', '#N/A'):
-                    self.write_cell_value("IA Working", row_idx, 12, data.get('interest_rate', ''))   # L
-                existing_p = self.read_cell_value("IA Working", row_idx, 16)
-                if existing_p in (None, '', '#N/A', 0, '0'):
-                    amount = data.get('contract_amount')
-                    if amount in (None, '', '#N/A', 0, '0'):
-                        amount = data.get('AT_limit')
-                    if amount is not None:
-                        self.write_cell_value("IA Working", row_idx, 16, amount)  # P
+            # List of columns to divide by 100
+            cols_to_scale = ["Minimum Rate (Final)", "Contractual Interest Rate", "Base Rate", "LTV %", "WALTV %"]
 
-            updated = 0
-            for row_idx, contract in targets:
-                data = contract_data.get(contract)
-                if not data:
-                    continue
-                _apply_data_to_row(row_idx, data)
-                updated += 1
+            # Divide numeric values by 100
+            for col in cols_to_scale:
+                if col in df_prod_loans.columns:
+                    df_prod_loans[col] = pd.to_numeric(df_prod_loans[col], errors="coerce") / 100
 
-            # Second pass: if still missing any of C,D,I,J,L,P, try bot again with retries
-            second_targets = []
-            for row_idx, contract in targets:
-                c2 = self.read_cell_value("IA Working", row_idx, 3)
-                d2 = self.read_cell_value("IA Working", row_idx, 4)
-                i2 = self.read_cell_value("IA Working", row_idx, 9)
-                j2 = self.read_cell_value("IA Working", row_idx, 10)
-                l2 = self.read_cell_value("IA Working", row_idx, 12)
-                p2 = self.read_cell_value("IA Working", row_idx, 16)
-                if any(v in (None, '', '#N/A', 0, '0') for v in (c2, d2, i2, j2, l2, p2)):
-                    second_targets.append((row_idx, contract))
+            # Mask for FDL and Margin Trading rows (case-insensitive)
+            mask_special = df_prod_loans["Product"].str.strip().str.lower().isin(["fdl", "margin trading"])
 
-            if second_targets:
-                logger.info(f"Step 6: Second enrichment pass for {len(second_targets)} rows")
-                missing = [c for _, c in second_targets]
-                second_data = {}
-                for attempt in range(1, max_retries + 1):
-                    if not missing:
-                        break
-                    try:
-                        logger.info(f"Second pass bot fetch attempt {attempt}/{max_retries} for {len(missing)} contracts")
-                        fetched2 = run_contract_search_bot(missing)
-                        rkeys2 = list(fetched2.keys()) if isinstance(fetched2, dict) else []
-                        logger.info(f"Second pass returned {len(rkeys2)} results on attempt {attempt}: sample {rkeys2[:10]}")
-                        if isinstance(fetched2, dict):
-                            for k, v in fetched2.items():
-                                key = str(k).strip()
-                                if key not in second_data and v:
-                                    second_data[key] = v
-                    except Exception as bot_error:
-                        self.log_exception("6", f"Second pass bot failed on attempt {attempt}: {str(bot_error)}")
-                    missing = [c for c in missing if c not in second_data]
-                    logger.info(f"Second pass after attempt {attempt}: remaining {len(missing)}")
-                    if missing and attempt < max_retries:
-                        delay = base_delay_sec * attempt
-                        logger.info(f"Retrying second pass after {delay}s for {len(missing)} contracts")
-                        time.sleep(delay)
+            # ---- Step 1: Apply transformations to special rows ----
 
-                for row_idx, contract in second_targets:
-                    data = second_data.get(contract)
-                    if not data:
-                        continue
-                    _apply_data_to_row(row_idx, data)
+            # Columns to clear
+            cols_to_clear = ["Client Code", "Equipment", "Purpose", "Frequency", "Contract Period", "Tenure (Months)"]
+            df_prod_loans.loc[mask_special, cols_to_clear] = ""
 
-            total_requested = len(requested_contracts)
-            total_processed = len({c for c in requested_contracts if c in contract_data})
-            logger.info(f"Step 6 completed: requested {total_requested}, processed {total_processed}, missing {total_requested - total_processed}")
+            # Assign Base Rate to interest columns for the special rows
+            interest_cols = ["Minimum Rate (Final)", "Contractual Interest Rate", "EIR (%)"]
+            df_prod_loans.loc[mask_special, interest_cols] = df_prod_loans.loc[mask_special, "Base Rate"]
+
+            # Assign Contract Amount and Annual Interest Cost = Disbursed Amount (Net of DC)
+            df_prod_loans.loc[mask_special, ["Contract Amount", "Annual Interest Cost"]] = df_prod_loans.loc[mask_special, "Disbursed Amount (Net of DC)"]
+
+            # Additional adjustments for Margin Trading only
+            mask_margin = df_prod_loans["Product"].str.strip().str.lower() == "margin trading"
+            df_prod_loans.loc[mask_margin, "Corporate Clients"] = ""
+            df_prod_loans.loc[mask_margin, "MSME Classification"] = "Small"
+
+            # ---- Step 2: Move special rows to the bottom ----
+
+            # Split into normal and special rows
+            df_normal = df_prod_loans[~mask_special]
+            df_special = df_prod_loans[mask_special]
+
+            # Create an empty row (all blank)
+            empty_row = pd.DataFrame([[""] * len(df_prod_loans.columns)], columns=df_prod_loans.columns)
+
+            # Concatenate: normal rows + empty row + special rows
+            df_prod_loans = pd.concat([df_normal, empty_row, df_special], ignore_index=True)
+
+
+            # Columns to copy
+            cols_to_copy = ["Product", "Equipment", "Purpose", "Corporate Clients"]
+
+            # Filter rows where 'Type of Loans (1.3.1.0.0.0)' is '#N/A'
+            mask_na_type = df_prod_loans["Type of Loans (1.3.1.0.0.0)"] == "#N/A"
+
+            # Create new dataframe with the selected columns
+            df_add_product_type = df_prod_loans.loc[mask_na_type, cols_to_copy].copy()
+
+            # Remove duplicate rows (all columns duplicate)
+            df_add_product_type.drop_duplicates(inplace=True)
+
+            # Optional: reset index for clean sequential index
+            df_add_product_type.reset_index(drop=True, inplace=True)
+
+
+            # Rearrange columns in the specified order
+            desired_column_order = [
+                "Contract No",
+                "Product",
+                "Client Code",
+                "Equipment",
+                "Purpose",
+                "Corporate Clients",
+                "Type of Loans (1.3.1.0.0.0)",
+                "Normal/Concessionary",
+                "Frequency",
+                "Contract Period",
+                "Tenure (Months)",
+                "Minimum Rate (Final)",
+                "Contractual Interest Rate",
+                "Base Rate",
+                "Disbursed Amount (Net of DC)",
+                "Contract Amount",
+                "Annual Interest Cost",
+                "EIR (%)",
+                "Gross Exposure",
+                "PD Category",
+                "Collateral/Security Type",
+                "Initial Valuation",
+                "LTV %",
+                "WALTV %",
+                "MSME Classification"
+            ]
+
+            # Only include columns that exist in the dataframe
+            existing_columns = [col for col in desired_column_order if col in df_prod_loans.columns]
+
+            # Add any remaining columns that weren't specified
+            remaining_columns = [col for col in df_prod_loans.columns if col not in existing_columns]
+            final_column_order = existing_columns + remaining_columns
+
+            df_prod_loans = df_prod_loans[final_column_order]
+            logger.info(f"✓ Columns rearranged. Final order: {df_prod_loans.columns.tolist()}")
+
+            # Final debugging - check what contracts we ended up with
+            final_product_counts = df_prod_loans["Product"].value_counts()
+            logger.info(f"FINAL CONTRACT COUNT: {len(df_prod_loans)} contracts")
+            logger.info(f"FINAL Product distribution: {final_product_counts.to_dict()}")
+
+            final_fdl_count = len(df_prod_loans[df_prod_loans["Product"] == "FDL"])
+            final_margin_trading_count = len(df_prod_loans[df_prod_loans["Product"] == "Margin Trading"])
+            logger.info(f"FINAL FDL contracts: {final_fdl_count}, FINAL Margin Trading contracts: {final_margin_trading_count}")
+
+            print(df_prod_loans)
+            return df_prod_loans
             
         except Exception as e:
-            self.log_exception("6", f"Failed to handle missing contracts via bot: {str(e)}")
+            logger.error(f"CRITICAL ERROR in build_prod_loans: {e}")
+            logger.error(traceback.format_exc())
             raise
     
-    def step_7_check_blank_cells(self):
-        """Step 7: Check for blank cells and report exceptions"""
+    
+    
+    def save_report(self, df_prod_loans, picked_date):
+        """Paste data to IA Working sheet using fast pandas Excel writing,
+        check Product_Cat classification for missing values,
+        and verify C39 of NBD-MF-23-IA sheet after pasting data."""
         try:
-            logger.info("Step 7: Checking for blank cells (bulk)...")
-            
-            # Clean up any 65535 artifacts before validation
-            self._cleanup_65535_artifacts()
-            
-            # Determine last data row using Column A
-            last_row = self.find_last_row("IA Working", 1)
-            if last_row < 3:
-                logger.info("Step 7: No data rows found")
-                return
-            
-            # Read the entire data block in one go: A3:Z{last_row}
-            worksheet = self.get_worksheet("IA Working")
-            range_str = f"A3:Z{last_row}"
-            data = worksheet.Range(range_str).Value
-            
-            if not data:
-                logger.info("Step 7: No data in range")
-                return
-            
-            # Normalize Excel COM return shape to a list of rows
-            if isinstance(data, tuple):
-                if data and not isinstance(data[0], (tuple, list)):
-                    rows = [list(data)]
+            # Find the Prod. wise Class. of Loans file
+            prod_file_path = self._find_file("Prod. wise Class. of Loans")
+
+            # Validate dataframe before saving
+            if df_prod_loans.empty:
+                logger.warning("DataFrame is empty. Nothing to paste.")
+                return prod_file_path
+
+            logger.info(f"Fast pasting {len(df_prod_loans)} rows x {len(df_prod_loans.columns)} columns to IA Working sheet")
+
+            # Clean dataframe values
+            df_clean = df_prod_loans.copy()
+            for col in df_clean.columns:
+                if pd.api.types.is_numeric_dtype(df_clean[col]):
+                    df_clean[col] = df_clean[col].fillna(0)
                 else:
-                    rows = [list(r) for r in data]
-            else:
-                rows = data
-            
-            blank_cells = []
-            start_row_index = 3
-            
-            for offset, row_vals in enumerate(rows):
-                row_num = start_row_index + offset
-                if not isinstance(row_vals, (list, tuple)):
-                    row_vals = [row_vals]
-                
-                # Contract number in Column A (index 0)
-                contract = row_vals[0] if len(row_vals) > 0 else None
-                if not contract:
-                    continue
-                
-                # Scan columns A..Z (1..26) except column E (5) and Z (26)
-                for col in range(1, 27):
-                    if col in (5, 26):
-                        continue
-                    value = row_vals[col - 1] if len(row_vals) >= col else None
-                    if value is None or (isinstance(value, str) and value.strip() == ""):
-                        blank_cells.append({
-                            'row': row_num,
-                            'column': col,
-                            'contract': contract
-                        })
-            
-            if blank_cells:
-                for blank in blank_cells:
-                    self.log_exception("7", f"Blank cell found at {chr(64 + blank['column'])}{blank['row']}", blank['contract'])
-            
-            logger.info(f"Step 7 completed: Found {len(blank_cells)} blank cells via bulk read")
-            
-        except Exception as e:
-            self.log_exception("7", f"Failed to check blank cells: {str(e)}")
-            raise
-    
-    def step_8_handle_special_columns(self):
-        """Step 8: Handle special column logic for FDL and Margin Trading"""
-        try:
-            logger.info("Step 8: Handling special column logic...")
-            
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                
-                b_value = self.read_cell_value("IA Working", row, 2)  # Column B
-                
-                if b_value == "FDL":
-                    # Clear C,D,E,I,J,K cells
-                    self.clear_range("IA Working", row, row, 3, 5)   # C,D,E
-                    self.clear_range("IA Working", row, row, 9, 11)  # I,J,K
-                    
-                    # Check if L,M cells are empty or #N/A or 0
-                    l_value = self.read_cell_value("IA Working", row, 12)  # Column L
-                    m_value = self.read_cell_value("IA Working", row, 13)  # Column M
-                    
-                    if l_value is None or str(l_value) in ['#N/A', '0'] or l_value == 0:
-                        n_value = self.read_cell_value("IA Working", row, 14)  # Column N
-                        o_value = self.read_cell_value("IA Working", row, 15)  # Column O
-                        
-                        if n_value is not None:
-                            self.write_cell_value("IA Working", row, 12, n_value)  # L
-                            self.write_cell_value("IA Working", row, 17, o_value)  # Q
-                            self.write_cell_value("IA Working", row, 16, o_value)  # P
-                            self.write_cell_value("IA Working", row, 18, n_value)  # R
-                
-                elif b_value == "Margin Trading":
-                    # Clear C,D,E,F,I,J,K cells
-                    self.clear_range("IA Working", row, row, 3, 6)   # C,D,E,F
-                    self.clear_range("IA Working", row, row, 9, 11)  # I,J,K
-                    
-                    # Check if L,M cells are empty or #N/A or 0
-                    l_value = self.read_cell_value("IA Working", row, 12)  # Column L
-                    m_value = self.read_cell_value("IA Working", row, 13)  # Column M
-                    
-                    if l_value is None or str(l_value) in ['#N/A', '0'] or l_value == 0:
-                        n_value = self.read_cell_value("IA Working", row, 14)  # Column N
-                        if n_value is not None:
-                            self.write_cell_value("IA Working", row, 12, n_value)  # L
-                            self.write_cell_value("IA Working", row, 25, "Small")  # Y
-                
-                row += 1
-            
-            logger.info("Step 8 completed: Special column logic applied")
-            
-        except Exception as e:
-            self.log_exception("8", f"Failed to handle special columns: {str(e)}")
-            raise
-    
-    def step_9_handle_purpose_column(self):
-        """Step 9: Handle purpose column and Product_Cat sheet"""
-        try:
-            logger.info("Step 9: Handling purpose column and Product_Cat sheet...")
-            
-            # Clear 0 or #N/A values in column E
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                
-                e_value = self.read_cell_value("IA Working", row, 5)  # Column E
-                if e_value in [0, '#N/A'] or str(e_value) in ['0', '#N/A']:
-                    self.write_cell_value("IA Working", row, 5, None)
-                
-                row += 1
-            
-            # Filter column G for #N/A and copy data
-            data_to_copy = []
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                
-                g_value = self.read_cell_value("IA Working", row, 7)  # Column G
-                if g_value == '#N/A':
-                    b_value = self.read_cell_value("IA Working", row, 2)  # Column B
-                    d_value = self.read_cell_value("IA Working", row, 4)  # Column D
-                    e_value = self.read_cell_value("IA Working", row, 5)  # Column E
-                    f_value = self.read_cell_value("IA Working", row, 6)  # Column F
-                    
-                    data_to_copy.append({
-                        'b': b_value,
-                        'd': d_value,
-                        'e': e_value,
-                        'f': f_value
-                    })
-                
-                row += 1
-            
-            # Remove duplicates
-            unique_data = []
-            seen = set()
-            for item in data_to_copy:
-                key = (item['b'], item['d'], item['e'], item['f'])
-                if key not in seen:
-                    seen.add(key)
-                    unique_data.append(item)
-            
-            # Create or update Product_Cat sheet
+                    df_clean[col] = df_clean[col].fillna("")
+
+            # Extract unique combinations and paste to Product_Cat sheet
+            logger.info("Extracting unique Product, Equipment, Purpose, Corporate Clients combinations...")
+            cols_for_product_cat = ["Product", "Equipment", "Purpose", "Corporate Clients"]
+            df_unique_combinations = df_clean[cols_for_product_cat].drop_duplicates().reset_index(drop=True)
+            logger.info(f"Found {len(df_unique_combinations)} unique combinations")
+
+            # Paste to Product_Cat sheet
             try:
-                # Try to get the Product_Cat worksheet
-                product_cat_ws = self.get_worksheet("Product_Cat")
-                logger.info("Product_Cat sheet found, updating existing data")
-            except:
-                # Create new Product_Cat sheet if it doesn't exist
-                logger.info("Product_Cat sheet not found, creating new sheet")
-                product_cat_ws = self.workbook.Worksheets.Add()
-                product_cat_ws.Name = "Product_Cat"
-            
-            # Clear existing data and add new data
-            if unique_data:
-                # Clear the sheet first
-                self.clear_range("Product_Cat", 1, len(unique_data) + 1, 1, 5)
-                
-                # Add headers
-                self.write_cell_value("Product_Cat", 1, 1, "B_Value")
-                self.write_cell_value("Product_Cat", 1, 2, "D_Value")
-                self.write_cell_value("Product_Cat", 1, 3, "E_Value")
-                self.write_cell_value("Product_Cat", 1, 4, "F_Value")
-                self.write_cell_value("Product_Cat", 1, 5, "Classification")
-                
-                # Add data
-                for i, item in enumerate(unique_data):
-                    row = i + 2
-                    self.write_cell_value("Product_Cat", row, 1, item['b'])  # B -> A
-                    self.write_cell_value("Product_Cat", row, 2, item['d'])  # D -> B
-                    self.write_cell_value("Product_Cat", row, 3, item['e'])  # E -> C
-                    self.write_cell_value("Product_Cat", row, 4, item['f'])  # F -> D
-                    # Classification will be filled later via WorkHub24 API
-            
-            logger.info(f"Step 9 completed: {len(unique_data)} unique records copied to Product_Cat")
-            
-        except Exception as e:
-            self.log_exception("9", f"Failed to handle purpose column: {str(e)}")
-            raise
-    
-    def step_10_filter_vehicles_machinery(self):
-        """Step 10: Filter Vehicles and Machinery rows"""
-        try:
-            logger.info("Step 10: Filtering Vehicles and Machinery rows...")
-            
-            vehicles_machinery_rows = []
-            row = 3
-            
-            # Read through IA Working sheet to find rows with "Vehicles and Machinery" in Column U
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                
-                u_value = self.read_cell_value("IA Working", row, 21)  # Column U
-                if u_value == "Vehicles and Machinery":
-                    vehicles_machinery_rows.append(row)
-                
-                row += 1
-            
-            # Cache for reuse in Step 11 to avoid re-scan
-            self._vehicles_machinery_rows = vehicles_machinery_rows
-            
-            logger.info(f"Step 10 completed: Found {len(vehicles_machinery_rows)} Vehicles and Machinery rows")
-            return vehicles_machinery_rows
-            
-        except Exception as e:
-            self.log_exception("10", f"Failed to filter Vehicles and Machinery: {str(e)}")
-            raise
-    
-    def step_11_po_listing_mapping(self):
-        """Step 11: Po Listing mapping and Portfolio Recovery fallback"""
-        try:
-            logger.info("Step 11: Po Listing mapping and Portfolio Recovery fallback...")
-            
-            # Read Po Listing data using bulk method
-            po_listing_data = self.read_bulk_data_from_excel(self.po_listing_file)
-            
-            # Read Portfolio Recovery data (if file exists)
-            portfolio_recovery_data = None
-            if self.portfolio_recovery_file and self.portfolio_recovery_file.exists():
-                portfolio_recovery_data = self.read_bulk_data_from_excel(self.portfolio_recovery_file)
-            else:
-                logger.warning("Portfolio Report Recovery file not found - will skip fallback mapping")
-            
-            # Get Vehicles and Machinery rows from cache if available
-            vehicles_rows = getattr(self, '_vehicles_machinery_rows', None)
-            if vehicles_rows is None:
-                vehicles_rows = self.step_10_filter_vehicles_machinery()
-            
-            # Create lookup dictionaries using normalized contract number from Column H (index 7)
-            po_lookup_dict = {}
-            for row_data in po_listing_data:
-                if isinstance(row_data, (list, tuple)) and len(row_data) > 33:
-                    contract_h = row_data[7] if len(row_data) > 7 else None  # Column H
-                    key = self._normalize_contract(contract_h)
-                    sell_price = row_data[33] if len(row_data) > 33 else None  # Column AH
-                    if key and sell_price is not None:
-                        po_lookup_dict[key] = sell_price
-            
-            portfolio_lookup_dict = {}
-            if portfolio_recovery_data:
-                for row_data in portfolio_recovery_data:
-                    if isinstance(row_data, (list, tuple)) and len(row_data) > 33:
-                        contract_h = row_data[7] if len(row_data) > 7 else None  # Column H
-                        key = self._normalize_contract(contract_h)
-                        sell_price = row_data[33] if len(row_data) > 33 else None  # Column AH
-                        if key and sell_price is not None:
-                            portfolio_lookup_dict[key] = sell_price
-            
-            # Process each Vehicles and Machinery row
-            missing_contracts = []
-            updated_rows = []
-            for row in vehicles_rows:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                key = self._normalize_contract(contract)
-                if not key:
-                    continue
-                
-                sell_price = po_lookup_dict.get(key)
-                if sell_price is None:
-                    sell_price = portfolio_lookup_dict.get(key)
-                
-                if sell_price is not None:
-                    # Skip if V cell has formula; preserve formulas
-                    if self.cell_has_formula("IA Working", row, 22):
-                        continue
-                    # Ensure numeric type
-                    try:
-                        if isinstance(sell_price, str):
-                            sell_price = float(sell_price.replace(',', '').strip())
-                    except Exception:
-                        pass
-                    self.write_cell_value("IA Working", row, 22, sell_price)  # Column V (index 21)
-                    updated_rows.append(row)
-                else:
-                    missing_contracts.append(contract)
-            
-            # Convert V column to numbers only for updated rows (and only if not formulas)
-            for row in updated_rows:
-                if self.cell_has_formula("IA Working", row, 22):
-                    continue
-                v_value = self.read_cell_value("IA Working", row, 22)  # Column V (index 21)
-                if isinstance(v_value, str):
-                    v_clean = v_value.replace(',', '').strip()
-                    try:
-                        v_value = float(v_clean)
-                    except Exception:
-                        continue
-                    self.write_cell_value("IA Working", row, 22, v_value)
-            
-            if missing_contracts:
-                logger.warning(f"No Po Listing or Portfolio Recovery data found for {len(missing_contracts)} contracts (sample: {missing_contracts[:20]})")
-            
-            logger.info("Step 11 completed: Po Listing mapping and Portfolio Recovery fallback")
-            
-        except Exception as e:
-            self.log_exception("11", f"Failed to perform Po Listing mapping: {str(e)}")
-            raise
-    
-    def step_12_valuation_bot_integration(self):
-        """Step 12: Integration with IA_Working_Initial_valuation_bot"""
-        try:
-            logger.info("Step 12: Running valuation bot for remaining #N/A values...")
-            
-            # Find remaining #N/A and "Not Valued" in column V
-            remaining_contracts = []
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                
-                v_value = self.read_cell_value("IA Working", row, 22)  # Column V (index 21)
-                if v_value in ['#N/A', 'Not Valued']:
-                    remaining_contracts.append((row, contract))
-                
-                row += 1
-            
-            if remaining_contracts:
-                if valuation_bot:
-                    try:
-                        # Import and run the valuation bot
-                        contract_numbers = [contract for _, contract in remaining_contracts]
-                        
-                        # Run the bot (assuming it returns a dictionary with contract numbers as keys)
-                        bot_results = run_valuation_bot_wrapper(contract_numbers)
-                        
-                        # Update worksheet with bot results
-                        for row, contract in remaining_contracts:
-                            if contract in bot_results:
-                                self.write_cell_value("IA Working", row, 22, bot_results[contract])  # Column V
-                        
-                        logger.info(f"Step 12 completed: Bot updated {len(remaining_contracts)} contracts")
-                        
-                    except Exception as bot_error:
-                        self.log_exception("12", f"Valuation bot failed: {str(bot_error)}")
-                        logger.warning("Valuation bot unavailable, continuing without updates")
-                else:
-                    logger.warning("Valuation bot unavailable, skipping valuation bot integration.")
-            
-            # Check for remaining #N/A values
-            final_na_contracts = []
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                
-                if self.read_cell_value("IA Working", row, 22) == '#N/A':  # Column V (index 21)
-                    final_na_contracts.append(contract)
-                
-                row += 1
-            
-            if final_na_contracts:
-                for contract in final_na_contracts:
-                    self.log_exception("12", f"Contract still has #N/A after bot run", contract)
-            
-            logger.info("Step 12 completed: Valuation bot integration completed")
-            
-        except Exception as e:
-            self.log_exception("12", f"Failed to integrate valuation bot: {str(e)}")
-            raise
-    
-    def step_13_scienter_bot_integration(self):
-        """Step 13: Integration with Scienter bot and calculations"""
-        try:
-            logger.info("Step 13: Running Scienter bot and performing calculations...")
-            
-            # Find contracts with LR00000049-like values in column A
-            lr_contracts = []
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                
-                if contract and str(contract).startswith('LR') and str(contract).replace('LR', '').isdigit():
-                    lr_contracts.append(row)
-                
-                row += 1
-            
-            if lr_contracts:
-                # Log missing scienter bot as exception since it's not implemented
-                contract_numbers = [self.read_cell_value("IA Working", row, 1) for row in lr_contracts]
-                self.log_exception("13", f"Scienter bot not implemented yet - LR contracts {contract_numbers} need manual processing")
-                logger.warning("Scienter bot not implemented - LR contracts will need manual processing")
-                
-                # Perform calculations for W and X columns (placeholder for when bot is implemented)
-                for row in lr_contracts:
-                    # W column: P/V calculation
-                    p_value = self.read_cell_value("IA Working", row, 16)  # Column P (index 15)
-                    v_value = self.read_cell_value("IA Working", row, 22)  # Column V (index 21)
-                    if p_value and v_value and v_value != 0:
-                        try:
-                            w_value = p_value / v_value  # Column W (index 22)
-                            self.write_cell_value("IA Working", row, 23, w_value)
-                        except Exception as e:
-                            logger.error(f"Failed to calculate W column for row {row}: {e}")
-                            self.log_exception("13", f"W column calculation failed for row {row}: {e}")
-                    
-                    # X column: S/SUM(S:S+1)*W calculation
-                    s_value = self.read_cell_value("IA Working", row, 19)  # Column S (index 18)
-                    s_next_value = self.read_cell_value("IA Working", row + 1, 19) if row + 1 <= self.find_last_row("IA Working", 1) else 0
-                    w_value = self.read_cell_value("IA Working", row, 23)  # Column W (index 22)
-                    if s_value is not None and w_value is not None:
-                        try:
-                            sum_s = s_value + (s_next_value or 0)
-                            if sum_s != 0:
-                                x_value = (s_value / sum_s) * w_value  # Column X (index 23)
-                                self.write_cell_value("IA Working", row, 24, x_value)
-                        except Exception as e:
-                            logger.error(f"Failed to calculate X column for row {row}: {e}")
-                            self.log_exception("13", f"X column calculation failed for row {row}: {e}")
-                
-                logger.info(f"Step 13 completed: LR contracts logged for manual processing")
-            
-            logger.info("Step 13 completed: Scienter bot integration completed")
-            
-        except Exception as e:
-            self.log_exception("13", f"Failed to integrate Scienter bot: {str(e)}")
-            raise
-    
-    def step_14_minimum_rate_api(self):
-        """Step 14: Import minimum rate from WorkHub24 API"""
-        try:
-            logger.info("Step 14: Importing minimum rate from WorkHub24 API...")
-            
-            # TODO: Implement WorkHub24 API call
-            # For now, log this as an exception since the API is not implemented
-            self.log_exception("14", "WorkHub24 API for minimum rate not implemented yet - needs manual input")
-            logger.warning("WorkHub24 API not implemented - minimum rate needs manual input")
-            
-            # Placeholder for minimum rate
-            self.minimum_rate = 42.00  # Default value, should come from API
-            logger.info(f"Using default minimum rate: {self.minimum_rate}%")
-            
-        except Exception as e:
-            self.log_exception("14", f"Failed to import minimum rate: {str(e)}")
-            self.log_exception("14", f"Step 14 failed: {str(e)}")
-            # Set a default minimum rate to continue processing
-            self.minimum_rate = 42.00
-    
-    def step_15_check_interest_rates(self):
-        """Step 15: Check interest rates against minimum rate"""
-        try:
-            logger.info("Step 15: Checking interest rates against minimum rate...")
-            
-            # Use the minimum rate from step 14, default to 42.00 if not set
-            minimum_rate = getattr(self, 'minimum_rate', 42.00)
-            
-            # Check L column values from row 3
-            row = 3
-            while True:
-                contract = self.read_cell_value("IA Working", row, 1)  # Column A
-                if not contract:
-                    break
-                
-                l_value = self.read_cell_value("IA Working", row, 12)  # Column L (index 11)
-                if l_value and l_value != '#N/A':
-                    try:
-                        rate = float(l_value)
-                        if rate > minimum_rate:
-                            self.log_exception("15", f"Interest rate {rate}% exceeds minimum {minimum_rate}%", contract)
-                    except (ValueError, TypeError):
-                        pass
-                
-                row += 1
-            
-            logger.info("Step 15 completed: Interest rate validation completed")
-            
-        except Exception as e:
-            self.log_exception("15", f"Failed to check interest rates: {str(e)}")
-            raise
-    
-    def step_16_final_validation(self):
-        """Step 16: Final validation of C39 cell"""
-        try:
-            logger.info("Step 16: Final validation of C39 cell...")
-            
-            # Check C39 cell value directly from the worksheet
-            try:
-                c39_value = self.read_cell_value("NBD-MF-23-IA", 39, 3)  # Row 39, Column C (index 3)
-                
-                if c39_value != 0:
-                    # Do not modify the workbook; just record for the exception report
-                    self.log_exception("16", f"C39 cell value is {c39_value}, expected 0")
-                    logger.error(f"Final validation failed: C39 = {c39_value}")
-                else:
-                    logger.info("Step 16 completed: C39 cell validation passed")
-                    
-            except Exception as sheet_error:
-                self.log_exception("16", f"Could not read C39 cell: {str(sheet_error)}")
-                logger.error("NBD-MF-23-IA sheet structure insufficient for C39 validation")
-            
-        except Exception as e:
-            self.log_exception("16", f"Failed to validate C39 cell: {str(e)}")
-            raise
-    
-    def step_17_cleanup_formatting(self):
-        """Cleanup: fix percent scaling in columns M and N, remove 65535 artifacts"""
-        try:
-            sheet = "IA Working"
-            worksheet = self.get_worksheet(sheet)
-            start_row = 3
-            last_row = self.find_last_row(sheet, col=1)
+                import xlwings as xw
 
-            # 1) Fix percent scaling in columns M (13) and N (14): always divide by 100, but skip formulas
-            for row in range(start_row, last_row + 1):
-                for col in (13, 14):
-                    try:
-                        if self.cell_has_formula(sheet, row, col):
-                            continue
-                        val = self.read_cell_value(sheet, row, col)
-                        if isinstance(val, (int, float)):
-                            self.write_cell_value(sheet, row, col, float(val) / 100.0)
-                        elif isinstance(val, str) and val.strip():
-                            s = val.replace('%', '').replace(',', '').strip()
-                            num = float(s)
-                            self.write_cell_value(sheet, row, col, num / 100.0)
-                    except Exception:
-                        # Ignore parse errors for individual cells
-                        continue
+                # Use xlwings to open the workbook
+                app = xw.App(visible=False, add_book=False)
+                app.display_alerts = False
+                app.screen_updating = False
 
-            logger.info("Cleanup step completed: percent scaling fixed")
-        except Exception as e:
-             self.log_exception("17", f"Cleanup formatting failed: {str(e)}")
-             raise
-    
-    def generate_exception_report(self):
-        """Generate Excel report of all exceptions"""
-        try:
-            if not self.exceptions:
-                logger.info("No exceptions to report")
-                return
-            
-            # Validate that all exceptions are properly formatted dictionaries
-            valid_exceptions = []
-            for i, exception in enumerate(self.exceptions):
-                if isinstance(exception, dict) and 'step' in exception and 'message' in exception:
-                    valid_exceptions.append(exception)
-                else:
-                    logger.warning(f"Invalid exception format at index {i}: {exception}")
-                    # Convert invalid exceptions to proper format
-                    if isinstance(exception, str):
-                        valid_exceptions.append({
-                            'step': 'Unknown',
-                            'message': exception,
-                            'contract_number': None,
-                            'timestamp': datetime.now().isoformat()
-                        })
-                    else:
-                        logger.error(f"Cannot convert exception at index {i} to proper format: {exception}")
-            
-            if not valid_exceptions:
-                logger.info("No valid exceptions to report after validation")
-                return
-            
-            # Create exception report
-            report_file = self.working_dir / f"NBD_MF_23_IA_Exceptions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            
-            df_exceptions = pd.DataFrame(valid_exceptions)
-            
-            with pd.ExcelWriter(report_file, engine='openpyxl') as writer:
-                df_exceptions.to_excel(writer, sheet_name='Exceptions', index=False)
-            
-            logger.info(f"Exception report generated: {report_file}")
-            
-        except Exception as e:
-            logger.error(f"Failed to generate exception report: {str(e)}")
-            # Log the current state of exceptions for debugging
-            logger.error(f"Current exceptions state: {self.exceptions}")
-            logger.error(f"Exceptions type: {type(self.exceptions)}")
-            if self.exceptions:
-                logger.error(f"First exception: {self.exceptions[0]} (type: {type(self.exceptions[0])})")
-    
-    def run_automation(self):
-        """Run the complete automation workflow"""
-        try:
-            logger.info("Starting NBD-MF-23-IA automation...")
-            
-            # Initialize Excel COM application
-            self.initialize_excel()
-            
-            # Optimize Excel performance for bulk operations
-            self.optimize_excel_performance()
-            
-            # Execute all steps
-            self.step_1_copy_disbursement_data()
-            self.step_2_vlookup_net_portfolio()
-            self.step_3_po_listing_vlookup()
-            self.step_4_info_request_vlookup()
-            self.step_5_reorganize_special_values()
-            self.step_6_handle_na_contracts()
-            self.step_7_check_blank_cells()
-            self.step_8_handle_special_columns()
-            self.step_9_handle_purpose_column()
-            self.step_10_filter_vehicles_machinery()
-            self.step_11_po_listing_mapping()
-            self.step_12_valuation_bot_integration()
-            self.step_13_scienter_bot_integration()
-            self.step_14_minimum_rate_api()
-            self.step_15_check_interest_rates()
-            self.step_16_final_validation()
-            self.step_17_cleanup_formatting()
-            
-            # Generate exception report
-            self.generate_exception_report()
-            
-            logger.info("NBD-MF-23-IA automation completed successfully!")
-            
-        except Exception as e:
-            logger.error(f"Automation failed: {e}")
-            # Ensure exception report is still generated
-            self.generate_exception_report()
-            raise
-        finally:
-            # Restore Excel performance settings
-            self.restore_excel_performance()
-            # Always close Excel properly
-            self.close_excel()
-
-    def write_bulk_data(self, sheet_name: str, start_row: int, start_col: int, data):
-        """Write bulk data to Excel starting from specified position"""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            
-            # Convert data to list if it's not already
-            if not isinstance(data, list):
-                data = [data]
-            
-            # If data is 2D (list of lists), write as range
-            if data and isinstance(data[0], list):
-                # Calculate range
-                end_row = start_row + len(data) - 1
-                end_col = start_col + len(data[0]) - 1
-                range_str = f"{chr(64 + start_col)}{start_row}:{chr(64 + end_col)}{end_row}"
-                
-                # Write entire range at once
-                worksheet.Range(range_str).Value = data
-                logger.info(f"Bulk wrote {len(data)}x{len(data[0])} data to {range_str}")
-            else:
-                # Single column data
-                end_row = start_row + len(data) - 1
-                range_str = f"{chr(64 + start_col)}{start_row}:{chr(64 + start_col)}{end_row}"
-                
-                # Convert to 2D format for Excel
-                data_2d = [[item] for item in data]
-                worksheet.Range(range_str).Value = data_2d
-                logger.info(f"Bulk wrote {len(data)} values to column {chr(64 + start_col)} rows {start_row}-{end_row}")
-                
-        except Exception as e:
-            logger.error(f"Failed to write bulk data: {e}")
-            raise
-    
-    def read_bulk_data_from_excel(self, file_path: str, sheet_name: str = None, usecols: str = None):
-        """Read bulk data from Excel file using pandas for better performance"""
-        try:
-            logger.info(f"Starting to read Excel file: {file_path}")
-            
-            # Use optimized reading parameters for large files
-            read_params = {
-                'sheet_name': sheet_name,
-                'usecols': usecols,
-                'nrows': None,  # Read all rows
-                'skiprows': None,
-                'header': None,  # No header to avoid issues
-                'engine': 'openpyxl'  # Explicitly use openpyxl for better performance
-            }
-            
-            # Remove None values
-            read_params = {k: v for k, v in read_params.items() if v is not None}
-            
-            logger.info(f"Reading with parameters: {read_params}")
-            df = pd.read_excel(file_path, **read_params)
-            
-            logger.info(f"Successfully read DataFrame with shape: {df.shape}")
-            
-            # Convert to list of lists for bulk writing
-            # Use a more robust approach that handles different pandas versions
-            try:
-                # Try the most reliable method first
-                data = df.values.tolist()
-                logger.info(f"Converted to list using df.values.tolist()")
-            except Exception as e1:
-                logger.warning(f"df.values.tolist() failed: {e1}, trying alternative method")
                 try:
-                    # Alternative method for newer pandas versions
-                    data = df.to_numpy().tolist()
-                    logger.info(f"Converted to list using df.to_numpy().tolist()")
-                except Exception as e2:
-                    logger.warning(f"df.to_numpy().tolist() failed: {e2}, using row-by-row conversion")
-                    # Last resort: convert row by row
-                    data = []
-                    for index, row in df.iterrows():
-                        data.append(row.tolist())
-                    logger.info(f"Converted to list using row-by-row iteration")
-            
-            logger.info(f"Successfully read {len(data)} rows from {file_path}")
-            return data
-            
+                    workbook = app.books.open(os.path.abspath(prod_file_path))
+                    product_cat_sheet = workbook.sheets["Product_Cat"]
+
+                    # Find the last row with data in Product_Cat sheet
+                    last_row = product_cat_sheet.range('A1').expand('down').last_cell.row
+                    logger.info(f"Product_Cat sheet currently has {last_row} rows")
+
+                    # Determine starting row for new data (append below existing data)
+                    start_row = last_row + 1
+
+                    # Paste DataFrame directly
+                    if not df_unique_combinations.empty:
+                        product_cat_sheet.range(f'A{start_row}').value = df_unique_combinations.values
+                        num_rows = len(df_unique_combinations)
+                        logger.info(f"✓ Pasted {num_rows} unique combinations to Product_Cat sheet (rows {start_row} to {start_row + num_rows - 1})")
+
+                    workbook.save()
+                    workbook.close()
+                finally:
+                    app.quit()
+
+            except Exception as product_cat_error:
+                logger.error(f"Failed to paste data to Product_Cat sheet: {product_cat_error}")
+                logger.error(traceback.format_exc())
+
+            # Convert to absolute path
+            abs_file_path = os.path.abspath(prod_file_path)
+            logger.info(f"Working with file: {abs_file_path}")
+
+            if not os.path.exists(abs_file_path):
+                raise FileNotFoundError(f"File not found: {abs_file_path}")
+
+            try:
+                import xlwings as xw
+
+                # Use xlwings to open the workbook
+                app = xw.App(visible=False, add_book=False)
+                app.display_alerts = False
+                app.screen_updating = False
+
+                try:
+                    workbook = app.books.open(abs_file_path)
+
+                    # === Step 1: Update IA Working sheet ===
+                    worksheet = workbook.sheets["IA Working"]
+
+                    # Clear existing data from row 3 onwards (keep headers in rows 1-2)
+                    last_row = worksheet.range('A1').expand('down').last_cell.row
+                    if last_row >= 3:
+                        worksheet.range(f'A3:Z{last_row}').clear_contents()
+
+                    # Write new data starting from row 3
+                    if not df_clean.empty:
+                        num_cols = min(len(df_clean.columns), 26)
+                        worksheet.range('A3').value = df_clean.iloc[:, :num_cols].values
+
+                    # === Step 2: Verify C39 in NBD-MF-23-IA sheet ===
+                    try:
+                        ia_sheet = workbook.sheets["NBD-MF-23-IA"]
+                        c39_value = ia_sheet.range("C39").value
+                        logger.info(f"C39 value in NBD-MF-23-IA: {c39_value}")
+
+                        if c39_value not in (None, 0, "0"):
+                            exception_data = pd.DataFrame(
+                                [{"Sheet": "NBD-MF-23-IA", "Cell": "C39", "Value": c39_value}]
+                            )
+                            exception_filepath = os.path.join(
+                                os.path.dirname(abs_file_path), "NBD-MF-23-IA_exceptions.xlsx"
+                            )
+                            exception_data.to_excel(exception_filepath, index=False)
+                            logger.warning(f"⚠ Exception found (C39 != 0). Saved file: {exception_filepath}")
+                        else:
+                            logger.info("✓ C39 is 0. No exceptions.")
+
+                    except Exception as check_error:
+                        logger.error(f"Failed to check C39 value: {check_error}")
+
+                    # Save and close workbook
+                    workbook.save()
+                    workbook.close()
+                finally:
+                    app.quit()
+
+            except Exception as xlwings_error:
+                logger.error(f"xlwings method failed: {xlwings_error}")
+                logger.error(traceback.format_exc())
+                raise
+
+            # === Step 3: Rename the file with date format ===
+            try:
+                month_year = picked_date.strftime("%b %Y")
+                file_dir = os.path.dirname(abs_file_path)
+                new_filename = f"Prod. wise Class. of Loans - {month_year}.xlsb"
+                new_file_path = os.path.join(file_dir, new_filename)
+
+                os.rename(abs_file_path, new_file_path)
+                logger.info(f"✓ File renamed to: {new_filename}")
+                return new_file_path
+
+            except Exception as e:
+                logger.error(f"Failed to rename file: {e}")
+                return abs_file_path
+
         except Exception as e:
-            logger.error(f"Failed to read Excel file {file_path}: {e}")
+            logger.error(f"Failed to paste data to IA Working sheet: {e}")
+            logger.error(traceback.format_exc())
             raise
+
+
     
-    def bulk_vlookup_operation(self, sheet_name: str, target_col: int, lookup_col: int, 
-                              source_data, source_lookup_col: int, source_value_col: int, 
-                              start_row: int, end_row: int):
-        """Perform bulk VLOOKUP operation for better performance"""
+    def load_all(self, picked_date):
+        """Orchestrator method with comprehensive error handling and recovery."""
+        # Parse the date if it's not already a date object
         try:
-            worksheet = self.get_worksheet(sheet_name)
-            
-            # Create lookup dictionary for faster matching
-            lookup_dict = {}
-            for row_data in source_data:
-                if len(row_data) > max(source_lookup_col, source_value_col):
-                    lookup_key = row_data[source_lookup_col]
-                    lookup_value = row_data[source_value_col]
-                    lookup_dict[lookup_key] = lookup_value
-            
-            # Prepare data for bulk writing
-            result_data = []
-            for row in range(start_row, end_row + 1):
-                lookup_value = worksheet.Cells(row, lookup_col).Value
-                if lookup_value in lookup_dict:
-                    result_data.append([lookup_dict[lookup_value]])
+            picked_date = self.parse_date(picked_date)
+        except ValueError as e:
+            logger.error(f"Date parsing error: {e}")
+            raise
+
+        logger.info("="*80)
+        logger.info(f"Starting load_all process for date: {picked_date}")
+        logger.info("="*80)
+        
+        loaded_data = {}
+        errors = []
+        
+        # Define loading steps with fallback options
+        loading_steps = [
+            ("df_disbursement", self.load_disbursement, True),  # Required
+            ("df_net_portfolio", self.load_net_portfolio, True),  # Required
+            ("df_po_listing", self.load_po_listing, False),  # Optional
+            ("df_information_request_from_credit", self.load_information_request_from_credit, True),  # Required
+            ("df_product_cat", self.load_product_cat, True),  # Required
+            ("df_C1_C2_Working", self.load_C1_C2_Working, True),  # Required
+            ("df_yard_and_property_list", self.load_yard_and_Property_List, True),  # Required
+            ("df_portfolio_report_recovery", self.load_portfolio_report_recovery, False),  # Optional
+        ]
+        
+        # Load each dataset with error handling
+        for name, loader_func, is_required in loading_steps:
+            try:
+                logger.info(f"Loading {name}...")
+                loaded_data[name] = loader_func()
+                logger.info(f"✓ Successfully loaded {name}")
+            except Exception as e:
+                error_msg = f"Failed to load {name}: {e}"
+                logger.error(error_msg)
+                errors.append((name, str(e)))
+                
+                if is_required:
+                    logger.error(f"CRITICAL: Required dataset {name} could not be loaded")
+                    raise RuntimeError(f"Cannot proceed without {name}. Error: {e}")
                 else:
-                    result_data.append([None])
-            
-            # Write results in bulk
-            self.write_bulk_data(sheet_name, start_row, target_col, result_data)
-            
-            logger.info(f"Bulk VLOOKUP completed for {len(result_data)} rows")
-            
-        except Exception as e:
-            logger.error(f"Failed to perform bulk VLOOKUP: {e}")
-            raise
-    
-    def bulk_copy_range_with_filter(self, source_sheet: str, target_sheet: str, 
-                                   source_range: str, target_start_row: int, target_start_col: int,
-                                   filter_col: int = None, filter_value: str = None):
-        """Copy a range of data with optional filtering in bulk"""
+                    logger.warning(f"Optional dataset {name} failed to load, using empty DataFrame")
+                    loaded_data[name] = pd.DataFrame()
+        
+        # Check if we have minimum required data
+        required_datasets = ["df_disbursement", "df_net_portfolio", "df_product_cat"]
+        missing_required = [ds for ds in required_datasets if ds not in loaded_data or loaded_data[ds].empty]
+        
+        if missing_required:
+            error_msg = f"Missing required datasets: {missing_required}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        # Build production loans
         try:
-            source_worksheet = self.get_worksheet(source_sheet)
-            target_worksheet = self.get_worksheet(target_sheet)
-            
-            # Read source range
-            source_range_obj = source_worksheet.Range(source_range)
-            source_data = source_range_obj.Value
-            
-            if not source_data:
-                logger.warning(f"No data found in source range {source_range}")
-                return
-            
-            # Filter data if filter is specified
-            if filter_col is not None and filter_value is not None:
-                filtered_data = []
-                for row_data in source_data:
-                    if isinstance(row_data, list) and len(row_data) > filter_col:
-                        if row_data[filter_col] == filter_value:
-                            filtered_data.append(row_data)
-                source_data = filtered_data
-            
-            if not source_data:
-                logger.info(f"No data matches filter criteria: {filter_col}={filter_value}")
-                return
-            
-            # Calculate target range
-            rows = len(source_data)
-            cols = len(source_data[0]) if source_data else 0
-            target_end_row = target_start_row + rows - 1
-            target_end_col = target_start_col + cols - 1
-            target_range = f"{chr(64 + target_start_col)}{target_start_row}:{chr(64 + target_end_col)}{target_end_row}"
-            
-            # Write filtered data in bulk
-            target_worksheet.Range(target_range).Value = source_data
-            
-            logger.info(f"Bulk copied {rows}x{cols} filtered data to {target_range}")
-            
+            logger.info("Starting build_prod_loans process...")
+            df_prod_loans = self.build_prod_loans(
+                loaded_data.get("df_disbursement"),
+                loaded_data.get("df_net_portfolio"),
+                loaded_data.get("df_information_request_from_credit", pd.DataFrame()),
+                loaded_data.get("df_product_cat"),
+                loaded_data.get("df_C1_C2_Working", pd.DataFrame()),
+                loaded_data.get("df_yard_and_property_list", pd.DataFrame()),
+                loaded_data.get("df_po_listing", pd.DataFrame()),
+                loaded_data.get("df_portfolio_report_recovery", pd.DataFrame())
+            )
+            logger.info("✓ build_prod_loans completed successfully")
         except Exception as e:
-            logger.error(f"Failed to bulk copy range: {e}")
+            logger.error(f"Failed to build production loans: {e}")
+            logger.error(traceback.format_exc())
             raise
-    
-    def bulk_clear_and_fill(self, sheet_name: str, clear_ranges: list, fill_data: dict):
-        """Clear multiple ranges and fill with data in bulk operations"""
+        
+        # Save report
         try:
-            worksheet = self.get_worksheet(sheet_name)
-            
-            # Clear all specified ranges
-            for range_str in clear_ranges:
-                worksheet.Range(range_str).ClearContents()
-                logger.info(f"Cleared range: {range_str}")
-            
-            # Fill data in bulk
-            for range_str, data in fill_data.items():
-                if isinstance(data, list):
-                    worksheet.Range(range_str).Value = data
-                    logger.info(f"Filled range {range_str} with {len(data)} rows")
+            report_path = self.save_report(df_prod_loans, picked_date)
+        except Exception as e:
+            logger.error(f"Failed to save report: {e}")
+            raise
+        
+        # Prepare return data
+        month_year = picked_date.strftime("%b %Y")
+
+        # Log summary
+        logger.info("="*80)
+        logger.info("PROCESS SUMMARY")
+        logger.info(f"Date processed: {picked_date}")
+        logger.info(f"Total rows generated: {len(df_prod_loans)}")
+        logger.info(f"Data pasted to IA Working sheet in: {report_path}")
+        if errors:
+            logger.warning(f"Errors encountered during processing:")
+            for name, error in errors:
+                logger.warning(f"  - {name}: {error}")
+        logger.info("="*80)
+
+        return {
+            "df_Prod_wise_Class_of_Loans": df_prod_loans,
+            "df_Disbursement": loaded_data.get("df_disbursement"),
+            "df_Net_Portfolio": loaded_data.get("df_net_portfolio"),
+            "df_PO_Listing": loaded_data.get("df_po_listing"),
+            "df_information_request_from_credit": loaded_data.get("df_information_request_from_credit"),
+            "final_output_path": report_path,
+            "report_path": report_path,
+            "processing_errors": errors
+        }
+    
+    def get_minimum_rate_threshold(self, df_product_cat):
+        """
+        Extract minimum rate threshold from master data file.
+
+        Args:
+            df_product_cat: Product category dataframe from master file
+
+        Returns:
+            float: Minimum rate threshold value
+        """
+        try:
+            # Get the file path for Prod. wise Class. of Loans
+            prod_file_path = self._find_file("Prod. wise Class. of Loans")
+
+            # Read the NBD-MF-23-IA sheet to get L20 value (minimum rate threshold)
+            df_nbd_sheet = pd.read_excel(prod_file_path, sheet_name="NBD-MF-23-IA", header=None)
+
+            # Extract L20 value (row 19, column 11 in 0-indexed)
+            minimum_rate_threshold = df_nbd_sheet.iloc[19, 11]
+
+            # Convert to numeric and validate
+            minimum_rate_threshold = pd.to_numeric(minimum_rate_threshold, errors='coerce')
+
+            if pd.isna(minimum_rate_threshold):
+                logger.warning("Could not extract minimum rate threshold from L20")
+                # Check if command line override is available
+                if hasattr(self, 'minimum_rate_override') and self.minimum_rate_override is not None:
+                    logger.info(f"Using command line minimum rate override: {self.minimum_rate_override}%")
+                    return self.minimum_rate_override
                 else:
-                    worksheet.Range(range_str).Value = data
-                    logger.info(f"Filled range {range_str} with single value")
+                    logger.warning("No command line override provided, using default value of 6.00%")
+                    return 6.00
+
+            logger.info(f"✓ Extracted minimum rate threshold from master data: {minimum_rate_threshold}%")
+            return minimum_rate_threshold
+
+        except Exception as e:
+            logger.error(f"Error extracting minimum rate threshold: {e}")
+            # Check if command line override is available
+            if hasattr(self, 'minimum_rate_override') and self.minimum_rate_override is not None:
+                logger.info(f"Using command line minimum rate override: {self.minimum_rate_override}%")
+                return self.minimum_rate_override
+            else:
+                logger.warning("No command line override provided, using default minimum rate threshold of 6.00%")
+                return 6.00
+
+    def load_scienter_valuation(self):
+        """Load Scienter valuation bot with error handling."""
+        try:
+            logger.info("Loading IA_Working_Initial_valuation_Scienter_bot module...")
+            import sys
+            import os
+            
+            # Add the parent "bots" folder relative to this file
+            current_dir = os.path.dirname(__file__)
+            bot_dir = os.path.join(current_dir, "..", "bots")
+            sys.path.insert(0, os.path.abspath(bot_dir))
+            
+            import IA_Working_Initial_valuation_Scienter_bot as scienter_bot
+            logger.info("Successfully imported IA_Working_Initial_valuation_Scienter_bot module")
+            return scienter_bot
+        except ImportError as e:
+            logger.warning(f"Could not import IA_Working_Initial_valuation_Scienter_bot: {e}")
+            return None
+
+    def fetch_lr_valuations(self, contracts_list, scienter_bot):
+        """
+        Fetch initial valuations for LR-type contracts using Scienter bot.
+        
+        Args:
+            contracts_list: List of LR contract numbers
+            scienter_bot: The imported Scienter bot module
+            
+        Returns:
+            dict: Dictionary mapping contract numbers to their valuations
+        """
+        valuations = {}
+        
+        if not scienter_bot:
+            logger.warning("Scienter bot not available, cannot fetch LR valuations")
+            return valuations
+        
+        if not contracts_list:
+            logger.info("No LR contracts to process")
+            return valuations
+        
+        try:
+            logger.info(f"Fetching valuations for {len(contracts_list)} LR contracts via Scienter bot")
+            
+            # Call the Scienter bot's valuation function
+            # Adjust the function name based on the actual bot's API
+            response = scienter_bot.run_valuation_bot(contracts_list)
+            
+            if isinstance(response, dict):
+                for contract, value in response.items():
+                    # Validate the value from bot
+                    if value and value not in ["", "Not Valued", "#N/A", "N/A"]:
+                        try:
+                            numeric_value = pd.to_numeric(value, errors='coerce')
+                            if pd.notna(numeric_value) and numeric_value > 0:
+                                valuations[contract] = numeric_value
+                                logger.debug(f"✓ Scienter bot: {contract} = {numeric_value}")
+                            else:
+                                logger.debug(f"Scienter bot returned invalid value for {contract}: {value}")
+                        except:
+                            logger.debug(f"Scienter bot returned non-numeric value for {contract}: {value}")
+                    else:
+                        logger.debug(f"Scienter bot returned empty/N/A for {contract}")
+            else:
+                logger.warning(f"Scienter bot returned unexpected response type: {type(response)}")
+                
+            logger.info(f"✓ Scienter bot returned {len(valuations)} valid valuations")
             
         except Exception as e:
-            logger.error(f"Failed to bulk clear and fill: {e}")
-            raise
-    
-    def optimize_excel_performance(self):
-        """Optimize Excel performance settings for bulk operations"""
+            logger.error(f"Error running Scienter bot for LR contracts: {e}")
+            logger.error(traceback.format_exc())
+        
+        return valuations
+
+    def fill_incomplete_contracts(self, df_prod_loans, na_contract_bot):
+        """Fill incomplete contracts with comprehensive error handling."""
+        if na_contract_bot is None:
+            logger.warning("Contract bot not available, skipping incomplete contract processing")
+            return df_prod_loans
+        
         try:
-            if self.excel_app:
-                # Disable screen updating for faster operations
-                self.excel_app.ScreenUpdating = False
+            critical_cols = [
+                "Client Code", "Equipment", "Frequency",
+                "Contract Period", "Contractual Interest Rate", "Contract Amount"
+            ]
+            
+            # Find incomplete contracts
+            mask = df_prod_loans[critical_cols].isnull().any(axis=1) | (df_prod_loans[critical_cols] == "").any(axis=1)
+            incomplete_contracts = df_prod_loans.loc[mask, "Contract No"].dropna().unique()
+            
+            # Keep all incomplete contracts (removed LR/Margin Trading exclusion)
+            incomplete_contracts = list(incomplete_contracts)
+            
+            if len(incomplete_contracts) == 0:
+                logger.info("No incomplete contracts found")
+                return df_prod_loans
+            
+            logger.info(f"Found {len(incomplete_contracts)} incomplete contracts to process")
+            
+            # Process contracts with bot
+            try:
+                session, verification_token = na_contract_bot.get_authenticated_session()
+                updated_count = 0
+                failed_contracts = []
                 
-                # Disable automatic calculations
-                self.excel_app.Calculation = -4105  # xlCalculationManual
+                for i, cn in enumerate(incomplete_contracts, 1):
+                    cn_str = str(cn).strip()
+                    if not cn_str:
+                        continue
+                    
+                    try:
+                        logger.debug(f"Processing contract {i}/{len(incomplete_contracts)}: {cn_str}")
+                        data, success = na_contract_bot.process_contract_with_retry(session, cn_str, verification_token)
+                        
+                        if success and isinstance(data, dict):
+                            mapping = {
+                                "Client Code": data.get("client_code", ""),
+                                "Equipment": data.get("equipment", ""),
+                                "Frequency": data.get("frequency", ""),
+                                "Contract Period": data.get("contract_period", ""),
+                                "Contractual Interest Rate": data.get("interest_rate", ""),
+                                "Contract Amount": data.get("contract_amount", "")
+                            }
+                            
+                            for k, v in mapping.items():
+                                if v:  # Only update if we have a value
+                                    df_prod_loans.loc[df_prod_loans["Contract No"] == cn_str, k] = v
+                            
+                            updated_count += 1
+                            logger.debug(f"✓ Updated contract {cn_str}")
+                        else:
+                            failed_contracts.append(cn_str)
+                            logger.warning(f"✗ Failed to get data for contract {cn_str}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing contract {cn_str}: {e}")
+                        failed_contracts.append(cn_str)
                 
-                # Disable events
-                self.excel_app.EnableEvents = False
-                
-                logger.info("Excel performance optimized for bulk operations")
-                
+                logger.info(f"Contract update summary: {updated_count} successful, {len(failed_contracts)} failed")
+                if failed_contracts:
+                    logger.warning(f"Failed contracts: {failed_contracts[:10]}...")  # Show first 10
+                    
+            except Exception as e:
+                logger.error(f"Error in bot processing: {e}")
+                logger.error(traceback.format_exc())
+            
+            return df_prod_loans
+            
         except Exception as e:
-            logger.warning(f"Could not optimize Excel performance: {e}")
-    
-    def restore_excel_performance(self):
-        """Restore Excel performance settings after bulk operations"""
-        try:
-            if self.excel_app:
-                # Re-enable screen updating
-                self.excel_app.ScreenUpdating = True
-                
-                # Re-enable automatic calculations
-                self.excel_app.Calculation = -4105  # xlCalculationAutomatic
-                
-                # Re-enable events
-                self.excel_app.EnableEvents = True
-                
-                logger.info("Excel performance settings restored")
-                
-        except Exception as e:
-            logger.warning(f"Could not restore Excel performance: {e}")
-
-    def _cleanup_65535_artifacts(self):
-        """No-op: 65535 values are allowed; preserve all data and formulas."""
-        try:
-            return
-        except Exception:
-            return
-
-    def cell_has_formula(self, sheet_name: str, row: int, col: int):
-        """Return True if the specified cell contains a formula."""
-        try:
-            worksheet = self.get_worksheet(sheet_name)
-            return bool(worksheet.Cells(row, col).HasFormula)
-        except Exception:
-            return False
+            logger.error(f"Error in fill_incomplete_contracts: {e}")
+            logger.error(traceback.format_exc())
+            return df_prod_loans
 
 
-def main():
-    """Main function to run the automation"""
-    # Default values so you don't have to pass arguments every time
-    working_dir = r"..\working\monthly\08-01-2025(2)\NBD_MF_23_IA"
-    month = "July"
-    year = "2025"
+def run_report(picked_date):
+    """
+    Function to be called by app.py or other modules.
 
-    # If arguments are provided, they override the defaults
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--working-dir", default=working_dir, help="Working directory")
-    parser.add_argument("--month", default=month, help="Month (e.g., Jan, Feb)")
-    parser.add_argument("--year", default=year, help="Year")
-    args = parser.parse_args()
+    Args:
+        picked_date: Can be a datetime.date object, string in "YYYY-MM-DD" format, or "MM/DD/YYYY" format
 
-    # Run automation
-    automation = NBDMF23IAAutomation(args.working_dir, args.month, args.year)
-    
-    # Check module status before starting
-    print("\n" + "="*50)
-    print("MODULE STATUS CHECK")
-    print("="*50)
-    automation.check_module_status()
-    
+    Returns:
+        Dictionary containing the processed data and file paths
+    """
     try:
-        # Run all steps
-        automation.run_automation()
-        logger.info("All steps completed successfully!")
-        
-        # Show exception summary
-        print("\n" + "="*50)
-        print(automation.get_exception_summary())
-        print("="*50)
-        
+        logger.info("Starting NBD_MF23_IA_Report via run_report function")
+
+        # Initialize report generator
+        loader = NBD_MF23_IA_Report()
+
+        # Load and process all data
+        dfs = loader.load_all(picked_date)
+
+        # Log results
+        logger.info("✓ Processing completed successfully")
+        logger.info(f"Final output location: {dfs['final_output_path']}")
+
+        # Check for processing errors
+        if dfs.get("processing_errors"):
+            logger.warning("Some non-critical errors occurred during processing:")
+            for name, error in dfs["processing_errors"]:
+                logger.warning(f"  - {name}: {error}")
+
+        return dfs
+
     except Exception as e:
-        logger.error(f"Automation failed: {e}")
-        # Generate exception report even if automation fails
-        automation.generate_exception_report()
-        
-        # Show exception summary even on failure
-        print("\n" + "="*50)
-        print(automation.get_exception_summary())
-        print("="*50)
-    finally:
-        # Ensure Excel is properly closed
-        try:
-            automation.close_excel()
-        except:
-            pass
+        logger.error(f"FATAL ERROR in run_report: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        import argparse
+
+        # Set up command line argument parsing
+        parser = argparse.ArgumentParser(description='NBD MF23 IA Report Generator')
+
+        # Support both standalone execution and app.py integration
+        parser.add_argument('date', nargs='?', help='Processing date in MM/DD/YYYY or YYYY-MM-DD format')
+        parser.add_argument('--base-dir', default=r"working\monthly",
+                          help='Base directory for data files (default: working\\monthly)')
+        parser.add_argument('--working-dir', help='Working directory (used by app.py)')
+        parser.add_argument('--month', help='Report month (e.g., Jan) - used by app.py')
+        parser.add_argument('--year', help='Report year (e.g., 2025) - used by app.py')
+        parser.add_argument('--minimum-rate', type=float, metavar='RATE',
+                          help='Minimum rate threshold (percentage) to use if master data is missing (e.g., 6.5)')
+        parser.add_argument('--verbose', '-v', action='store_true',
+                          help='Enable verbose logging')
+
+        # Parse arguments
+        args = parser.parse_args()
+
+        if args.verbose:
+            logging.getLogger().setLevel(logging.DEBUG)
+            logger.info("Verbose logging enabled")
+
+        logger.info("Starting NBD_MF23_IA_Report script")
+
+        # Determine date: either from 'date' argument or from --month/--year
+        picked_date = None
+        if args.date:
+            picked_date = args.date
+            logger.info(f"Processing date: {args.date}")
+        elif args.month and args.year:
+            # Convert month name and year to date (first day of next month for app.py compatibility)
+            month_num = datetime.strptime(args.month, "%b").month
+            next_month = month_num + 1 if month_num < 12 else 1
+            year = int(args.year) if month_num < 12 else int(args.year) + 1
+            picked_date = f"{next_month:02d}/01/{year}"
+            logger.info(f"Processing date derived from month/year: {picked_date} (for report month {args.month} {args.year})")
+        else:
+            raise ValueError("Either 'date' or '--month' and '--year' must be provided")
+
+        # Determine directories
+        if args.working_dir:
+            # app.py provides full working directory path
+            logger.info(f"Using working directory from app.py: {args.working_dir}")
+            loader = NBD_MF23_IA_Report(working_dir=args.working_dir)
+        else:
+            # Standalone execution uses base_dir
+            logger.info(f"Using base directory: {args.base_dir}")
+            loader = NBD_MF23_IA_Report(base_dir=args.base_dir)
+
+        if args.minimum_rate:
+            logger.info(f"Minimum rate override: {args.minimum_rate}%")
+            loader.minimum_rate_override = args.minimum_rate
+
+        # Load and process all data
+        dfs = loader.load_all(picked_date)
+
+        # Log results
+        logger.info("✓ Processing completed successfully")
+        logger.info(f"Final output location: {dfs['final_output_path']}")
+
+        # Check for processing errors
+        if dfs.get("processing_errors"):
+            logger.warning("Some non-critical errors occurred during processing:")
+            for name, error in dfs["processing_errors"]:
+                logger.warning(f"  - {name}: {error}")
+
+        # Check if exception report was generated
+        exception_file = os.path.join(loader.ia_folder, "Minimum_Rate_Exceptions.xlsx")
+        if os.path.exists(exception_file):
+            logger.info(f"Exception report generated: {exception_file}")
+
+        logger.info("NBD MF23 IA Report generation completed successfully!")
+
+    except SystemExit:
+        # Allow argparse to handle help and error exits
+        pass
+    except Exception as e:
+        logger.error(f"FATAL ERROR: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)
