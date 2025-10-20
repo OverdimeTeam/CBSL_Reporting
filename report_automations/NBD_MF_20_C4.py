@@ -69,98 +69,90 @@ def setup_logging():
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logger.addHandler(file_handler)
     
-    logger.info(f"📄 Detailed log file: {run_log_file}")
+    logger.info(f"Detailed log file: {run_log_file}")
     return logger
 
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='NBD MF 20 C4 Report Generator')
-    parser.add_argument('--working-dir', type=str, help='Working directory path')
-    parser.add_argument('--month', type=str, help='Report month (e.g., Jul)')
-    parser.add_argument('--year', type=str, help='Report year (e.g., 2025)')
-    
+    parser.add_argument('--working-dir', type=str, help='Working directory path (points to NBD_MF_20_C1_C6 folder)')
+    parser.add_argument('--month', type=str, help='Report month (optional, e.g., Jul)')
+    parser.add_argument('--year', type=str, help='Report year (optional, e.g., 2025)')
+
     args = parser.parse_args()
-    
+
     # Setup logging
     logger = setup_logging()
-    
-    # Determine working directory
+
+    # Determine base working directory
     if args.working_dir:
-        # Use provided working directory - it should point to the date folder
-        monthly_folder = Path(args.working_dir)
-        working_dir = monthly_folder.parent.parent
+        base_working_dir = Path(args.working_dir)
     else:
-        # Fallback to default behavior
-        base_dir = Path(__file__).resolve().parent.parent
-        working_dir = base_dir / "working"
-        monthly_working_dir = working_dir / "monthly"
-        
-        # Find the monthly folder (there should be only one)
-        monthly_folders = [f for f in monthly_working_dir.iterdir() if f.is_dir()]
-        
-        if not monthly_folders:
-            print(f"No monthly folders found in: {monthly_working_dir}")
-            return
-        
-        if len(monthly_folders) > 1:
-            print(f"Multiple monthly folders found, using the first one: {monthly_folders[0].name}")
-        
-        monthly_folder = monthly_folders[0]
-    
-    logger.info(f"Base directory: {Path(__file__).resolve().parent.parent}")
-    logger.info(f"Working directory: {working_dir}")
-    logger.info(f"Monthly folder: {monthly_folder}")
-    print(f"Base directory: {Path(__file__).resolve().parent.parent}")
-    print(f"Working directory: {working_dir}")
-    print(f"Monthly folder: {monthly_folder}")
-    print(f"Current working directory: {Path.cwd()}")
-    
+        project_root = Path(__file__).resolve().parents[1]
+        base_working_dir = project_root / "working" / "NBD_MF_20_C1_C6"
+
+    # Ensure the folder exists
+    if not base_working_dir.exists() or not base_working_dir.is_dir():
+        logger.error(f"Working directory not found: {base_working_dir}")
+        exit(1)
+
+    # Find the single dated folder inside NBD_MF_20_C1_C6
+    dated_folders = [f for f in base_working_dir.iterdir() if f.is_dir()]
+    if not dated_folders:
+        logger.error(f"No dated folder found inside: {base_working_dir}")
+        exit(1)
+
+    if len(dated_folders) > 1:
+        logger.warning(f"Multiple dated folders found, using the first one: {dated_folders[0].name}")
+
+    dated_folder = dated_folders[0]
+    logger.info(f"Using dated folder: {dated_folder}")
+    print(f"Dated folder: {dated_folder}")
+
+    # Initialize file paths
     file_c1_c6 = None
     file_unutilized = None
-    
-    # Look for the specific files in the monthly folder and subdirectories
-    print(f"\nSearching for files in: {monthly_folder}")
-    
-    # The final working folder is NBD_MF_20_C1_C6 inside the date folder
-    c1_c6_subfolder = monthly_folder / "NBD_MF_20_C1_C6"
-    print(f"Final working folder: {c1_c6_subfolder}")
-    
-    # Look for C1-C6 file in subdirectories
+
+    # Look for the specific files directly in the dated folder and subdirectories
+    print(f"\nSearching for files in: {dated_folder}")
+
+    # Look for C1-C6 file
     c1_c6_pattern = "**/NBD-MF-20-C1 to C6*.xlsx"
-    c1_c6_files = list(monthly_folder.glob(c1_c6_pattern))
-    
+    c1_c6_files = list(dated_folder.glob(c1_c6_pattern))
+
     if c1_c6_files:
         file_c1_c6 = c1_c6_files[0]
         print(f"Found C1-C6 file: {file_c1_c6}")
     else:
         print(f"Could not find C1-C6 file with pattern: {c1_c6_pattern}")
         print("Available files in directory and subdirectories:")
-        for f in monthly_folder.rglob("*.xlsx"):
-            print(f"  - {f.relative_to(monthly_folder)}")
-        return
-    
-    # Look for Unutilized Credit Limits file in subdirectories
+        for f in dated_folder.rglob("*.xlsx"):
+            print(f"  - {f.relative_to(dated_folder)}")
+        exit(1)
+
+    # Look for Unutilized Credit Limits file
     unutilized_pattern = "**/Unutilized Credit Limits*.xlsx"
-    unutilized_files = list(monthly_folder.glob(unutilized_pattern))
-    
+    unutilized_files = list(dated_folder.glob(unutilized_pattern))
+
     if unutilized_files:
         file_unutilized = unutilized_files[0]
         print(f"Found Unutilized Credit Limits file: {file_unutilized}")
     else:
         print(f"Could not find Unutilized Credit Limits file with pattern: {unutilized_pattern}")
         print("Available files in directory and subdirectories:")
-        for f in monthly_folder.rglob("*.xlsx"):
-            print(f"  - {f.relative_to(monthly_folder)}")
-        return
-    
-    # Extract month and year from filename
-    month, year = get_month_year_from_filename(file_c1_c6.name)
-    if not month or not year:
-        print(f"Could not parse month/year from filename: {file_c1_c6.name}")
-        print("Expected format: 'NBD-MF-20-C1 to C6 [Month] [Year].xlsx'")
-        return
-    
-    print(f"\nParsed month: {month}, year: {year}")
+        for f in dated_folder.rglob("*.xlsx"):
+            print(f"  - {f.relative_to(dated_folder)}")
+        exit(1)
+
+        
+        # Extract month and year from filename
+        month, year = get_month_year_from_filename(file_c1_c6.name)
+        if not month or not year:
+            print(f"Could not parse month/year from filename: {file_c1_c6.name}")
+            print("Expected format: 'NBD-MF-20-C1 to C6 [Month] [Year].xlsx'")
+            return
+        
+        print(f"\nParsed month: {month}, year: {year}")
     
     try:
         # Load workbooks

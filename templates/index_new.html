@@ -1,0 +1,1107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CBSL Report Automation Portal</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+      :root {
+        --primary-blue: #0d6efd;
+        --success-green: #198754;
+        --warning-orange: #fd7e14;
+        --danger-red: #dc3545;
+        --light-gray: #f8f9fa;
+        --border-gray: #e9ecef;
+        --text-muted: #6c757d;
+      }
+
+      body {
+        background-color: #ffffff;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        margin: 0;
+        padding: 0;
+      }
+
+      .header {
+        background-color: white;
+        color: #333;
+        padding: 1rem 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.08);
+        border-bottom: 1px solid var(--border-gray);
+      }
+
+      .logo-placeholder {
+        height: 40px;
+        width: auto;
+        max-width: 100px;
+      }
+
+      .main-container {
+        padding: 2rem 0;
+        background-color: var(--light-gray);
+        min-height: calc(100vh - 160px);
+      }
+
+      .content-wrapper {
+        background-color: white;
+        border-radius: 8px;
+        padding: 2rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        margin: 0 1rem;
+      }
+
+      .section-title {
+        color: #333;
+        font-weight: 600;
+        margin-bottom: 1.5rem;
+        font-size: 1.5rem;
+      }
+
+      .level-accordion .accordion-item {
+        border: 2px solid #dee2e6;
+        margin-bottom: 1.5rem;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+
+      .level-accordion .accordion-button {
+        background: linear-gradient(135deg, #6c757d 0%, #5a6268 100%);
+        color: white;
+        font-weight: 600;
+        font-size: 1.1rem;
+        padding: 1rem 1.25rem;
+      }
+
+      .level-accordion .accordion-button:not(.collapsed) {
+        background: linear-gradient(135deg, #5a6268 0%, #6c757d 100%);
+        color: white;
+      }
+
+      .level-accordion .accordion-button:hover {
+        opacity: 0.9;
+      }
+
+      .level-accordion .accordion-button:focus {
+        box-shadow: none;
+      }
+
+      .level-accordion .accordion-body {
+        padding: 0;
+        background-color: var(--light-gray);
+      }
+
+      .set-accordion {
+        border: none;
+      }
+
+      .set-accordion .accordion-item {
+        border: 1px solid var(--border-gray);
+        margin: 0.5rem;
+        border-radius: 6px;
+        background-color: white;
+      }
+
+      .set-accordion .accordion-button {
+        background-color: white;
+        color: #333;
+        font-weight: 600;
+        padding: 0.875rem 1rem;
+        font-size: 1rem;
+      }
+
+      .set-accordion .accordion-button:not(.collapsed) {
+        background-color: rgba(13, 110, 253, 0.05);
+        color: var(--primary-blue);
+      }
+
+      .set-accordion .accordion-button:focus {
+        box-shadow: none;
+      }
+
+      .set-accordion .accordion-body {
+        padding: 1rem;
+        background-color: white;
+      }
+
+      .set-header-info {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+
+      .set-title {
+        font-weight: 600;
+        color: #333;
+      }
+
+      .set-est-time {
+        background-color: rgba(13, 110, 253, 0.1);
+        color: var(--primary-blue);
+        padding: 0.25rem 0.6rem;
+        border-radius: 4px;
+        font-size: 0.85rem;
+        font-weight: 500;
+      }
+
+      .date-selector {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+        padding: 0.75rem;
+        background-color: rgba(13, 110, 253, 0.05);
+        border-radius: 6px;
+      }
+
+      .date-selector label {
+        font-weight: 500;
+        margin: 0;
+        min-width: 70px;
+      }
+
+      .date-selector input[type="date"] {
+        flex-grow: 1;
+      }
+
+      .report-checkbox {
+        display: flex;
+        align-items: center;
+        padding: 0.6rem;
+        border-radius: 4px;
+        transition: background-color 0.2s;
+        margin-bottom: 0.25rem;
+      }
+
+      .report-checkbox:hover {
+        background-color: rgba(13, 110, 253, 0.05);
+      }
+
+      .report-checkbox input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        margin-right: 0.75rem;
+        cursor: pointer;
+      }
+
+      .report-checkbox label {
+        margin: 0;
+        cursor: pointer;
+        flex-grow: 1;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 0.95rem;
+      }
+
+      .report-name {
+        flex-grow: 1;
+      }
+
+      .report-step-badge {
+        background-color: var(--primary-blue);
+        color: white;
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.8rem;
+        font-weight: 500;
+        margin-right: 0.5rem;
+      }
+
+      .report-time-badge {
+        background-color: rgba(253, 126, 20, 0.1);
+        color: var(--warning-orange);
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
+        font-size: 0.8rem;
+        font-weight: 500;
+        margin-left: 0.5rem;
+      }
+
+      .btn-primary {
+        background: linear-gradient(135deg, #0d6efd 0%, #0b5ed7 100%);
+        border: none;
+        border-radius: 6px;
+        font-weight: 500;
+        padding: 0.75rem 2rem;
+        transition: all 0.2s ease;
+      }
+
+      .btn-primary:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(13, 110, 253, 0.3);
+        background: linear-gradient(135deg, #0b5ed7 0%, #0d6efd 100%);
+      }
+
+      .btn-outline-danger {
+        color: var(--danger-red);
+        border: 2px solid var(--danger-red);
+        background: transparent;
+        border-radius: 6px;
+        font-weight: 500;
+        padding: 0.75rem 2rem;
+        transition: all 0.2s ease;
+      }
+
+      .btn-outline-danger:hover {
+        background-color: var(--danger-red);
+        border-color: var(--danger-red);
+        color: white;
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(220, 53, 69, 0.3);
+      }
+
+      .btn-success {
+        background: linear-gradient(135deg, #198754 0%, #146c43 100%);
+        border: none;
+        border-radius: 6px;
+        font-weight: 500;
+        padding: 0.75rem 2rem;
+        transition: all 0.2s ease;
+      }
+
+      .btn-success:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(25, 135, 84, 0.3);
+      }
+
+      .form-control {
+        border: 2px solid var(--border-gray);
+        border-radius: 6px;
+        padding: 0.5rem 0.75rem;
+        transition: all 0.2s ease;
+        font-size: 0.95rem;
+      }
+
+      .form-control:focus {
+        border-color: var(--primary-blue);
+        box-shadow: 0 0 0 0.2rem rgba(13, 110, 253, 0.1);
+      }
+
+      .alert {
+        border: none;
+        border-radius: 8px;
+        border-left: 4px solid;
+        font-weight: 500;
+      }
+
+      .alert-success {
+        background-color: rgba(25, 135, 84, 0.1);
+        border-left-color: var(--success-green);
+        color: var(--success-green);
+      }
+
+      .alert-warning {
+        background-color: rgba(253, 126, 20, 0.1);
+        border-left-color: var(--warning-orange);
+        color: #b45309;
+      }
+
+      .alert-danger, .alert-error {
+        background-color: rgba(220, 53, 69, 0.1);
+        border-left-color: var(--danger-red);
+        color: var(--danger-red);
+      }
+
+      #status-card {
+        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+        border: 1px solid var(--border-gray);
+        border-radius: 8px;
+        margin-top: 2rem;
+      }
+
+      .progress {
+        height: 8px;
+        border-radius: 4px;
+        background-color: rgba(0,0,0,0.1);
+      }
+
+      .progress-bar {
+        border-radius: 4px;
+        transition: width 0.3s ease;
+      }
+
+      .badge {
+        font-weight: 500;
+        padding: 0.4em 0.8em;
+        border-radius: 6px;
+      }
+
+      .report-status-accordion .accordion-button {
+        background-color: white;
+        color: #333;
+        border: none;
+        font-weight: 500;
+        padding: 1rem 1.25rem;
+      }
+
+      .report-status-accordion .accordion-button:not(.collapsed) {
+        background-color: rgba(13, 110, 253, 0.05);
+        color: var(--primary-blue);
+        box-shadow: none;
+      }
+
+      .report-status-accordion .accordion-button .time-display {
+        font-size: 0.9rem;
+        margin-left: auto;
+        margin-right: 1rem;
+      }
+
+      .footer {
+        background-color: white;
+        border-top: 1px solid var(--border-gray);
+        padding: 1.5rem 0;
+        margin-top: 2rem;
+        color: var(--text-muted);
+        font-size: 0.9rem;
+      }
+
+      .select-all-btn {
+        background-color: rgba(13, 110, 253, 0.1);
+        color: var(--primary-blue);
+        border: 1px solid var(--primary-blue);
+        padding: 0.35rem 0.75rem;
+        border-radius: 4px;
+        font-size: 0.85rem;
+        cursor: pointer;
+        transition: all 0.2s;
+        white-space: nowrap;
+      }
+
+      .select-all-btn:hover {
+        background-color: var(--primary-blue);
+        color: white;
+      }
+
+      .action-buttons {
+        position: sticky;
+        top: 0;
+        background: white;
+        padding: 1rem 0;
+        z-index: 100;
+        border-bottom: 2px solid var(--border-gray);
+        margin: -2rem -2rem 2rem -2rem;
+        padding: 1rem 2rem;
+      }
+
+      .download-section {
+        background-color: rgba(25, 135, 84, 0.05);
+        border: 2px solid var(--success-green);
+        border-radius: 8px;
+        padding: 1rem;
+        margin-top: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Header -->
+    <header class="header">
+      <div class="container">
+        <div class="d-flex align-items-center justify-content-between w-100">
+          <div class="d-flex align-items-center">
+            <img src="{{ url_for('static', filename='logo/logo.png') }}" alt="Logo" class="logo-placeholder me-3" onerror="this.style.display='none'">
+            <div>
+              <h1 class="h3 mb-0">CBSL Report Automation Portal</h1>
+              <p class="mb-0 opacity-75 small">ASSETLINE FINANCE LIMITED</p>
+            </div>
+          </div>
+          <div class="text-end">
+            <div id="live-datetime" class="fw-bold text-primary"></div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="main-container">
+      <div class="container">
+        <div class="content-wrapper">
+          <h2 class="section-title">Select and Run Reports</h2>
+
+          {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+              <div class="mb-4">
+              {% for category, message in messages %}
+                <div class="alert alert-{{ 'warning' if category == 'warning' else ('danger' if category == 'error' else 'success') }} alert-dismissible fade show" role="alert">
+                  {{ message }}
+                  <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+              {% endfor %}
+              </div>
+            {% endif %}
+          {% endwith %}
+
+          <form method="post" action="{{ url_for('run_reports') }}" id="report-form">
+            <!-- Sticky Action Buttons -->
+            <div class="action-buttons">
+              <div class="d-flex gap-3 align-items-center flex-wrap">
+                <button type="submit" class="btn btn-primary" onclick="return confirmSubmit()">
+                  &#9654; Run Selected Reports
+                </button>
+                <button type="button" class="btn btn-outline-danger" onclick="requestStop()">
+                  &#9724; Stop Process
+                </button>
+                <div class="ms-auto text-muted small">
+                  <span id="selected-count">0 reports selected</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Level Accordions -->
+            <div class="accordion level-accordion" id="levelAccordion">
+              {% for level in [1, 2, 3] %}
+                {% if level in reports_by_level %}
+                  <div class="accordion-item">
+                    <h2 class="accordion-header" id="levelHeading{{ level }}">
+                      <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#levelCollapse{{ level }}">
+                        Level {{ level }} Reports
+                        {% if level == 1 %}(Base Reports){% elif level == 2 %}(Depend on Level 1){% else %}(Depend on Level 2){% endif %}
+                        <span class="ms-auto me-3 badge bg-light text-dark">{{ reports_by_level[level]|length }} sets</span>
+                      </button>
+                    </h2>
+                    <div id="levelCollapse{{ level }}" class="accordion-collapse collapse" data-bs-parent="#levelAccordion">
+                      <div class="accordion-body">
+                        <!-- Set Accordions within Level -->
+                        <div class="accordion set-accordion" id="setAccordion{{ level }}">
+                          {% for set_num in reports_by_level[level]|sort %}
+                            <div class="accordion-item">
+                              <h2 class="accordion-header" id="setHeading{{ set_num }}">
+                                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#setCollapse{{ set_num }}">
+                                  <div class="set-header-info">
+                                    <span class="set-title">Set {{ set_num }}</span>
+                                    <span class="set-est-time">&#9201; {{ sets_info[set_num].estimated_minutes }} min</span>
+                                    <span class="badge bg-secondary">{{ reports_by_level[level][set_num]|length }} reports</span>
+                                  </div>
+                                </button>
+                              </h2>
+                              <div id="setCollapse{{ set_num }}" class="accordion-collapse collapse" data-bs-parent="#setAccordion{{ level }}">
+                                <div class="accordion-body">
+                                  <!-- Date picker for this set -->
+                                  <div class="date-selector">
+                                    <label for="date_{{ set_num }}">&#128197; Date:</label>
+                                    <input type="date"
+                                           class="form-control"
+                                           id="date_{{ set_num }}"
+                                           name="date_{{ set_num }}"
+                                           value="{{ today_iso }}">
+                                    <button type="button" class="select-all-btn" data-set="{{ set_num }}">
+                                        Select All
+                                    </button>
+
+                                    <script>
+                                    document.querySelectorAll('.select-all-btn').forEach(btn => {
+                                        btn.addEventListener('click', () => {
+                                            const setNum = btn.dataset.set;
+                                            selectSet(setNum);
+                                        });
+                                    });
+                                    </script>
+
+                                  </div>
+
+                                  <!-- Reports in this set -->
+                                  {% for report in reports_by_level[level][set_num] %}
+                                    <div class="report-checkbox">
+                                      <input type="checkbox"
+                                             name="reports_{{ set_num }}"
+                                             value="{{ report.id }}"
+                                             id="report-{{ report.id }}"
+                                             data-level="{{ level }}"
+                                             data-set="{{ set_num }}"
+                                             onchange="handleC1C6Selection(this); handleIAC1C2Selection(this); updateSelectedCount()">
+                                      <label for="report-{{ report.id }}">
+                                        <div class="report-name">
+                                          <span class="report-step-badge">Step {{ report.step }}</span>
+                                          {{ report.id }} - {{ report.name }}
+                                        </div>
+                                        <span class="report-time-badge">{{ report.estimated_minutes }} min</span>
+                                      </label>
+                                    </div>
+                                  {% endfor %}
+                                </div>
+                              </div>
+                            </div>
+                          {% endfor %}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                {% endif %}
+              {% endfor %}
+            </div>
+          </form>
+
+          <!-- Status Card -->
+          <div id="status-card" class="card" style="display:none;">
+            <div class="card-body">
+              <div class="d-flex align-items-center mb-3">
+                <div id="status-spinner" class="spinner-border text-primary me-3" role="status" style="display:none;width:1.5rem;height:1.5rem;">
+                  <span class="visually-hidden">Loading...</span>
+                </div>
+                <h5 class="card-title mb-0">Process Status</h5>
+                <span id="status-badge" class="badge bg-secondary ms-auto">Idle</span>
+              </div>
+              <div id="status-subtitle" class="text-muted mb-3"></div>
+              <div class="progress">
+                <div id="status-progress" class="progress-bar" role="progressbar" style="width: 0%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Report Checklist with Estimated Times -->
+          <div id="report-accordion" class="accordion report-status-accordion mt-4" style="display:none;"></div>
+
+          <!-- Status History -->
+          <div class="card mt-4" id="log-card" style="display:none;">
+            <div class="card-body">
+              <h5 class="card-title mb-3">Status History</h5>
+            </div>
+            <ul id="live-logs" class="list-group list-group-flush" style="max-height: 400px; overflow-y: auto;"></ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Mark Report Completion Section -->
+    <div class="main-container">
+      <div class="container">
+        <div class="content-wrapper">
+          <h2 class="section-title">Mark Report Completion</h2>
+          
+          <div class="row g-4">
+            {% for report_id, info in report_structure.items() %}
+            <div class="col-12 col-md-6 col-lg-4">
+              <div class="card h-100">
+                <div class="card-body d-flex flex-column">
+                  <h5 class="card-title">{{ info.name }}</h5>
+                  <p class="text-muted small mb-3">{{ report_id }}</p>
+                  <form method="post" action="{{ url_for('mark_completed') }}" onsubmit="return confirmMarkCompleted(this)" class="flex-grow-1 d-flex flex-column">
+                    <input type="hidden" name="report_id" value="{{ report_id }}">
+                    <div class="mb-3 flex-grow-1">
+                      <label class="form-label text-muted small">Completion Date:</label>
+                      <input type="date" class="form-control" name="date" value="{{ today_iso }}">
+                    </div>
+                    <div class="mt-auto">
+                      <button class="btn btn-success w-100" type="submit">Mark as Completed</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <div class="container">
+        <div class="d-flex justify-content-between align-items-center flex-wrap">
+          <div>
+            <span>Developed by Overdime Technologies</span>
+          </div>
+          <div class="d-flex align-items-center gap-2">
+            <a href="https://overdimetechnologies.com" target="_blank" class="text-decoration-none">Help and Support</a>
+          </div>
+        </div>
+      </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+      // Live Date and Time
+      function updateLiveDateTime() {
+        const now = new Date();
+        const options = {
+          weekday: 'long',
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
+        };
+        const timeOptions = {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false
+        };
+
+        const dateStr = now.toLocaleDateString('en-US', options);
+        const timeStr = now.toLocaleTimeString('en-US', timeOptions);
+
+        document.getElementById('live-datetime').innerHTML = `
+          <div>${dateStr}</div>
+          <div class="small">${timeStr}</div>
+        `;
+      }
+
+      updateLiveDateTime();
+      setInterval(updateLiveDateTime, 1000);
+
+      // Update selected count
+      function updateSelectedCount() {
+        const allCheckboxes = document.querySelectorAll('input[type="checkbox"][name^="reports_"]');
+        const selected = Array.from(allCheckboxes).filter(cb => cb.checked);
+        const countEl = document.getElementById('selected-count');
+        countEl.textContent = `${selected.length} report${selected.length !== 1 ? 's' : ''} selected`;
+      }
+
+      // Report Selection Functions
+      function selectSet(setNum) {
+        document.querySelectorAll(`input[name="reports_${setNum}"]`).forEach(cb => cb.checked = true);
+        updateSelectedCount();
+      }
+
+      // Auto-select all C1-C6 reports when any is selected
+      function handleC1C6Selection(checkbox) {
+        const c1c6Reports = ['NBD-MF-20-C1', 'NBD-MF-20-C2', 'NBD-MF-20-C3', 'NBD-MF-20-C4', 'NBD-MF-20-C5', 'NBD-MF-20-C6'];
+        
+        if (c1c6Reports.includes(checkbox.value)) {
+          // If any C1-C6 report is selected, select all of them
+          c1c6Reports.forEach(reportId => {
+            const reportCheckbox = document.getElementById(`report-${reportId}`);
+            if (reportCheckbox) {
+              reportCheckbox.checked = true;
+            }
+          });
+          updateSelectedCount();
+        }
+      }
+
+      function handleIAC1C2Selection(checkbox) {
+        const iaC1C2Reports = ['NBD-MF-23-IA', 'NBD-MF-23-C1-C2'];
+        
+        if (iaC1C2Reports.includes(checkbox.value)) {
+          // If any IA or C1C2 report is selected, select both of them
+          iaC1C2Reports.forEach(reportId => {
+            const reportCheckbox = document.getElementById(`report-${reportId}`);
+            if (reportCheckbox) {
+              reportCheckbox.checked = true;
+            }
+          });
+          updateSelectedCount();
+        }
+      }
+
+      function confirmSubmit() {
+        const allCheckboxes = document.querySelectorAll('input[type="checkbox"][name^="reports_"]');
+        const selected = Array.from(allCheckboxes).filter(cb => cb.checked);
+
+        if (selected.length === 0) {
+          alert('Please select at least one report.');
+          return false;
+        }
+
+        // Check if all selected reports have dates
+        const sets = new Set();
+        selected.forEach(cb => {
+          const setNum = cb.name.replace('reports_', '');
+          sets.add(setNum);
+        });
+
+        for (const setNum of sets) {
+          const dateInput = document.getElementById(`date_${setNum}`);
+          if (!dateInput.value) {
+            alert(`Please select a date for Set ${setNum}`);
+            return false;
+          }
+        }
+
+        const confirmation = confirm(`Run ${selected.length} report(s)?\n\nThis will execute the reports with their dependencies.`);
+        
+        if (confirmation) {
+          // Reset any previous state
+        }
+        
+        return confirmation;
+      }
+
+      function confirmMarkCompleted(form) {
+        const reportId = form.querySelector('input[name="report_id"]').value;
+        const date = form.querySelector('input[name="date"]').value;
+        const reportName = form.querySelector('.card-title').textContent;
+        
+        if (!date) {
+          alert('Please select a completion date.');
+          return false;
+        }
+        
+        return confirm(`Mark "${reportName}" as completed for ${date}?\n\nThis will append the date to the completed_dates.txt file.`);
+      }
+
+      async function requestStop() {
+        if (!confirm('Are you sure you want to stop the current process?\n\nThis will terminate all running reports.')) return;
+        try {
+          const response = await fetch("{{ url_for('stop') }}", { method: 'POST' });
+          if (response.ok) {
+            const data = await response.json();
+            if (data.ok) {
+              alert('Stop request sent successfully.');
+            }
+          }
+        } catch (e) {
+          console.error('Failed to send stop request:', e);
+          alert('Failed to send stop request. Please try again.');
+        }
+      }
+
+
+      // Format time display
+      function formatTime(seconds, estimatedMinutes) {
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        const elapsed = `${mins}m ${secs}s`;
+        const estimated = `${estimatedMinutes}m`;
+        return `${elapsed} / ${estimated}`;
+      }
+
+      // Status Polling
+      const statusCard = document.getElementById('status-card');
+      const statusSpinner = document.getElementById('status-spinner');
+      const statusBadge = document.getElementById('status-badge');
+      const statusSubtitle = document.getElementById('status-subtitle');
+      const statusProgress = document.getElementById('status-progress');
+      const logCard = document.getElementById('log-card');
+      const logList = document.getElementById('live-logs');
+      const reportAccordion = document.getElementById('report-accordion');
+
+      let lastLogCount = 0;
+      let processCompleted = false;
+
+      async function pollStatus() {
+        try {
+          const res = await fetch("{{ url_for('status') }}", { cache: 'no-store' });
+          if (!res.ok) return;
+          const data = await res.json();
+
+          const running = !!data.running;
+          const stage = data.stage || 'idle';
+          const message = data.message || '';
+
+          if (running || stage !== 'idle') {
+            statusCard.style.display = '';
+            logCard.style.display = '';
+
+            // Update badge
+            let badgeClass = 'bg-secondary';
+            let badgeText = 'Idle';
+            if (stage === 'running') {
+              badgeClass = 'bg-primary';
+              badgeText = 'Running';
+              processCompleted = false;
+            } else if (stage === 'copying') {
+              badgeClass = 'bg-info';
+              badgeText = 'Copying';
+              processCompleted = false;
+            } else if (stage === 'saving') {
+              badgeClass = 'bg-info';
+              badgeText = 'Saving';
+              processCompleted = false;
+            } else if (stage === 'done') {
+              badgeClass = 'bg-success';
+              badgeText = 'Completed';
+              if (!processCompleted) {
+                processCompleted = true;
+                // Auto-download files after completion
+                setTimeout(() => {
+                  window.location.href = "{{ url_for('download_latest') }}";
+                }, 2000); // Wait 2 seconds before auto-download
+              }
+            } else if (stage === 'error') {
+              badgeClass = 'bg-danger';
+              badgeText = 'Error';
+              processCompleted = true;
+            } else if (stage === 'stopping') {
+              badgeClass = 'bg-warning text-dark';
+              badgeText = 'Stopping';
+            }
+
+            statusBadge.className = `badge ${badgeClass} ms-auto`;
+            statusBadge.textContent = badgeText;
+            statusSubtitle.textContent = message;
+
+            // Update progress bar
+            let progress = 0;
+            if (stage === 'starting') progress = 10;
+            else if (stage === 'copying') progress = 20;
+            else if (stage === 'running') progress = 50;
+            else if (stage === 'saving') progress = 90;
+            else if (stage === 'done' || stage === 'error') progress = 100;
+
+            statusProgress.style.width = progress + '%';
+            statusProgress.className = 'progress-bar ' + (stage === 'error' ? 'bg-danger' : (stage === 'done' ? 'bg-success' : ''));
+
+            statusSpinner.style.display = (running && stage !== 'done' && stage !== 'error') ? '' : 'none';
+          } else {
+            // Only hide if no process is running and stage is idle
+            if (stage === 'idle' && !processCompleted) {
+              statusCard.style.display = 'none';
+              logCard.style.display = 'none';
+              reportAccordion.style.display = 'none';
+            }
+          }
+        } catch (e) {
+          console.error('Status poll error:', e);
+        }
+      }
+
+      async function pollLogs() {
+        try {
+          const res = await fetch("{{ url_for('logs') }}", { cache: 'no-store' });
+          if (!res.ok) return;
+          const text = await res.text();
+          const lines = (text || '').split('\n').filter(Boolean);
+          
+          // Only update if there are new logs
+          if (lines.length !== lastLogCount) {
+            lastLogCount = lines.length;
+            const recent = lines.slice(-50); // Show last 50 lines
+
+            logList.innerHTML = '';
+            recent.forEach(line => {
+              const item = document.createElement('li');
+              item.className = 'list-group-item small';
+              item.style.fontFamily = 'monospace';
+              item.textContent = line;
+              logList.appendChild(item);
+            });
+            
+            // Auto-scroll to bottom
+            logList.scrollTop = logList.scrollHeight;
+          }
+        } catch (e) {
+          console.error('Logs poll error:', e);
+        }
+      }
+
+      async function pollChecklist() {
+        try {
+          const res = await fetch("{{ url_for('report_checklist') }}", { cache: 'no-store' });
+          if (!res.ok) return;
+          const items = await res.json();
+
+          if (items && items.length > 0) {
+            reportAccordion.style.display = '';
+
+            // Rebuild accordion if structure changed
+            const currentIds = Array.from(reportAccordion.querySelectorAll('.accordion-item')).map(el => el.dataset.reportId).join('|');
+            const newIds = items.map(it => it.name).join('|');
+
+            if (currentIds !== newIds) {
+              reportAccordion.innerHTML = '';
+
+              items.forEach((item, idx) => {
+                const headingId = `heading-${idx}`;
+                const collapseId = `collapse-${idx}`;
+
+                const accordionItem = document.createElement('div');
+                accordionItem.className = 'accordion-item';
+                accordionItem.dataset.reportId = item.name;
+
+                const status = (item.status || '').toLowerCase();
+                let badgeClass = 'bg-secondary';
+                let badgeText = 'Pending';
+                let icon = '&#9679;'; // Circle
+
+                if (status === 'running') {
+                  badgeClass = 'bg-primary';
+                  badgeText = 'Running';
+                  icon = '&#9654;'; // Play
+                } else if (status === 'completed') {
+                  badgeClass = 'bg-success';
+                  badgeText = 'Done';
+                  icon = '&#10004;'; // Check
+                } else if (status === 'failed') {
+                  badgeClass = 'bg-danger';
+                  badgeText = 'Failed';
+                  icon = '&#10008;'; // X
+                } else if (status === 'stopped') {
+                  badgeClass = 'bg-warning text-dark';
+                  badgeText = 'Stopped';
+                  icon = '&#9724;'; // Stop
+                }
+
+                const estMin = item.estimated_minutes || 10;
+                const elapsedSec = item.elapsed_seconds || 0;
+                const timeDisplay = formatTime(elapsedSec, estMin);
+
+                accordionItem.innerHTML = `
+                  <h2 class="accordion-header" id="${headingId}">
+                    <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#${collapseId}">
+                      <div class="d-flex align-items-center w-100">
+                        <span class="me-2">${icon}</span>
+                        <span class="flex-grow-1">${item.display_name || item.name}</span>
+                        <span class="time-display text-muted" id="time-${item.name}">&#9201; ${timeDisplay}</span>
+                        <span class="badge ${badgeClass} ms-2">${badgeText}</span>
+                      </div>
+                    </button>
+                  </h2>
+                  <div id="${collapseId}" class="accordion-collapse collapse" data-bs-parent="#report-accordion">
+                    <div class="accordion-body">
+                      <div class="border rounded bg-light p-3" style="height: 200px; overflow-y: auto; font-family: monospace; font-size: 0.85rem;">
+                        <pre class="mb-0 small" style="white-space: pre-wrap;" id="log-${item.name}">No logs available yet...</pre>
+                      </div>
+                    </div>
+                  </div>
+                `;
+
+                reportAccordion.appendChild(accordionItem);
+              });
+            }
+
+            // Update badges, icons, and time displays
+            items.forEach(item => {
+              const accordionItem = reportAccordion.querySelector(`[data-report-id="${item.name}"]`);
+              if (accordionItem) {
+                const badge = accordionItem.querySelector('.badge');
+                const timeDisplayEl = accordionItem.querySelector(`#time-${item.name}`);
+                const iconSpan = accordionItem.querySelector('.me-2');
+                const status = (item.status || '').toLowerCase();
+
+                let badgeClass = 'bg-secondary';
+                let badgeText = 'Pending';
+                let icon = '&#9679;';
+
+                if (status === 'running') {
+                  badgeClass = 'bg-primary';
+                  badgeText = 'Running';
+                  icon = '&#9654;';
+                } else if (status === 'completed') {
+                  badgeClass = 'bg-success';
+                  badgeText = 'Done';
+                  icon = '&#10004;';
+                } else if (status === 'failed') {
+                  badgeClass = 'bg-danger';
+                  badgeText = 'Failed';
+                  icon = '&#10008;';
+                } else if (status === 'stopped') {
+                  badgeClass = 'bg-warning text-dark';
+                  badgeText = 'Stopped';
+                  icon = '&#9724;';
+                }
+
+                badge.className = `badge ${badgeClass} ms-2`;
+                badge.textContent = badgeText;
+                if (iconSpan) iconSpan.innerHTML = icon;
+
+                // Update time display
+                const estMin = item.estimated_minutes || 10;
+                const elapsedSec = item.elapsed_seconds || 0;
+                const timeDisplay = formatTime(elapsedSec, estMin);
+                if (timeDisplayEl) {
+                  timeDisplayEl.innerHTML = `&#9201; ${timeDisplay}`;
+                }
+              }
+            });
+          } else {
+            // Only hide if no process is running
+            const statusRes = await fetch("{{ url_for('status') }}", { cache: 'no-store' });
+            if (statusRes.ok) {
+              const statusData = await statusRes.json();
+              if (!statusData.running && statusData.stage === 'idle') {
+                reportAccordion.style.display = 'none';
+              }
+            }
+          }
+        } catch (e) {
+          console.error('Checklist poll error:', e);
+        }
+      }
+
+      // Polling intervals
+      let statusInterval, logsInterval, checklistInterval;
+
+      function startPolling() {
+        // Clear any existing intervals
+        stopPolling();
+        
+        // Start polling
+        statusInterval = setInterval(pollStatus, 2000);
+        logsInterval = setInterval(pollLogs, 1500);
+        checklistInterval = setInterval(pollChecklist, 1000);
+        
+        // Initial polls
+        pollStatus();
+        pollLogs();
+        pollChecklist();
+      }
+
+      function stopPolling() {
+        if (statusInterval) clearInterval(statusInterval);
+        if (logsInterval) clearInterval(logsInterval);
+        if (checklistInterval) clearInterval(checklistInterval);
+      }
+
+      // Start polling on page load
+      startPolling();
+
+      // Initialize selected count on load
+      updateSelectedCount();
+
+      // Prevent multiple form submissions
+      const form = document.getElementById('report-form');
+      let isSubmitting = false;
+
+      form.addEventListener('submit', function(e) {
+        if (isSubmitting) {
+          e.preventDefault();
+          return false;
+        }
+        isSubmitting = true;
+        
+        // Re-enable after 3 seconds to allow for re-submission if needed
+        setTimeout(() => {
+          isSubmitting = false;
+        }, 3000);
+      });
+
+      // Handle page visibility changes to pause/resume polling
+      document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+          stopPolling();
+        } else {
+          startPolling();
+        }
+      });
+
+      // Keyboard shortcuts
+      document.addEventListener('keydown', function(e) {
+        // Ctrl/Cmd + Enter to submit form
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+          e.preventDefault();
+          if (confirmSubmit()) {
+            form.submit();
+          }
+        }
+        
+        // Escape to stop process
+        if (e.key === 'Escape') {
+          const statusData = statusBadge.textContent.toLowerCase();
+          if (statusData === 'running' || statusData === 'copying' || statusData === 'saving') {
+            requestStop();
+          }
+        }
+      });
+
+      // Show helpful tooltips
+      const tooltips = {
+        'Level 1 Reports': 'Base reports that do not depend on any other reports',
+        'Level 2 Reports': 'Reports that depend on Level 1 reports',
+        'Level 3 Reports': 'Reports that depend on Level 2 reports'
+      };
+
+      // Add Bootstrap tooltips if available
+      if (typeof bootstrap !== 'undefined' && bootstrap.Tooltip) {
+        document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => {
+          new bootstrap.Tooltip(el);
+        });
+      }
+
+      console.log('CBSL Report Automation Portal initialized');
+      console.log('Keyboard shortcuts:');
+      console.log('  - Ctrl/Cmd + Enter: Submit form');
+      console.log('  - Escape: Stop running process');
+    </script>
+  </body>
+</html>

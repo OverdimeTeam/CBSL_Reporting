@@ -17,42 +17,6 @@ def get_month_year_from_filename(filename):
             return month, year
     return None, None
 
-def get_latest_folder(monthly_dir):
-    """Find the latest folder in monthly directory based on date and sequence number"""
-    if not monthly_dir.exists():
-        print(f"[ERROR] Monthly directory doesn't exist: {monthly_dir}")
-        return None
-    
-    # Pattern to match folders like "08-01-2025", "08-01-2025(1)", "08-01-2025(2)", etc.
-    date_pattern = re.compile(r'^(\d{2}-\d{2}-\d{4})(?:\((\d+)\))?$')
-    
-    folders_with_dates = []
-    
-    for folder in monthly_dir.iterdir():
-        if folder.is_dir():
-            match = date_pattern.match(folder.name)
-            if match:
-                date_str = match.group(1)
-                sequence = int(match.group(2)) if match.group(2) else 0
-                
-                try:
-                    # Parse the date
-                    date_obj = datetime.strptime(date_str, '%m-%d-%Y')
-                    folders_with_dates.append((date_obj, sequence, folder))
-                    print(f"Found folder: {folder.name} -> Date: {date_str}, Sequence: {sequence}")
-                except ValueError:
-                    print(f"[WARNING] Skipping folder with invalid date format: {folder.name}")
-    
-    if not folders_with_dates:
-        print("[ERROR] No valid date folders found in monthly directory")
-        return None
-    
-    # Sort by date (most recent first), then by sequence number (highest first)
-    folders_with_dates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    
-    latest_folder = folders_with_dates[0][2]
-    print(f"[OK] Latest folder selected: {latest_folder.name}")
-    return latest_folder
 
 def find_files_safely(search_dir, pattern, description):
     """Safely find files and provide detailed error messages"""
@@ -127,67 +91,66 @@ def main():
     # Setup logging
     logger = setup_logging()
     
-    # Determine working directory
+    # Determine working directory - new structure: working/NBD_MF_20_C1_C6/<dated-folder>/
     if args.working_dir:
         # Use provided working directory - it should point to the date folder
         latest_folder = Path(args.working_dir)
-        monthly_working_dir = latest_folder.parent
-        working_dir = monthly_working_dir.parent
+        c1_c6_working_dir = latest_folder.parent
+        working_dir = c1_c6_working_dir.parent
     else:
         # Fallback to default behavior
         base_dir = Path(__file__).resolve().parent.parent
         working_dir = base_dir / "working"
-        monthly_working_dir = working_dir / "monthly"
-        monthly_working_dir.mkdir(parents=True, exist_ok=True)
-        latest_folder = get_latest_folder(monthly_working_dir)
-        if latest_folder is None:
-            print("[ERROR] Could not find any valid date folders in monthly directory")
+        c1_c6_working_dir = working_dir / "NBD_MF_20_C1_C6"
+        
+        if not c1_c6_working_dir.exists():
+            print(f"[ERROR] C1-C6 working directory does not exist: {c1_c6_working_dir}")
+            print("Please ensure the working/NBD_MF_20_C1_C6 directory exists with dated folders.")
             sys.exit(1)
+        
+        # Find the latest dated folder
+        dated_folders = [d for d in c1_c6_working_dir.iterdir() if d.is_dir()]
+        if not dated_folders:
+            print("[ERROR] No dated folders found in C1-C6 working directory")
+            sys.exit(1)
+        
+        # Use the first dated folder (assuming only one exists as per new structure)
+        latest_folder = dated_folders[0]
+        print(f"[OK] Using dated folder: {latest_folder.name}")
     
     logger.info(f"Base directory: {Path(__file__).resolve().parent.parent}")
     logger.info(f"Working directory: {working_dir}")
-    logger.info(f"Monthly working directory: {monthly_working_dir}")
+    logger.info(f"C1-C6 working directory: {c1_c6_working_dir}")
     logger.info(f"Latest folder: {latest_folder}")
     print(f"Base directory: {Path(__file__).resolve().parent.parent}")
     print(f"Working directory: {working_dir}")
-    print(f"Monthly working directory: {monthly_working_dir}")
+    print(f"C1-C6 working directory: {c1_c6_working_dir}")
     print(f"Latest folder: {latest_folder}")
     
     if not latest_folder.exists():
         print(f"[ERROR] Latest folder does not exist: {latest_folder}")
         sys.exit(1)
     
-    print(f"\nSearching for files in latest folder: {latest_folder}")
+    print(f"\nSearching for files in dated folder: {latest_folder}")
     
-    # Look for the NBD_MF_20_C1_C6 subfolder - this is the final working folder
-    c1_c6_subfolder = latest_folder / "NBD_MF_20_C1_C6"
-    print(f"Final working folder: {c1_c6_subfolder}")
+    # Files are directly in the dated folder (no subfolders in new structure)
+    search_folder = latest_folder
+    print(f"Search folder: {search_folder}")
     
-    if not c1_c6_subfolder.exists():
-        print(f"[ERROR] NBD_MF_20_C1_C6 subfolder not found in {latest_folder}")
-        print("Available subfolders:")
-        try:
-            subfolders = [f.name for f in latest_folder.iterdir() if f.is_dir()]
-            for folder in subfolders:
-                print(f"  - {folder}")
-        except Exception as e:
-            print(f"  Error listing subfolders: {e}")
-        sys.exit(1)
+    # Both files should be in the same dated folder
+    afl_subfolder = search_folder  # Use the same folder for both files
     
-    # Both files should be in the NBD_MF_20_C1_C6 subfolder
-    afl_subfolder = c1_c6_subfolder  # Use the same folder for both files
-    
-    # Search for files in the appropriate subfolders
+    # Search for files in the dated folder
     # First try the expected naming patterns
-    file_c1_c6 = find_files_safely(c1_c6_subfolder, "NBD-MF-20-C1 to C6*.xlsx", "C1-C6 file")
+    file_c1_c6 = find_files_safely(search_folder, "NBD-MF-20-C1 to C6*.xlsx", "C1-C6 file")
     file_afl = find_files_safely(afl_subfolder, "NBD-MF-01-SOFP & SOCI AFL Monthly FS*.xlsx", "AFL file")
     
     # If not found, try alternative patterns
     if file_c1_c6 is None:
         print("Trying alternative patterns for C1-C6 file...")
-        file_c1_c6 = find_files_safely(c1_c6_subfolder, "*C1*C6*.xlsx", "C1-C6 file (alternative)")
+        file_c1_c6 = find_files_safely(search_folder, "*C1*C6*.xlsx", "C1-C6 file (alternative)")
         if file_c1_c6 is None:
-            file_c1_c6 = find_files_safely(c1_c6_subfolder, "*NBD*MF*20*.xlsx", "C1-C6 file (alternative 2)")
+            file_c1_c6 = find_files_safely(search_folder, "*NBD*MF*20*.xlsx", "C1-C6 file (alternative 2)")
     
     if file_afl is None:
         print("Trying alternative patterns for AFL file...")
@@ -198,10 +161,10 @@ def main():
             file_afl = find_files_safely(afl_subfolder, "*SOCI*.xlsx", "AFL file (alternative 3)")
     
     if file_c1_c6 is None:
-        print(f"\n[ERROR] Could not find C1 to C6 file in {c1_c6_subfolder}")
+        print(f"\n[ERROR] Could not find C1 to C6 file in {search_folder}")
         print("Available Excel files:")
         try:
-            xlsx_files = list(c1_c6_subfolder.glob("*.xlsx"))
+            xlsx_files = list(search_folder.glob("*.xlsx"))
             for f in xlsx_files:
                 print(f"  - {f.name}")
         except Exception as e:
@@ -229,7 +192,7 @@ def main():
     print(f"\n[OK] Parsed month: {month}, year: {year}")
     
     # Save the report directly in the NBD_MF_20_C1_C6 subfolder where source files are located
-    out_folder = c1_c6_subfolder
+    out_folder = search_folder
     print(f"Output folder: {out_folder}")
     
     try:

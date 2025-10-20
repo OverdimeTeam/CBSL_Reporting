@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Master Data Input - CBSL Report Automation Portal</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+      :root {
+        --primary-red: #dc3545;
+        --secondary-red: #c82333;
+        --success-green: #198754;
+        --warning-orange: #fd7e14;
+        --danger-red: #dc3545;
+        --light-gray: #f8f9fa;
+        --border-gray: #e9ecef;
+        --text-muted: #6c757d;
+      }
+
+      body { 
+        background-color: #ffffff;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        margin: 0;
+        padding: 0;
+      }
+
+      .header {
+        background-color: white;
+        color: #333;
+        padding: 1rem 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.08);
+        border-bottom: 1px solid var(--border-gray);
+      }
+
+      .logo-placeholder {
+        height: 40px;
+        width: auto;
+        max-width: 100px;
+      }
+
+      .main-container {
+        padding: 2rem 0;
+        background-color: var(--light-gray);
+        min-height: calc(100vh - 160px);
+      }
+
+      .content-wrapper {
+        background-color: white;
+        border-radius: 0;
+        padding: 2rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        margin: 0 1rem;
+        max-width: 800px;
+        margin-left: auto;
+        margin-right: auto;
+      }
+
+      .section-title { 
+        color: #333;
+        font-weight: 600;
+        margin-top: 2rem; 
+        margin-bottom: 1.5rem;
+        font-size: 1.5rem;
+      }
+
+      .section-title:first-child {
+        margin-top: 0;
+      }
+
+      .form-control {
+        border: 2px solid var(--border-gray);
+        border-radius: 8px;
+        padding: 0.6rem 0.75rem;
+        transition: all 0.2s ease;
+        background-color: white;
+      }
+
+      .form-control:focus {
+        border-color: #0d6efd;
+        box-shadow: 0 0 0 0.2rem rgba(13, 110, 253, 0.1);
+        background-color: white;
+      }
+
+      .btn-primary {
+        background: linear-gradient(135deg, #0d6efd 0%, #0b5ed7 100%);
+        border: none;
+        border-radius: 0;
+        font-weight: 500;
+        padding: 0.6rem 1rem;
+        transition: all 0.2s ease;
+      }
+
+      .btn-primary:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(13, 110, 253, 0.3);
+        background: linear-gradient(135deg, #0b5ed7 0%, #0d6efd 100%);
+      }
+
+      .btn-secondary {
+        background: linear-gradient(135deg, #6c757d 0%, #5a6268 100%);
+        border: none;
+        border-radius: 0;
+        font-weight: 500;
+        padding: 0.6rem 1rem;
+        transition: all 0.2s ease;
+      }
+
+      .btn-secondary:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(108, 117, 125, 0.3);
+        background: linear-gradient(135deg, #5a6268 0%, #6c757d 100%);
+      }
+
+      .card {
+        border: 1px solid var(--border-gray);
+        border-radius: 0;
+        transition: all 0.2s ease;
+        background-color: white;
+        margin-bottom: 1rem;
+      }
+
+      .card:hover {
+        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+        transform: translateY(-2px);
+      }
+
+      .card-title {
+        color: #333;
+        font-weight: 600;
+        font-size: 1.1rem;
+      }
+
+      .alert {
+        border: none;
+        border-radius: 10px;
+        border-left: 4px solid;
+        font-weight: 500;
+      }
+
+      .alert-success {
+        background-color: rgba(25, 135, 84, 0.1);
+        border-left-color: var(--success-green);
+        color: var(--success-green);
+      }
+
+      .alert-danger {
+        background-color: rgba(220, 53, 69, 0.1);
+        border-left-color: var(--danger-red);
+        color: var(--danger-red);
+      }
+
+      .footer {
+        background-color: white;
+        border-top: 1px solid var(--border-gray);
+        padding: 1.5rem 0;
+        margin-top: 2rem;
+        color: var(--text-muted);
+        font-size: 0.9rem;
+      }
+
+      .footer a {
+        color: var(--primary-red);
+        text-decoration: none;
+        font-weight: 500;
+      }
+
+      .footer a:hover {
+        color: var(--secondary-red);
+        text-decoration: underline;
+      }
+
+      @media (max-width: 768px) {
+        .content-wrapper {
+          margin: 0 0.5rem;
+          padding: 1.5rem;
+        }
+        
+        .header h1 {
+          font-size: 1.5rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Header -->
+    <header class="header">
+      <div class="container">
+        <div class="d-flex align-items-center justify-content-between w-100">
+          <div class="d-flex align-items-center">
+            <img src="{{ url_for('static', filename='logo/logo.png') }}" alt="ASSETLINE Logo" class="logo-placeholder me-3">
+            <div>
+              <h1 class="h3 mb-0">Master Data Input</h1>
+              <p class="mb-0 opacity-75 small">CBSL Report Automation Portal</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="main-container">
+      <div class="container">
+        <div class="content-wrapper">
+          <h2 class="section-title">Enter Master Data</h2>
+          
+          {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+              <div class="mb-4">
+              {% for category, message in messages %}
+                <div class="alert alert-{{ 'danger' if category == 'error' else 'success' }} alert-dismissible fade show" role="alert">
+                  {{ message }}
+                  <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+              {% endfor %}
+              </div>
+            {% endif %}
+          {% endwith %}
+
+          <form method="post" action="{{ url_for('submit_master_data') }}" enctype="multipart/form-data">
+            <input type="hidden" name="_show_sofp" value="{{ 1 if show_sofp else 0 }}">
+            <input type="hidden" name="_show_ia" value="{{ 1 if show_ia else 0 }}">
+            <input type="hidden" name="_show_c1c2" value="{{ 1 if show_c1c2 else 0 }}">
+            <input type="hidden" name="_show_c1c6" value="{{ 1 if show_c1c6 else 0 }}">
+            <input type="hidden" name="_show_ga_is" value="{{ 1 if show_ga_is else 0 }}">
+            <input type="hidden" name="_show_c4" value="{{ 1 if show_c4 else 0 }}">
+            <!-- SOFP-SOCI Section -->
+            {% if show_sofp %}
+            <div class="card mb-4">
+              <div class="card-body">
+                <h5 class="card-title">NBD-MF-01-SOFP-SOCI Data</h5>
+                <div class="row g-3">
+                  <div class="col-md-6">
+                    <label for="sofp_timestamp" class="form-label">Last Timestamp</label>
+                    <input type="text" class="form-control" id="sofp_timestamp" value="{{ sofp_data.timestamp }}" readonly style="background-color: #f8f9fa; color: #6c757d;">
+                    <small class="text-muted">Auto-generated when saved</small>
+                  </div>
+                  <div class="col-md-6">
+                    <label for="bank_loans" class="form-label">Bank Loans</label>
+                    <input type="text" class="form-control" id="bank_loans" name="bank_loans" value="{{ sofp_data.bank_loans }}" placeholder="Enter bank loans value">
+                  </div>
+                  <div class="col-md-6">
+                    <label for="securitization_loans" class="form-label">Securitization Loans</label>
+                    <input type="text" class="form-control" id="securitization_loans" name="securitization_loans" value="{{ sofp_data.securitization_loans }}" placeholder="Enter securitization loans value">
+                  </div>
+                  <div class="col-md-6">
+                    <label for="foreign_funding" class="form-label">Foreign Funding</label>
+                    <input type="text" class="form-control" id="foreign_funding" name="foreign_funding" value="{{ sofp_data.foreign_funding }}" placeholder="Enter foreign funding value">
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- SOFP File Uploads Section -->
+            <div class="card mb-4">
+              <div class="card-body">
+                <h5 class="card-title">SOFP Supporting Files</h5>
+                
+                <!-- ALCL Management Accounts -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">ALCL Management Accounts</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('ALCL Management Accounts', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-6">
+                      <label for="alcl_management_accounts_month" class="form-label">Month <span class="text-danger" id="alcl_month_required" style="display: none;">*</span></label>
+                      <select class="form-control" id="alcl_management_accounts_month" name="alcl_management_accounts_month">
+                        <option value="">Select Month</option>
+                        <option value="January">January</option>
+                        <option value="February">February</option>
+                        <option value="March">March</option>
+                        <option value="April">April</option>
+                        <option value="May">May</option>
+                        <option value="June">June</option>
+                        <option value="July">July</option>
+                        <option value="August">August</option>
+                        <option value="September">September</option>
+                        <option value="October">October</option>
+                        <option value="November">November</option>
+                        <option value="December">December</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label for="alcl_management_accounts_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="alcl_management_accounts_file" name="alcl_management_accounts_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Investment Schedule -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Investment Schedule</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Investment Schedule', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-6">
+                      <label for="investment_schedule_month" class="form-label">Month <span class="text-danger" id="investment_month_required" style="display: none;">*</span></label>
+                      <select class="form-control" id="investment_schedule_month" name="investment_schedule_month">
+                        <option value="">Select Month</option>
+                        <option value="January">January</option>
+                        <option value="February">February</option>
+                        <option value="March">March</option>
+                        <option value="April">April</option>
+                        <option value="May">May</option>
+                        <option value="June">June</option>
+                        <option value="July">July</option>
+                        <option value="August">August</option>
+                        <option value="September">September</option>
+                        <option value="October">October</option>
+                        <option value="November">November</option>
+                        <option value="December">December</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label for="investment_schedule_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="investment_schedule_file" name="investment_schedule_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Loan Schedule -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Loan Schedule</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Loan Schedule', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-6">
+                      <label for="loan_schedule_month" class="form-label">Month <span class="text-danger" id="loan_month_required" style="display: none;">*</span></label>
+                      <select class="form-control" id="loan_schedule_month" name="loan_schedule_month">
+                        <option value="">Select Month</option>
+                        <option value="January">January</option>
+                        <option value="February">February</option>
+                        <option value="March">March</option>
+                        <option value="April">April</option>
+                        <option value="May">May</option>
+                        <option value="June">June</option>
+                        <option value="July">July</option>
+                        <option value="August">August</option>
+                        <option value="September">September</option>
+                        <option value="October">October</option>
+                        <option value="November">November</option>
+                        <option value="December">December</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label for="loan_schedule_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="loan_schedule_file" name="loan_schedule_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Supporting Schedules -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Supporting Schedules</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Supporting Schedules', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-6">
+                      <label for="supporting_schedules_month" class="form-label">Month <span class="text-danger" id="supporting_month_required" style="display: none;">*</span></label>
+                      <select class="form-control" id="supporting_schedules_month" name="supporting_schedules_month">
+                        <option value="">Select Month</option>
+                        <option value="January">January</option>
+                        <option value="February">February</option>
+                        <option value="March">March</option>
+                        <option value="April">April</option>
+                        <option value="May">May</option>
+                        <option value="June">June</option>
+                        <option value="July">July</option>
+                        <option value="August">August</option>
+                        <option value="September">September</option>
+                        <option value="October">October</option>
+                        <option value="November">November</option>
+                        <option value="December">December</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6">
+                      <label for="supporting_schedules_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="supporting_schedules_file" name="supporting_schedules_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            <!-- IA Section -->
+            {% if show_ia %}
+            <div class="card mb-4">
+              <div class="card-body">
+                <h5 class="card-title">NBD-MF-23-IA Data</h5>
+                <div class="row g-3">
+                  <div class="col-md-6">
+                    <label for="ia_timestamp" class="form-label">Last Timestamp</label>
+                    <input type="text" class="form-control" id="ia_timestamp" value="{{ ia_data.timestamp }}" readonly style="background-color: #f8f9fa; color: #6c757d;">
+                    <small class="text-muted">Auto-generated when saved</small>
+                  </div>
+                  <div class="col-md-6">
+                    <label for="annual_interest_rate" class="form-label">Annual Interest Rate</label>
+                    <input type="text" class="form-control" id="annual_interest_rate" name="annual_interest_rate" value="{{ ia_data.annual_interest_rate }}" placeholder="Enter annual interest rate">
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- IA File Uploads Section -->
+            <div class="card mb-4">
+              <div class="card-body">
+                <h5 class="card-title">IA Supporting Files</h5>
+                
+                <!-- Disbursement with Budget -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Disbursement with Budget</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Disbursement with Budget', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-4">
+                      <label for="disbursement_with_budget_month" class="form-label">Month <span class="text-danger" id="disbursement_month_required" style="display: none;">*</span></label>
+                      <select class="form-control" id="disbursement_with_budget_month" name="disbursement_with_budget_month">
+                        <option value="">Select Month</option>
+                        <option value="January">January</option>
+                        <option value="February">February</option>
+                        <option value="March">March</option>
+                        <option value="April">April</option>
+                        <option value="May">May</option>
+                        <option value="June">June</option>
+                        <option value="July">July</option>
+                        <option value="August">August</option>
+                        <option value="September">September</option>
+                        <option value="October">October</option>
+                        <option value="November">November</option>
+                        <option value="December">December</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label for="disbursement_with_budget_year" class="form-label">Year <span class="text-danger" id="disbursement_year_required" style="display: none;">*</span></label>
+                      <input type="number" class="form-control" id="disbursement_with_budget_year" name="disbursement_with_budget_year" min="2000" max="2100" placeholder="2025" value="{{ form_data.get('disbursement_with_budget_year', '') }}">
+                    </div>
+                    <div class="col-md-4">
+                      <label for="disbursement_with_budget_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="disbursement_with_budget_file" name="disbursement_with_budget_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Information Request from Credit -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Information Request from Credit</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Information Request from Credit', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-4">
+                      <label for="information_request_from_credit_month" class="form-label">Month <span class="text-danger" id="information_request_month_required" style="display: none;">*</span></label>
+                      <select class="form-control" id="information_request_from_credit_month" name="information_request_from_credit_month">
+                        <option value="">Select Month</option>
+                        <option value="January">January</option>
+                        <option value="February">February</option>
+                        <option value="March">March</option>
+                        <option value="April">April</option>
+                        <option value="May">May</option>
+                        <option value="June">June</option>
+                        <option value="July">July</option>
+                        <option value="August">August</option>
+                        <option value="September">September</option>
+                        <option value="October">October</option>
+                        <option value="November">November</option>
+                        <option value="December">December</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label for="information_request_from_credit_year" class="form-label">Year <span class="text-danger" id="information_request_year_required" style="display: none;">*</span></label>
+                      <input type="number" class="form-control" id="information_request_from_credit_year" name="information_request_from_credit_year" min="2000" max="2100" placeholder="2025">
+                    </div>
+                    <div class="col-md-4">
+                      <label for="information_request_from_credit_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="information_request_from_credit_file" name="information_request_from_credit_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Net Portfolio -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Net Portfolio</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Net Portfolio', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-4">
+                      <label for="net_portfolio_month" class="form-label">Month <span class="text-danger" id="net_portfolio_month_required" style="display: none;">*</span></label>
+                      <select class="form-control" id="net_portfolio_month" name="net_portfolio_month">
+                        <option value="">Select Month</option>
+                        <option value="January">January</option>
+                        <option value="February">February</option>
+                        <option value="March">March</option>
+                        <option value="April">April</option>
+                        <option value="May">May</option>
+                        <option value="June">June</option>
+                        <option value="July">July</option>
+                        <option value="August">August</option>
+                        <option value="September">September</option>
+                        <option value="October">October</option>
+                        <option value="November">November</option>
+                        <option value="December">December</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label for="net_portfolio_year" class="form-label">Year <span class="text-danger" id="net_portfolio_year_required" style="display: none;">*</span></label>
+                      <input type="number" class="form-control" id="net_portfolio_year" name="net_portfolio_year" min="2000" max="2100" placeholder="2025">
+                    </div>
+                    <div class="col-md-4">
+                      <label for="net_portfolio_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="net_portfolio_file" name="net_portfolio_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            <!-- C1-C6 Section -->
+            {% if show_c1c6 %}
+            <div class="card mb-4">
+              <div class="card-body">
+                <h5 class="card-title">NBD-MF-20 C1–C6 Data</h5>
+                <div class="row g-3">
+                  <div class="col-md-6">
+                    <label for="c1c6_timestamp" class="form-label">Last Timestamp</label>
+                    <input type="text" class="form-control" id="c1c6_timestamp" value="{{ c1c6_data.timestamp }}" readonly style="background-color: #f8f9fa; color: #6c757d;">
+                    <small class="text-muted">Auto-generated when saved</small>
+                  </div>
+                  <div class="col-md-6">
+                    <label for="c1c6_guarantees" class="form-label">Guarantees <small class="text-muted">(from Letter of Guarantees file)</small></label>
+                    <input type="text" class="form-control" id="c1c6_guarantees" name="c1c6_guarantees" value="{{ c1c6_data.guarantees }}" placeholder="Enter guarantees value">
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            <!-- C1-C2 Section -->
+            {% if show_c1c2 %}
+            <div class="card mb-4">
+              <div class="card-body">
+                <h5 class="card-title">NBD-MF-23-C1-C2 Supporting Files</h5>
+                
+                <!-- Cadre -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Cadre</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Cadre', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-6">
+                      <label for="cadre_date" class="form-label">Date <span class="text-danger" id="cadre_date_required" style="display: none;">*</span></label>
+                      <input type="date" class="form-control" id="cadre_date" name="cadre_date">
+                    </div>
+                    <div class="col-md-6">
+                      <label for="cadre_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="cadre_file" name="cadre_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Unutilized Amount -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Unutilized Amount</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Unutilized Amount', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-4">
+                      <label for="unutilized_amount_month" class="form-label">Month <span class="text-danger" id="unutilized_amount_month_required" style="display: none;">*</span></label>
+                      <select class="form-control" id="unutilized_amount_month" name="unutilized_amount_month">
+                        <option value="">Select Month</option>
+                        <option value="January">January</option>
+                        <option value="February">February</option>
+                        <option value="March">March</option>
+                        <option value="April">April</option>
+                        <option value="May">May</option>
+                        <option value="June">June</option>
+                        <option value="July">July</option>
+                        <option value="August">August</option>
+                        <option value="September">September</option>
+                        <option value="October">October</option>
+                        <option value="November">November</option>
+                        <option value="December">December</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label for="unutilized_amount_year" class="form-label">Year <span class="text-danger" id="unutilized_amount_year_required" style="display: none;">*</span></label>
+                      <input type="number" class="form-control" id="unutilized_amount_year" name="unutilized_amount_year" min="2000" max="2100" placeholder="2025">
+                    </div>
+                    <div class="col-md-4">
+                      <label for="unutilized_amount_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="unutilized_amount_file" name="unutilized_amount_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            <!-- GA IS Section -->
+            {% if show_ga_is %}
+            <div class="card mb-4">
+              <div class="card-body">
+                <h5 class="card-title">NBD-MF-10-GA-11-IS Data</h5>
+                
+                <!-- Borrowing report -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Borrowing report (*Format .xlsm)</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Borrowing report', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-6">
+                      <label for="borrowing_date" class="form-label">Date <span class="text-danger" id="borrowing_date_required" style="display: none;">*</span></label>
+                      <input type="date" class="form-control" id="borrowing_date" name="borrowing_date">
+                    </div>
+                    <div class="col-md-6">
+                      <label for="borrowing_report_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="borrowing_report_file" name="borrowing_report_file" accept=".xlsb,.xlsm">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            <!-- C4 Section -->
+            {% if show_c4 %}
+            <div class="card mb-4">
+              <div class="card-body">
+                <h5 class="card-title">NBD-MF-23-C4 Supporting Files</h5>
+
+                <!-- Rec Target -->
+                <div class="mb-4">
+                  <label class="form-label fw-bold">Rec Target</label>
+                  <div class="mb-2">
+                    <small class="text-muted">Latest file: {{ uploaded_files.get('Rec Target', 'No files uploaded') }}</small>
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-4">
+                      <label for="rectarget_month" class="form-label">Month <span class="text-danger" id="rectarget_month_required" style="display: none;">*</span></label>
+                      <select class="form-control" id="rectarget_month" name="rectarget_month">
+                        <option value="">Select Month</option>
+                        <option value="January">January</option>
+                        <option value="February">February</option>
+                        <option value="March">March</option>
+                        <option value="April">April</option>
+                        <option value="May">May</option>
+                        <option value="June">June</option>
+                        <option value="July">July</option>
+                        <option value="August">August</option>
+                        <option value="September">September</option>
+                        <option value="October">October</option>
+                        <option value="November">November</option>
+                        <option value="December">December</option>
+                      </select>
+                    </div>
+                    <div class="col-md-4">
+                      <label for="rectarget_year" class="form-label">Year <span class="text-danger" id="rectarget_year_required" style="display: none;">*</span></label>
+                      <input type="number" class="form-control" id="rectarget_year" name="rectarget_year" min="2000" max="2100" placeholder="2025">
+                    </div>
+                    <div class="col-md-4">
+                      <label for="rectarget_file" class="form-label">Upload File</label>
+                      <input type="file" class="form-control" id="rectarget_file" name="rectarget_file" accept=".xlsx,.xls">
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            <!-- Submit Buttons -->
+            <div class="d-flex gap-3">
+              <button type="submit" class="btn btn-primary">Submit & Start Automation</button>
+              <a href="{{ url_for('index') }}" class="btn btn-secondary">Cancel</a>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <div class="container">
+          <div class="d-flex justify-content-between align-items-center flex-wrap">
+          <div>
+            <span>Developed by Overdime Technologies</span>
+          </div>
+            <div class="d-flex align-items-center gap-2">
+              <a href="https://overdimetechnologies.com" target="_blank">Help and Support</a>
+            </div>
+        </div>
+      </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+      // Handle dynamic required fields for file uploads
+      document.addEventListener('DOMContentLoaded', function() {
+        const fileInputs = [
+          { file: 'alcl_management_accounts_file', month: 'alcl_management_accounts_month', required: 'alcl_month_required' },
+          { file: 'investment_schedule_file', month: 'investment_schedule_month', required: 'investment_month_required' },
+          { file: 'loan_schedule_file', month: 'loan_schedule_month', required: 'loan_month_required' },
+          { file: 'supporting_schedules_file', month: 'supporting_schedules_month', required: 'supporting_month_required' },
+          { file: 'borrowing_report_file', month: 'borrowing_date', required: 'borrowing_date_required' },
+          { file: 'disbursement_with_budget_file', month: 'disbursement_with_budget_month', required: 'disbursement_month_required', year: 'disbursement_with_budget_year', yearRequired: 'disbursement_year_required' },
+          { file: 'information_request_from_credit_file', month: 'information_request_from_credit_month', required: 'information_request_month_required', year: 'information_request_from_credit_year', yearRequired: 'information_request_year_required' },
+          { file: 'net_portfolio_file', month: 'net_portfolio_month', required: 'net_portfolio_month_required', year: 'net_portfolio_year', yearRequired: 'net_portfolio_year_required' },
+          { file: 'cadre_file', month: 'cadre_date', required: 'cadre_date_required' },
+          { file: 'unutilized_amount_file', month: 'unutilized_amount_month', required: 'unutilized_amount_month_required', year: 'unutilized_amount_year', yearRequired: 'unutilized_amount_year_required' },
+          { file: 'rectarget_file', month: 'rectarget_month', required: 'rectarget_month_required', year: 'rectarget_year', yearRequired: 'rectarget_year_required' }
+        ];
+
+        fileInputs.forEach(function(input) {
+          const fileInput = document.getElementById(input.file);
+          const monthSelect = document.getElementById(input.month);
+          const requiredSpan = document.getElementById(input.required);
+          const yearInput = input.year ? document.getElementById(input.year) : null;
+          const yearRequiredSpan = input.yearRequired ? document.getElementById(input.yearRequired) : null;
+
+          fileInput.addEventListener('change', function() {
+            if (this.files && this.files.length > 0) {
+              // File selected - make month required
+              monthSelect.required = true;
+              requiredSpan.style.display = 'inline';
+              
+              // If year field exists, make it required too
+              if (yearInput && yearRequiredSpan) {
+                yearInput.required = true;
+                yearRequiredSpan.style.display = 'inline';
+              }
+            } else {
+              // No file selected - make month optional
+              monthSelect.required = false;
+              requiredSpan.style.display = 'none';
+              
+              // If year field exists, remove required too
+              if (yearInput && yearRequiredSpan) {
+                yearInput.required = false;
+                yearRequiredSpan.style.display = 'none';
+              }
+            }
+          });
+        });
+      });
+    </script>
+  </body>
+</html>

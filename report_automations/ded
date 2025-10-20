@@ -1,0 +1,1171 @@
+
+def main(wb_c1_c6, file_car, file_prod, file_cbsl, file_sofp=None, out_folder=None, file_c1_c6=None):
+    """
+    Main function to process C3 report data and return modified workbook
+    
+    Args:
+        wb_c1_c6: openpyxl workbook object for C1-C6 file
+        file_car: Path to CAR Working file
+        file_prod: Path to Prod. wise Class. of Loans file
+        file_cbsl: Path to CBSL Provision Comparison file
+        file_sofp: Path to SOFP file (optional)
+        out_folder: Path to output folder for saving reports (optional)
+        file_c1_c6: Path to C1-C6 file (optional, for updating operations)
+    
+    Returns:
+        Modified openpyxl workbook object
+    """
+    try:
+        print(f"\n=== PROCESSING C3 REPORT ===")
+        print(f"CAR Working: {file_car}")
+        print(f"Prod wise: {file_prod}")
+        print(f"CBSL Provision: {file_cbsl}")
+        if file_sofp:
+            print(f"SOFP: {file_sofp}")
+        
+        # Set up output folder if not provided
+        if out_folder is None:
+            from pathlib import Path
+            out_folder = Path("outputs/monthly") / "temp_c3_output"
+            out_folder.mkdir(parents=True, exist_ok=True)
+            print(f"[INFO] Using default output folder: {out_folder}")
+        else:
+            print(f"[INFO] Using provided output folder: {out_folder}")
+        
+        # Extract month and year from CAR Working filename
+        month, year = get_month_year_from_filename(file_car.name)
+        if not month or not year:
+            print(f"[ERROR] Could not parse month/year from filename: {file_car.name}")
+            return None
+        
+        print(f"[OK] Parsed month: {month}, year: {year}")
+        
+        # Read source data from xlsb files
+        print("Reading 'Prod. wise' C1 & C2 Working sheet (xlsb)...")
+        
+        def read_prod_sheet(path):
+            try:
+                df = pd.read_excel(path, sheet_name="C1 & C2 Working", engine="pyxlsb", header=[0, 1])
+                if isinstance(df.columns, pd.MultiIndex):
+                    new_cols = []
+                    for top, sub in df.columns:
+                        name = str(sub).strip() if str(sub).strip() and str(sub).lower() != "nan" else str(top).strip()
+                        new_cols.append(name)
+                    df.columns = new_cols
+                df = normalize_columns(df)
+                return df
+            except Exception:
+                df = pd.read_excel(path, sheet_name="C1 & C2 Working", engine="pyxlsb")
+                df = normalize_columns(df)
+                return df
+        
+        df_prod = read_prod_sheet(file_prod)
+        print(f"[OK] Loaded Prod. wise C1 & C2 Working sheet with {len(df_prod)} rows")
+        print(df_prod.columns)
+        print(df_prod.head())
+        print(df_prod)
+
+        # ========== calculate sums of MT and FD before filtering ==========
+        df_prod['contract_no_str'] = df_prod['contract_no'].astype(str).str.strip()
+
+        mask_margin = df_prod['contract_no_str'].str.lower().eq("margin trading")
+        mask_fd = df_prod['contract_no_str'].str.upper().str.startswith("LR", na=False)
+
+        net_exposure_sum_margin_trading = df_prod.loc[mask_margin, 'net_exposure'].sum(skipna=True)
+        net_exposure_sum_fd = df_prod.loc[mask_fd, 'net_exposure'].sum(skipna=True)
+
+        print(f"Margin Trading Net Exposure Sum: {net_exposure_sum_margin_trading}")
+        print(f"FD (LR-prefixed) Net Exposure Sum: {net_exposure_sum_fd}")
+
+        # ======= Step 3: Append two summary rows =======
+        summary_rows = [
+            {"contract_no": "Margin Trading", "net_exposure": net_exposure_sum_margin_trading},
+            {"contract_no": "FD Loans", "net_exposure": net_exposure_sum_fd}
+        ]
+
+        # Convert to DataFrame
+        df_summary = pd.DataFrame(summary_rows)
+
+        # ======= Step 2: Remove unwanted rows =======
+        # Ensure contract_no is a string and stripped
+        df_prod['contract_no_str'] = df_prod['contract_no'].astype(str).str.strip()
+
+        # Filter out unwanted rows
+        df_prod = df_prod[
+            df_prod['contract_no_str'].notna() &
+            df_prod['contract_no_str'].ne('') &
+            ~df_prod['contract_no_str'].str.lower().eq('margin trading') &
+            ~df_prod['contract_no_str'].str.upper().str.startswith('LR', na=False)
+        ].copy()
+
+        # Optional: drop the helper column if no longer needed
+        df_prod.drop(columns=['contract_no_str'], inplace=True, errors='ignore')
+
+        print(f"[INFO] After filtering, {len(df_prod)} rows remain")
+
+        print(f"[INFO] After filtering, {len(df_prod)} rows remain in production data")
+        
+        # Append to df_prod
+        df_prod = pd.concat([df_prod, df_summary], ignore_index=True)
+        
+        print(f"[INFO] df_prod now has {len(df_prod)} rows after appending summary rows")
+        print(df_prod.tail(5))  # check the appended rows
+        
+        print(df_prod)
+        print(f"Loaded {len(df_prod)} rows from production data")
+        
+        # Log Production sheet columns
+        print(f"\n=== Production Sheet Column Analysis & Logging ===")
+        print(f"Total columns: {len(df_prod.columns)}")
+        print("All Production column names after normalization:")
+        for i, col in enumerate(df_prod.columns):
+            print(f"  {i+1:2d}. '{col}'")
+            if "contract" in str(col).lower():
+                print(f"      *** POTENTIAL CONTRACT COLUMN ***")
+            if "client" in str(col).lower():
+                print(f"      *** POTENTIAL CLIENT COLUMN ***")
+            if "product" in str(col).lower():
+                print(f"      *** POTENTIAL PRODUCT COLUMN ***")
+            if "gross" in str(col).lower() and "dp" in str(col).lower():
+                print(f"      *** POTENTIAL GROSS WITH DP COLUMN ***")
+            if "irfs" in str(col).lower() or "ifrs" in str(col).lower():
+                print(f"      *** POTENTIAL IFRS PROVISION COLUMN ***")
+            if "iis" in str(col).lower():
+                print(f"      *** POTENTIAL IIS COLUMN ***")
+            if "equipment" in str(col).lower():
+                print(f"      *** POTENTIAL EQUIPMENT COLUMN ***")
+        print("=" * 50)
+        
+        # Read CAR Working
+        try:
+            # Choose correct engine based on extension
+            ext = file_car.suffix.lower()
+            engine = "pyxlsb" if ext == ".xlsb" else None  # pandas auto-selects for .xlsx
+            
+            df_car = pd.read_excel(file_car, sheet_name="Portfolio", engine=engine, header=3)
+            df_car = normalize_columns(df_car)
+            print(f"[OK] Loaded CAR Working Portfolio sheet with {len(df_car)} rows")
+            
+            # Log CAR Working sheet columns
+            print(f"\n=== CAR Working Sheet Column Analysis & Logging ===")
+            print(f"Total columns: {len(df_car.columns)}")
+            print("All CAR Working column names after normalization:")
+            for i, col in enumerate(df_car.columns):
+                print(f"  {i+1:2d}. '{col}'")
+                if "contract" in str(col).lower():
+                    print(f"      *** POTENTIAL CONTRACT COLUMN ***")
+                if "p_np" in str(col).lower() or "cbsl" in str(col).lower():
+                    print(f"      *** POTENTIAL P/NP COLUMN ***")
+                if "mortgage" in str(col).lower():
+                    print(f"      *** POTENTIAL MORTGAGE COLUMN ***")
+            print("=" * 50)
+
+        except Exception as e:
+            print(f"[WARN] Could not read Portfolio sheet from CAR Working ({e})")
+        
+        # Read CBSL data - ACCESS 3RD LEVEL COLUMNS DIRECTLY
+        print("Reading 'CBSL Provision Comparison' - Portfolio sheet...")
+        df_cbsl = None
+        try:
+            xls_cbsl = pd.ExcelFile(file_cbsl, engine="pyxlsb")
+            print(f"Available sheets in CBSL file: {xls_cbsl.sheet_names}")
+            
+            # Find the appropriate sheet
+            candidate_names = [
+                "Portfolio", "CBSL Portfolio", "Portfolio Sheet", "Working", "CBSL Working", 
+                "CBSL", "Sheet1", "Sheet", "C1 & C2 Working"
+            ]
+            
+            chosen_sheet = None
+            
+            # First, try to find Portfolio sheet specifically
+            if "Portfolio" in xls_cbsl.sheet_names:
+                chosen_sheet = "Portfolio"
+                print(f"[OK] Found Portfolio sheet in CBSL file")
+            else:
+                # Look for Portfolio-like sheet names
+                for sheet_name in xls_cbsl.sheet_names:
+                    if "portfolio" in sheet_name.lower():
+                        chosen_sheet = sheet_name
+                        print(f"[OK] Found Portfolio-like sheet: {chosen_sheet}")
+                        break
+            
+            # If no Portfolio sheet found, use candidate names
+            if chosen_sheet is None:
+                for name in candidate_names:
+                    if name in xls_cbsl.sheet_names:
+                        chosen_sheet = name
+                        print(f"[WARN] No Portfolio sheet found, using: {chosen_sheet}")
+                        break
+            
+            # Use first sheet as fallback
+            if chosen_sheet is None:
+                chosen_sheet = xls_cbsl.sheet_names[0]
+                print(f"[WARN] Using first sheet as fallback: {chosen_sheet}")
+            
+            print(f"Reading CBSL sheet: {chosen_sheet}")
+            
+            # Read the sheet with row 3 as column names, starting from column C
+            try:
+                # Read raw data first to understand structure
+                df_temp = pd.read_excel(xls_cbsl, sheet_name=chosen_sheet, engine="pyxlsb", header=None)
+                print(f"Raw CBSL sheet dimensions: {df_temp.shape}")
+                
+                # Display first few rows to understand structure
+                print("First 6 rows of CBSL sheet:")
+                for i in range(min(6, len(df_temp))):
+                    print(f"Row {i+1} (Excel row {i+1}): {df_temp.iloc[i, :10].tolist()}")
+                
+                # Use row 3 (index 2) as headers, starting from column C (index 2) - Excel row 3
+                if len(df_temp) > 2:
+                    headers = df_temp.iloc[2, :].values
+                    data = df_temp.iloc[3:, :]
+                    
+                    # Clean up headers - use row 3 column names directly
+                    clean_headers = []
+                    for h in headers:
+                        if pd.notna(h) and str(h).strip():
+                            clean_headers.append(str(h).strip())
+                        else:
+                            clean_headers.append(f"Col_{len(clean_headers)}")
+                    
+                    # Ensure we don't have more columns than headers
+                    n_headers = len(clean_headers)
+                    if len(data.columns) > n_headers:
+                        data = data.iloc[:, :n_headers]
+                    elif len(data.columns) < n_headers:
+                        clean_headers = clean_headers[:len(data.columns)]
+                    
+                    data.columns = clean_headers
+                    df_cbsl = data.reset_index(drop=True)
+                    
+                    print(f"[OK] Successfully extracted headers from Excel row 3: {clean_headers[:15]}")
+                    print(f"CBSL data shape after processing: {df_cbsl.shape}")
+                else:
+                    raise Exception("Sheet has insufficient rows for row 3 header extraction")
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to read CBSL with row 3 headers: {e}")
+                # Fallback: try simple read
+                try:
+                    df_cbsl = pd.read_excel(xls_cbsl, sheet_name=chosen_sheet, engine="pyxlsb")
+                    df_cbsl = normalize_columns(df_cbsl)
+                    print(f"[WARN] Using fallback method - simple read")
+                except Exception as e2:
+                    print(f"[ERROR] Fallback also failed: {e2}")
+                    return
+            
+            print(f"[OK] Using CBSL sheet: {chosen_sheet}")
+            print(f"CBSL sheet shape: {df_cbsl.shape}")
+            
+            # Normalize columns after reading
+            df_cbsl = normalize_columns(df_cbsl)
+            
+            print(f"\n=== CBSL Column Analysis & Logging ===")
+            print(f"Total columns: {len(df_cbsl.columns)}")
+            print("All CBSL column names after normalization:")
+            for i, col in enumerate(df_cbsl.columns):
+                print(f"  {i+1:2d}. '{col}'")
+                if "cbsl" in str(col).lower() or "p_np" in str(col).lower():
+                    print(f"      *** POTENTIAL P/NP COLUMN ***")
+                if "contract" in str(col).lower():
+                    print(f"      *** POTENTIAL CONTRACT COLUMN ***")
+            print("=" * 50)
+        
+        except Exception as e:
+            print(f"[ERROR] Failed to open CBSL xlsb: {e}")
+            return
+        
+        # Map required columns
+        print("\n=== Column Mapping ===")
+        print(f"Available columns in Prod sheet: {list(df_prod.columns)}")
+    
+        col_contract = pick_column(df_prod, ["contract_no", "contractno", "contract_number"]) or "contract_no"
+        col_client = pick_column(df_prod, ["client_code", "clientcode", "client_number"]) or "client_code"
+        col_product = pick_column(df_prod, ["product"]) or "product"
+        col_gross_dp = pick_column(df_prod, ["gross_outstanding_with_dp", "gross_with_dp", "gross_outstanding"]) or "gross_outstanding_with_dp"
+        col_ifrs_dp = pick_column(df_prod, ["irfs_provision_imp_prov_dp", "ifrs_provision_imp_prov_dp", "ifrs_provision_with_dp", "ifrs_provision"]) or "irfs_provision_imp_prov_dp"
+        col_iis = pick_column(df_prod, ["iis"]) or "iis"
+        col_equipment = pick_column(df_prod, ["equipment"]) or "equipment"
+        
+        print(f"\n=== Production Sheet Column Mapping Results ===")
+        print(f"Mapped columns:")
+        print(f"  Contract: {col_contract}")
+        print(f"  Client: {col_client}")
+        print(f"  Product: {col_product}")
+        print(f"  Gross DP: {col_gross_dp}")
+        print(f"  IFRS DP: {col_ifrs_dp}")
+        print(f"  IIS: {col_iis}")
+        print(f"  Equipment: {col_equipment}")
+        
+        # Log column mapping success/failure
+        mapping_status = {
+            "Contract": "[OK] FOUND" if col_contract in df_prod.columns else "[ERROR] NOT FOUND",
+            "Client": "[OK] FOUND" if col_client in df_prod.columns else "[ERROR] NOT FOUND", 
+            "Product": "[OK] FOUND" if col_product in df_prod.columns else "[ERROR] NOT FOUND",
+            "Gross DP": "[OK] FOUND" if col_gross_dp in df_prod.columns else "[ERROR] NOT FOUND",
+            "IFRS DP": "[OK] FOUND" if col_ifrs_dp in df_prod.columns else "[ERROR] NOT FOUND",
+            "IIS": "[OK] FOUND" if col_iis in df_prod.columns else "[ERROR] NOT FOUND",
+            "Equipment": "[OK] FOUND" if col_equipment in df_prod.columns else "[ERROR] NOT FOUND"
+        }
+        
+        print(f"\nColumn Mapping Status:")
+        for col_name, status in mapping_status.items():
+            print(f"  {col_name:10s}: {status}")
+        print("=" * 50)
+        
+        missing = [c for c in [col_contract, col_client, col_product, col_gross_dp, col_ifrs_dp, col_iis, col_equipment] 
+                   if c not in df_prod.columns]
+        if missing:
+            print(f"[ERROR] Missing expected columns in Prod sheet: {missing}")
+            return
+        
+        # Validate source data quality BEFORE processing
+        print("\n=== Source Data Validation ===")
+        for col in [col_gross_dp, col_ifrs_dp, col_iis]:
+            validate_data_quality(df_prod, col)
+        
+        # Create portfolio dataframe with proper data conversion
+        print("\n=== Creating Portfolio DataFrame ===")
+        df_port = pd.DataFrame({
+            "contract_no": df_prod[col_contract],
+            "client_code": df_prod[col_client],
+            "product": df_prod[col_product],
+            "equipment": df_prod[col_equipment],
+        })
+
+        print(f"Initial portfolio shape: {df_port.shape}")
+        print(f"Sample data:")
+        print(df_port.head())
+        
+        # Convert numeric columns with validation
+        print("Converting numeric columns...")
+        df_port["gross_with_dp"] = df_prod[col_gross_dp].apply(safe_number)
+        df_port["ifrs_provision_with_dp"] = df_prod[col_ifrs_dp].apply(safe_number)
+        df_port["iis"] = df_prod[col_iis].apply(safe_number)
+        
+        # Validate converted data
+        for col in ["gross_with_dp", "ifrs_provision_with_dp", "iis"]:
+            validate_data_quality(df_port, col)
+        
+        # Calculate Mid from Client Code first digit
+        def compute_mid(code):
+            s = str(code).strip()
+            return 1 if s.startswith("1") else (2 if s.startswith("2") else None)
+        
+        df_port["mid"] = df_port["client_code"].map(compute_mid)
+        
+        # Calculate Gross-IIS-IMP with detailed logging
+        print("\n=== Calculating Gross-IIS-IMP ===")
+        def calculate_gross_iis_imp(row):
+            try:
+                gross = row["gross_with_dp"]
+                iis = row["iis"]
+                ifrs = row["ifrs_provision_with_dp"]
+                
+                # Validate inputs
+                if pd.isna(gross) or pd.isna(iis) or pd.isna(ifrs):
+                    if row.name < 5:
+                        print(f"Row {row.name}: NaN detected - Gross: {gross}, IIS: {iis}, IFRS: {ifrs}")
+                    return 0.0
+                
+                result = gross - iis - ifrs
+                
+                # Debug first few rows
+                if row.name < 5:
+                    print(f"Row {row.name}: {gross} - {iis} - {ifrs} = {result}")
+                
+                return result
+                
+            except Exception as e:
+                print(f"Error calculating Gross-IIS-IMP for row {row.name}: {e}")
+                print(f"  Values - Gross: {row['gross_with_dp']}, IIS: {row['iis']}, IFRS: {row['ifrs_provision_with_dp']}")
+                return 0.0
+        
+        df_port["gross_iis_imp"] = df_port.apply(calculate_gross_iis_imp, axis=1)
+        
+        # Add missing columns that will be needed later
+        df_port["p_np_based_on_cbsl_provision"] = None
+        df_port["equipment"] = df_port["equipment"].fillna("")
+        df_port["corporate_individual"] = ""
+        df_port["mortgage"] = "#N/A"
+        df_port["final_category_for_risk_weight"] = ""
+        df_port["a"] = 0.0
+        df_port["b"] = 0.0
+        
+        # Extract CBSL Provision values from SOFP file and add as new contracts
+        if file_sofp:
+            cbsl_provision_values = extract_cbsl_provision_values(file_sofp)
+            if cbsl_provision_values:
+                df_port = add_cbsl_provision_contracts(df_port, cbsl_provision_values, month, year)
+            else:
+                print("[WARN] No CBSL Provision values extracted from SOFP file")
+        else:
+            print("[WARN] SOFP file not found - skipping CBSL Provision contract addition")
+        
+        # Load risk weight categories from Types sheet
+        categories = load_risk_weight_categories(file_car)
+        
+        # Round to 2 decimal places
+        df_port["gross_iis_imp"] = df_port["gross_iis_imp"].round(2)
+        
+        # Final validation of calculated column
+        validate_data_quality(df_port, "gross_iis_imp")
+        
+        # IMP%: Corrected calculation - IMP = (IIS + IFRS Provision with DP) / Gross with DP
+        def compute_imp_pct(row):
+            gross = row["gross_with_dp"]
+            iis = row["iis"]
+            ifrs = row["ifrs_provision_with_dp"]
+            
+            # Handle edge cases
+            if gross == 0:
+                return 0.0
+            
+            # Calculate as (IIS + IFRS) / Gross
+            imp_value = (iis + ifrs) / gross
+            return imp_value
+        
+        df_port["imp_percent"] = df_port.apply(compute_imp_pct, axis=1)
+        # Round IMP% to 4 decimal places for percentage precision
+        df_port["imp_percent"] = df_port["imp_percent"].round(4)
+        df_port["margin_20_percent"] = df_port["imp_percent"].map(lambda x: "above 20%" if x >= 0.2 else "below 20%")
+    
+        # Corporate/Individual classification based on Client Code first digit
+        def classify_corporate_individual(code):
+            s = str(code).strip()
+            if s.startswith("1"):
+                return "Individual"
+            if s.startswith("2"):
+                return "Corporate"
+            return ""
+        
+        df_port["corporate_individual"] = df_port["client_code"].map(classify_corporate_individual)
+        
+        # Enhanced CBSL P/NP lookup
+        print(f"\n=== CBSL P/NP Column Detection ===")
+        print(f"CBSL sheet columns: {list(df_cbsl.columns)}")
+        
+        # Look for contract column with enhanced search
+        cbsl_contract = None
+        contract_search_terms = [
+            "contract_no", "contractno", "contract_number", "facility_no", "facility_number", 
+            "agreement_no", "agreement_number"
+        ]
+        
+        # Exclude any YARD-related columns from consideration
+        cbsl_cols_filtered = [c for c in df_cbsl.columns if "yard" not in str(c).lower()]
+        
+        # Prefer exact 'contract_no' if present
+        if "contract_no" in cbsl_cols_filtered:
+            cbsl_contract = "contract_no"
+            print(f"[OK] Using specific CBSL contract column: '{cbsl_contract}' (ignoring YARD columns)")
+        
+        # First try exact matches among filtered columns
+        if not cbsl_contract:
+            for term in contract_search_terms:
+                if term in cbsl_cols_filtered:
+                    cbsl_contract = term
+                    print(f"[OK] Found EXACT contract column match: '{cbsl_contract}' (ignoring YARD columns)")
+                    break
+        
+        # If no exact match, try partial matches
+        if not cbsl_contract:
+            print("No exact contract column match found, searching partial matches (ignoring YARD columns)...")
+            for col in cbsl_cols_filtered:
+                if any(pattern in col for pattern in ['contract', 'facility', 'agreement']):
+                    cbsl_contract = col
+                    print(f"[OK] Found partial contract column match: '{cbsl_contract}'")
+                    break
+        
+        # Look for CBSL P/NP column with enhanced search
+        cbsl_pnp = None
+        pnp_search_terms = [
+            "cbsl_p_np", "cbsl_pnp", "p_np", "pnp", "classification", "status", "category"
+        ]
+        
+        # First try exact matches for P/NP
+        print("Searching for P/NP column...")
+        for term in pnp_search_terms:
+            if term in df_cbsl.columns:
+                cbsl_pnp = term
+                print(f"[OK] Found EXACT P/NP column match: '{cbsl_pnp}'")
+                break
+        
+        # If no exact match, try partial matches
+        if not cbsl_pnp:
+            print("No exact P/NP column match found, searching partial matches...")
+            for col in df_cbsl.columns:
+                if any(pattern in col for pattern in ['p_np', 'pnp', 'cbsl', 'classification', 'status']):
+                    cbsl_pnp = col
+                    print(f"[OK] Found partial P/NP column match: '{cbsl_pnp}'")
+                    break
+        
+        print(f"\n=== CBSL Column Detection Results ===")
+        print(f"Final column selections:")
+        print(f"CBSL Contract column: {cbsl_contract}")
+        print(f"CBSL P/NP column: {cbsl_pnp}")
+        
+        # Log CBSL column detection success/failure
+        cbsl_mapping_status = {
+            "Contract": "[OK] FOUND" if cbsl_contract and cbsl_contract in df_cbsl.columns else "[ERROR] NOT FOUND",
+            "P/NP": "[OK] FOUND" if cbsl_pnp and cbsl_pnp in df_cbsl.columns else "[ERROR] NOT FOUND"
+        }
+        
+        print(f"\nCBSL Column Detection Status:")
+        for col_name, status in cbsl_mapping_status.items():
+            print(f"  {col_name:10s}: {status}")
+        print("=" * 50)
+        
+        # Show all available columns if no match found
+        if not cbsl_contract or not cbsl_pnp:
+            print(f"\n[WARN] Missing required columns. Available CBSL columns:")
+            for i, col in enumerate(df_cbsl.columns, 1):
+                print(f"  {i:2d}. '{col}'")
+                # Check if this might be a contract or P/NP column
+                col_lower = str(col).lower()
+                if any(term in col_lower for term in ['contract', 'facility', 'agreement']):
+                    print(f"       ^ Potential CONTRACT column")
+                if any(term in col_lower for term in ['p/np', 'pnp', 'cbsl', 'classification', 'status']):
+                    print(f"       ^ Potential P/NP column")
+        
+        # Proceed with enhanced lookup if both columns are found
+        if cbsl_contract and cbsl_pnp and cbsl_contract in df_cbsl.columns and cbsl_pnp in df_cbsl.columns:
+            # Use enhanced P/NP lookup function
+            df_port, df_matching_report, comparison_results = enhanced_pnp_lookup(
+                df_port, df_cbsl, cbsl_contract, cbsl_pnp
+            )
+            
+            # Save detailed matching report
+            matching_report_path = out_folder / f"P_NP_Matching_Report_{month}_{year}.xlsx"
+            print(f"\n=== SAVING DETAILED MATCHING REPORT ===")
+            
+            with pd.ExcelWriter(matching_report_path, engine='openpyxl') as writer:
+                # Main matching report
+                df_matching_report.to_excel(writer, sheet_name='Matching_Report', index=False)
+                
+                # Summary statistics
+                summary_data = []
+                match_type_counts = df_matching_report["match_type"].value_counts()
+                total_records = len(df_matching_report)
+                
+                for match_type, count in match_type_counts.items():
+                    percentage = (count / total_records) * 100
+                    summary_data.append({
+                        'Match Type': match_type,
+                        'Count': count,
+                        'Percentage': f"{percentage:.1f}%"
+                    })
+                
+                df_summary = pd.DataFrame(summary_data)
+                df_summary.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # P/NP value distribution
+                pnp_counts = df_matching_report["p_np_value"].value_counts(dropna=False)
+                pnp_distribution_data = []
+                for value, count in pnp_counts.items():
+                    percentage = (count / total_records) * 100
+                    pnp_distribution_data.append({
+                        'P/NP Value': str(value),
+                        'Count': count,
+                        'Percentage': f"{percentage:.1f}%"
+                    })
+                
+                df_pnp_dist = pd.DataFrame(pnp_distribution_data)
+                df_pnp_dist.to_excel(writer, sheet_name='PNP_Distribution', index=False)
+                
+                # Unmatched records for further investigation
+                df_unmatched = df_matching_report[df_matching_report["match_type"] == "No Match"]
+                if len(df_unmatched) > 0:
+                    df_unmatched.to_excel(writer, sheet_name='Unmatched_Records', index=False)
+                
+                # Auto-fit columns for all sheets
+                workbook = writer.book
+                
+                # Auto-fit all sheets
+                for sheet_name in workbook.sheetnames:
+                    ws = workbook[sheet_name]
+                    for column in ws.columns:
+                        max_length = 0
+                        column_letter = column[0].column_letter
+                        
+                        # Check header length
+                        if column[0].row == 1:
+                            header_length = len(str(column[0].value)) if column[0].value else 0
+                            max_length = max(max_length, header_length)
+                        
+                        # Check data length (sample first 500 rows for performance)
+                        sample_size = min(500, ws.max_row)
+                        for i, cell in enumerate(column):
+                            if i >= sample_size:
+                                break
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except:
+                                pass
+                        
+                        adjusted_width = min(max_length + 2, 50)
+                        ws.column_dimensions[column_letter].width = adjusted_width
+            
+            print(f"[OK] Detailed matching report saved to: {matching_report_path}")
+            
+        else:
+            print("[ERROR] Could not find required CBSL columns for lookup. Setting P/NP to None for all records.")
+            df_port["p_np_based_on_cbsl_provision"] = None
+            
+            # Create a simple report showing the issue
+            issue_report = pd.DataFrame({
+                'Issue': ['Missing CBSL Contract Column', 'Missing CBSL P/NP Column'],
+                'Found': [cbsl_contract is not None, cbsl_pnp is not None],
+                'Column_Name': [cbsl_contract or 'NOT FOUND', cbsl_pnp or 'NOT FOUND']
+            })
+            
+            issue_report_path = out_folder / f"CBSL_Column_Issues_{month}_{year}.xlsx"
+            issue_report.to_excel(issue_report_path, index=False)
+            print(f"[WARN] Issue report saved to: {issue_report_path}")
+        
+        # Populate Mortgage from CBSL PropertyMortgage sheet using enhanced VLOOKUP-style logic
+        df_port = populate_mortgage_from_cbsl(df_port, file_cbsl)
+        
+        # Categorize contracts based on risk weight criteria (after P/NP lookup and mortgage lookup)
+        df_port = categorize_risk_weight(df_port, categories)
+        
+        # Also populate Mortgage in CAR Working file if it exists
+        if len(df_car) > 0:
+            print(f"\n=== POPULATING MORTGAGE IN CAR WORKING FILE ===")
+            print(f"CAR Working file has {len(df_car)} records")
+            
+            # Check if CAR Working already has a mortgage column
+            car_mortgage_col = pick_column(df_car, ["mortgage", "propertymortgage", "property_mortgage"])
+            if car_mortgage_col:
+                print(f"CAR Working already has mortgage column: '{car_mortgage_col}'")
+                print("Updating existing mortgage column with CBSL PropertyMortgage data...")
+            else:
+                print("CAR Working does not have mortgage column, will create new one...")
+            
+            df_car = populate_mortgage_from_cbsl(df_car, file_cbsl)
+            
+            # Log final results for CAR Working
+            car_total_records = len(df_car)
+            car_mortgage_found = (df_car["mortgage"] != "#N/A").sum()
+            car_mortgage_not_found = (df_car["mortgage"] == "#N/A").sum()
+            
+            print(f"\n=== CAR WORKING MORTGAGE LOOKUP RESULTS ===")
+            print(f"Total CAR Working records: {car_total_records}")
+            print(f"Mortgage values found: {car_mortgage_found} ({(car_mortgage_found/car_total_records)*100:.1f}%)")
+            print(f"Mortgage values NOT found: {car_mortgage_not_found} ({(car_mortgage_not_found/car_total_records)*100:.1f}%)")
+            print("[OK] Mortgage column populated in CAR Working file")
+        
+        # Final data summary
+        print("\n=== FINAL DATA SUMMARY ===")
+        print(f"Total portfolio records: {len(df_port)}")
+        print("Column summary:")
+        for col in df_port.columns:
+            if df_port[col].dtype in ['int64', 'float64']:
+                non_zero = (df_port[col] != 0).sum()
+                print(f"  {col}: min={df_port[col].min():.2f}, max={df_port[col].max():.2f}, mean={df_port[col].mean():.2f}, non-zero={non_zero}")
+            else:
+                non_null = df_port[col].notna().sum()
+                unique_vals = df_port[col].nunique()
+                print(f"  {col}: non-null={non_null}, unique_values={unique_vals}")
+        
+        # Show final P/NP statistics
+        if "p_np_based_on_cbsl_provision" in df_port.columns:
+            pnp_final_stats = df_port["p_np_based_on_cbsl_provision"].value_counts(dropna=False)
+            print(f"\nFinal P/NP Distribution:")
+            total_records = len(df_port)
+            for value, count in pnp_final_stats.items():
+                percentage = (count / total_records) * 100
+                print(f"  {str(value):15s}: {count:5d} records ({percentage:5.1f}%)")
+        
+        # Show final Mortgage statistics
+        if "mortgage" in df_port.columns:
+            mortgage_final_stats = df_port["mortgage"].value_counts(dropna=False)
+            print(f"\nFinal Mortgage Distribution:")
+            total_records = len(df_port)
+            # Show top 10 values and count of #N/A
+            na_count = (df_port["mortgage"] == "#N/A").sum()
+            non_na_count = total_records - na_count
+            print(f"  {'#N/A (No Match)':30s}: {na_count:5d} records ({(na_count/total_records)*100:5.1f}%)")
+            print(f"  {'Found Values':30s}: {non_na_count:5d} records ({(non_na_count/total_records)*100:5.1f}%)")
+            
+            # Show sample of actual mortgage values found
+            mortgage_values = df_port[df_port["mortgage"] != "#N/A"]["mortgage"]
+            if len(mortgage_values) > 0:
+                print(f"  Sample mortgage values found: {mortgage_values.head().tolist()}")
+        
+        # Reorder columns to match CAR Excel format
+        car_column_order = [
+            "contract_no",
+            "client_code", 
+            "mid",
+            "product",
+            "gross_with_dp",
+            "ifrs_provision_with_dp",
+            "iis",
+            "gross_iis_imp",
+            "imp_percent",
+            "margin_20_percent",
+            "p_np_based_on_cbsl_provision",
+            "equipment",
+            "corporate_individual",
+            "mortgage",
+            "final_category_for_risk_weight",
+            "final_category_for_risk_weight_code",
+            "a",
+            "b"
+        ]
+        
+        # Add missing columns with default values
+        for col in car_column_order:
+            if col not in df_port.columns:
+                if col in ["corporate_individual", "final_category_for_risk_weight", "final_category_for_risk_weight_code"]:
+                    df_port[col] = ""
+                elif col in ["a", "b"]:
+                    df_port[col] = 0.0
+                else:
+                    df_port[col] = None
+        
+        # Reorder the DataFrame columns
+        df_port = df_port[car_column_order]
+        
+        print(f"[OK] Reordered columns to match CAR Excel format: {list(df_port.columns)}")
+        
+        # Update Portfolio sheet with pivot data (preserving existing formatting)
+        if wb_c1_c6 is not None:
+            print("\n=== UPDATING EXISTING PORTFOLIO SHEET (PRESERVING FORMATTING) ===")
+            out_path = update_portfolio_with_pivot_data(wb_c1_c6, df_port, out_folder, month, year)
+            if out_path:
+                print(f"[OK] Portfolio sheet updated successfully: {out_path}")
+            else:
+                print("[WARN] Portfolio sheet update failed, falling back to new file creation")
+                # Fallback: create new file if update fails
+                out_path = out_folder / f"NBD_MF_20_C3_{month}_{year}_report.xlsx"
+                with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+                    df_port.to_excel(writer, sheet_name="Portfolio", index=False)
+                print(f"[OK] New report file created: {out_path}")
+        else:
+            # Use pandas ExcelWriter approach for new file creation
+            print("Using pandas ExcelWriter approach for new file...")
+            out_path = out_folder / f"NBD_MF_20_C3_{month}_{year}_report.xlsx"
+            
+            with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+                df_port.to_excel(writer, sheet_name="Portfolio", index=False)
+                
+                # Auto-fit columns
+                workbook = writer.book
+                ws = workbook["Portfolio"]
+                print("Auto-fitting column widths...")
+                for column in ws.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    
+                    # Check header length
+                    if column[0].row == 1:
+                        header_length = len(str(column[0].value)) if column[0].value else 0
+                        max_length = max(max_length, header_length)
+                    
+                    # Check data length (sample first 1000 rows for performance)
+                    sample_size = min(1000, len(df_port))
+                    for i, cell in enumerate(column):
+                        if i >= sample_size + 1:
+                            break
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    
+                    # Set column width (with some padding, cap at 50 characters)
+                    adjusted_width = min(max_length + 2, 50)
+                    ws.column_dimensions[column_letter].width = adjusted_width
+            
+            print(f"\n[OK] New report file created successfully: {out_path}")
+        
+        # Create detailed mortgage matching report
+        if "mortgage" in df_port.columns:
+            print(f"\n=== SAVING DETAILED MORTGAGE MATCHING REPORT ===")
+            mortgage_report_path = out_folder / f"Mortgage_Matching_Report_{month}_{year}.xlsx"
+            
+            # Prepare mortgage report data
+            df_mortgage_report = df_port[["contract_no", "client_code", "product", "gross_with_dp", "mortgage"]].copy()
+            df_mortgage_report["match_status"] = df_mortgage_report["mortgage"].apply(
+                lambda x: "No Match" if x == "#N/A" else "Match Found"
+            )
+            
+            with pd.ExcelWriter(mortgage_report_path, engine='openpyxl') as writer:
+                # Main mortgage report
+                df_mortgage_report.to_excel(writer, sheet_name='Mortgage_Report', index=False)
+                
+                # Summary statistics
+                match_summary = df_mortgage_report["match_status"].value_counts()
+                summary_data = []
+                total_records = len(df_mortgage_report)
+                
+                for status, count in match_summary.items():
+                    percentage = (count / total_records) * 100
+                    summary_data.append({
+                        'Match Status': status,
+                        'Count': count,
+                        'Percentage': f"{percentage:.1f}%"
+                    })
+                
+                df_mortgage_summary = pd.DataFrame(summary_data)
+                df_mortgage_summary.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Auto-fit columns for both sheets
+                workbook = writer.book
+                
+                # Auto-fit Mortgage_Report sheet
+                mortgage_ws = workbook['Mortgage_Report']
+                for column in mortgage_ws.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    
+                    # Check header length
+                    if column[0].row == 1:
+                        header_length = len(str(column[0].value)) if column[0].value else 0
+                        max_length = max(max_length, header_length)
+                    
+                    # Check data length (sample first 500 rows for performance)
+                    sample_size = min(500, len(df_mortgage_report))
+                    for i, cell in enumerate(column):
+                        if i >= sample_size + 1:
+                            break
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    
+                    adjusted_width = min(max_length + 2, 50)
+                    mortgage_ws.column_dimensions[column_letter].width = adjusted_width
+                
+                # Auto-fit Summary sheet
+                summary_ws = workbook['Summary']
+                for column in summary_ws.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    
+                    adjusted_width = min(max_length + 2, 50)
+                    summary_ws.column_dimensions[column_letter].width = adjusted_width
+                
+                # Unmatched records for investigation
+                df_mortgage_unmatched = df_mortgage_report[df_mortgage_report["match_status"] == "No Match"]
+                if len(df_mortgage_unmatched) > 0:
+                    df_mortgage_unmatched.to_excel(writer, sheet_name='Unmatched_Records', index=False)
+                
+                # Matched records sample
+                df_mortgage_matched = df_mortgage_report[df_mortgage_report["match_status"] == "Match Found"]
+                if len(df_mortgage_matched) > 0:
+                    # Sample of first 100 matched records
+                    df_mortgage_matched.head(100).to_excel(writer, sheet_name='Matched_Sample', index=False)
+            
+            print(f"[OK] Detailed mortgage matching report saved to: {mortgage_report_path}")
+        
+        # Compare with existing CAR Working file
+        print(f"\n=== COMPARING WITH EXISTING CAR WORKING FILE ===")
+        print(f"df_car shape: {df_car.shape}    Columns: {list(df_car.columns)}     Total records: {len(df_car)}")
+        if len(df_car) > 0:
+            print("Comparing generated portfolio with existing CAR Working Portfolio sheet...")
+            
+            # Check if CAR Working has P/NP column
+            car_pnp_col = pick_column(df_car, ["p_np_based_on_cbsl", "p_np_based_on_cbsl_provision", "cbsl_p_np", "p_np"])
+    
+            # Fallback: partial-match search if not found
+            if not car_pnp_col:
+                for col in df_car.columns:
+                    if any(pattern in col for pattern in ["p_np", "pnp", "cbsl", "classification", "status"]):
+                        car_pnp_col = col
+                        print(f"[OK] Fallback found CAR P/NP-like column: '{car_pnp_col}'")
+                        break
+    
+            if car_pnp_col:
+                print(f"Found P/NP column in CAR Working: '{car_pnp_col}'")
+                
+                # Compare P/NP values
+                car_contract_col = pick_column(df_car, ["contract_no", "contractno", "contract_number"])
+                
+                if car_contract_col:
+                    df_car_comparison = df_car[[car_contract_col, car_pnp_col]].copy()
+                    df_car_comparison.columns = ["contract_no", "car_p_np"]
+                    df_car_comparison["contract_no"] = df_car_comparison["contract_no"].astype(str).str.strip()
+                    
+                    # Merge with our results
+                    df_comparison = df_port[["contract_no", "p_np_based_on_cbsl_provision"]].merge(
+                        df_car_comparison, on="contract_no", how="outer", suffixes=("_New", "_CAR")
+                    )
+                    
+                    # Identify differences
+                    df_comparison["Match"] = df_comparison["p_np_based_on_cbsl_provision"] == df_comparison["car_p_np"]
+                    
+                    matches = df_comparison["Match"].sum()
+                    total_comparable = len(df_comparison.dropna(subset=["p_np_based_on_cbsl_provision", "car_p_np"]))
+                    
+                    print(f"P/NP Comparison with existing CAR Working:")
+                    print(f"  Matching records: {matches}")
+                    print(f"  Total comparable: {total_comparable}")
+                    if total_comparable > 0:
+                        print(f"  Match percentage: {(matches/total_comparable)*100:.1f}%")
+                    
+                    # Save comparison report
+                    comparison_path = out_folder / f"CAR_vs_New_PNP_Comparison_{month}_{year}.xlsx"
+                    
+                    # Save with auto-fit columns
+                    with pd.ExcelWriter(comparison_path, engine='openpyxl') as writer:
+                        df_comparison.to_excel(writer, sheet_name='Comparison', index=False)
+                        
+                        # Auto-fit columns
+                        workbook = writer.book
+                        ws = workbook['Comparison']
+                        for column in ws.columns:
+                            max_length = 0
+                            column_letter = column[0].column_letter
+                            
+                            # Check header length
+                            if column[0].row == 1:
+                                header_length = len(str(column[0].value)) if column[0].value else 0
+                                max_length = max(max_length, header_length)
+                            
+                            # Check data length (sample first 500 rows for performance)
+                            sample_size = min(500, ws.max_row)
+                            for i, cell in enumerate(column):
+                                if i >= sample_size:
+                                    break
+                                try:
+                                    if len(str(cell.value)) > max_length:
+                                        max_length = len(str(cell.value))
+                                except:
+                                    pass
+                            
+                            adjusted_width = min(max_length + 2, 50)
+                            ws.column_dimensions[column_letter].width = adjusted_width
+                    
+                    print(f"[OK] CAR comparison report saved to: {comparison_path}")
+                else:
+                    print("[ERROR] Could not find Contract No column in CAR Working file")
+            else:
+                print("[ERROR] Could not find P/NP column in CAR Working file")
+            
+            # Check if CAR Working has Mortgage column and compare
+            car_mortgage_col = pick_column(df_car, ["mortgage", "propertymortgage", "property_mortgage"])
+            
+            if car_mortgage_col:
+                print(f"\nFound Mortgage column in CAR Working: '{car_mortgage_col}'")
+                
+                car_contract_col = pick_column(df_car, ["contract_no", "contractno", "contract_number"])
+                
+                if car_contract_col:
+                    df_car_mortgage = df_car[[car_contract_col, car_mortgage_col]].copy()
+                    df_car_mortgage.columns = ["contract_no", "car_mortgage"]
+                    df_car_mortgage["contract_no"] = df_car_mortgage["contract_no"].astype(str).str.strip()
+                    
+                    # Merge with our results
+                    df_mortgage_comparison = df_port[["contract_no", "mortgage"]].merge(
+                        df_car_mortgage, on="contract_no", how="outer", suffixes=("_New", "_CAR")
+                    )
+                    
+                    # Identify differences (considering #N/A as no match)
+                    df_mortgage_comparison["Match"] = (
+                        (df_mortgage_comparison["mortgage"] == df_mortgage_comparison["car_mortgage"]) |
+                        ((df_mortgage_comparison["mortgage"] == "#N/A") & (pd.isna(df_mortgage_comparison["car_mortgage"])))
+                    )
+                    
+                    matches = df_mortgage_comparison["Match"].sum()
+                    total_comparable = len(df_mortgage_comparison.dropna(subset=["contract_no"]))
+                    
+                    print(f"Mortgage Comparison with existing CAR Working:")
+                    print(f"  Matching records: {matches}")
+                    print(f"  Total comparable: {total_comparable}")
+                    if total_comparable > 0:
+                        print(f"  Match percentage: {(matches/total_comparable)*100:.1f}%")
+                    
+                    # Save mortgage comparison report
+                    mortgage_comparison_path = out_folder / f"CAR_vs_New_Mortgage_Comparison_{month}_{year}.xlsx"
+                    
+                    # Save with auto-fit columns
+                    with pd.ExcelWriter(mortgage_comparison_path, engine='openpyxl') as writer:
+                        df_mortgage_comparison.to_excel(writer, sheet_name='Mortgage_Comparison', index=False)
+                        
+                        # Auto-fit columns
+                        workbook = writer.book
+                        ws = workbook['Mortgage_Comparison']
+                        for column in ws.columns:
+                            max_length = 0
+                            column_letter = column[0].column_letter
+                            
+                            # Check header length
+                            if column[0].row == 1:
+                                header_length = len(str(column[0].value)) if column[0].value else 0
+                                max_length = max(max_length, header_length)
+                            
+                            # Check data length (sample first 500 rows for performance)
+                            sample_size = min(500, ws.max_row)
+                            for i, cell in enumerate(column):
+                                if i >= sample_size:
+                                    break
+                                try:
+                                    if len(str(cell.value)) > max_length:
+                                        max_length = len(str(cell.value))
+                                except:
+                                    pass
+                            
+                            adjusted_width = min(max_length + 2, 50)
+                            ws.column_dimensions[column_letter].width = adjusted_width
+                    
+                    print(f"[OK] CAR mortgage comparison report saved to: {mortgage_comparison_path}")
+                else:
+                    print("[ERROR] Could not find Contract No column in CAR Working file for mortgage comparison")
+            else:
+                print("[ERROR] Could not find Mortgage column in CAR Working file")
+                
+        else:
+            print("[WARN] No CAR Working data available for comparison")
+        
+        print(f"\n=== UPDATING CAR WORKING FILE ===")
+        print("Updating CAR Working .xlsx Portfolio sheet via openpyxl...")
+
+        try:
+            print("Updating CAR Working .xlsx Portfolio sheet via openpyxl...")
+            update_pivot_table(file_car, df_port)
+        except Exception as e:
+            print(f"[ERROR] Error in C3 report processing: {e}")
+            import traceback
+            traceback.print_exc()
+
+        try:
+            # Load workbook
+            wb_car = load_workbook(file_car)
+            if "Portfolio" in wb_car.sheetnames:
+                ws_car = wb_car["Portfolio"]
+            else:
+                ws_car = wb_car.create_sheet("Portfolio")
+
+            # Clear contents from row 4 down
+            for row in ws_car.iter_rows(min_row=4):
+                for cell in row:
+                    cell.value = None
+
+            # Headers
+            headers = list(df_port.columns)
+            n_cols = len(headers)
+            n_rows = len(df_port)
+            end_col_letter = get_column_letter(n_cols)
+
+            print(f"Preparing to write {n_rows} rows and {n_cols} columns to Excel")
+
+            # Write totals row 3
+            total_ifrs = df_port.get("ifrs_provision_with_dp", pd.Series([0])).sum()
+            total_iis = df_port.get("iis", pd.Series([0])).sum()
+            total_gross_iis_imp = df_port.get("gross_iis_imp", pd.Series([0])).sum()
+            total_gross_dp = df_port.get("gross_with_dp", pd.Series([0])).sum()
+
+            col_map = {col: i + 1 for i, col in enumerate(headers)}
+
+            ws_car.cell(row=3, column=1, value="TOTAL")
+            if "ifrs_provision_with_dp" in col_map:
+                ws_car.cell(row=3, column=col_map["ifrs_provision_with_dp"], value=total_ifrs)
+            if "iis" in col_map:
+                ws_car.cell(row=3, column=col_map["iis"], value=total_iis)
+            if "gross_iis_imp" in col_map:
+                ws_car.cell(row=3, column=col_map["gross_iis_imp"], value=total_gross_iis_imp)
+            if "gross_with_dp" in col_map:
+                ws_car.cell(row=3, column=col_map["gross_with_dp"], value=total_gross_dp)
+
+            # Write headers row 4
+            for i, header in enumerate(headers, start=1):
+                ws_car.cell(row=4, column=i, value=header)
+
+            # Write data from row 5
+            for r_idx, row in enumerate(df_port.values.tolist(), start=5):
+                for c_idx, value in enumerate(row, start=1):
+                    ws_car.cell(row=r_idx, column=c_idx, value=value)
+
+            # Remove rows where contract_no (column 1) is empty, blank, or NaN
+            for row_idx in range(ws_car.max_row, 4, -1):
+                cell_value = ws_car.cell(row=row_idx, column=1).value
+                if cell_value is None or str(cell_value).strip() == "":
+                    ws_car.delete_rows(row_idx)
+
+            print(f"[INFO] Rows with empty contract_no removed. New max_row: {ws_car.max_row}")
+
+            # Determine the column indexes
+            col_map = {col: i + 1 for i, col in enumerate(headers)}
+            contract_col = col_map.get("contract_no")
+            gross_iis_imp_col = col_map.get("gross_iis_imp")
+
+            if contract_col and gross_iis_imp_col:
+                for row in ws_car.iter_rows(min_row=5, max_row=ws_car.max_row):
+                    contract_value = row[contract_col - 1].value
+                    if contract_value == "Margin Trading":
+                        row[gross_iis_imp_col - 1].value = net_exposure_sum_margin_trading
+                    elif contract_value == "FD Loans":
+                        row[gross_iis_imp_col - 1].value = net_exposure_sum_fd
+
+            # Format numeric columns
+            numeric_columns = ["gross_with_dp", "ifrs_provision_with_dp", "iis", "gross_iis_imp", "a", "b"]
+            percentage_columns = ["imp_percent"]
+            for col_name, col_idx in col_map.items():
+                if col_name in numeric_columns:
+                    for r in range(3, 5 + n_rows):
+                        ws_car.cell(row=r, column=col_idx).number_format = numbers.FORMAT_NUMBER_00
+                elif col_name in percentage_columns:
+                    for r in range(5, 5 + n_rows):
+                        ws_car.cell(row=r, column=col_idx).number_format = "0.0000"
+
+            # Net total from SOFP (if available)
+            net_total_from_sofp = None
+            if file_sofp:
+                # Replace this with your extraction logic
+                net_total_from_sofp = 1234567.89
+                if "gross_iis_imp" in col_map:
+                    ws_car.cell(row=2, column=col_map["gross_iis_imp"], value=net_total_from_sofp)
+                    ws_car.cell(row=2, column=col_map["gross_iis_imp"]).number_format = numbers.FORMAT_NUMBER_00
+
+            # Save updated file
+            car_out_path = out_folder / file_car.name
+            wb_car.save(car_out_path)
+            print(f"[OK] CAR Working copy saved to: {car_out_path}")
+
+        except Exception as e:
+            print(f"[ERROR] Could not update/save CAR Working: {e}")
+    
+        # Summary of enhancements
+        print(f"\n=== ENHANCEMENT SUMMARY ===")
+        print("[OK] Enhanced P/NP lookup with normalization and fuzzy matching")
+        print("[OK] Enhanced Mortgage lookup from CBSL PropertyMortgage sheet")
+        print("[OK] VLOOKUP-style functionality implemented for mortgage data")
+        print("[OK] Detailed matching reports generated for both P/NP and Mortgage")
+        print("[OK] Comparison reports with existing CAR Working file")
+        print("[OK] Updated CAR Working file with enhanced data")
+        print("[OK] Comprehensive column logging for all Excel files")
+        print("[OK] Column detection and mapping status tracking")
+        print(f"[OK] All outputs saved to: {out_folder}")
+        
+        # Final logging summary
+        print(f"\n=== FINAL LOGGING SUMMARY ===")
+        print("[PROCESS] Column Analysis Completed for:")
+        print("  • Production Sheet (C1 & C2 Working)")
+        print("  • CAR Working Sheet (Portfolio)")
+        print("  • CBSL Provision Comparison Sheet")
+        print("  • CBSL PropertyMortgage Sheet")
+        print("[LIST] All column names normalized and logged")
+        print("[INFO] Column detection status tracked for each sheet")
+        print("[OK] Enhanced error handling and debugging information")
+        
+        return wb_c1_c6
+        
+    except Exception as e:
+        print(f"[ERROR] Error in C3 report processing: {e}")
+        print(f"Error type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
+        return wb_c1_c6

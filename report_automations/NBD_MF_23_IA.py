@@ -56,7 +56,7 @@ except ImportError as e:
 
 
 class NBD_MF23_IA_Report:
-    def __init__(self, base_dir=r"working\monthly", working_dir=None):
+    def __init__(self, base_dir=r"working", working_dir=None):
         """Initialize the report generator with error handling.
 
         Args:
@@ -94,50 +94,31 @@ class NBD_MF23_IA_Report:
             raise ValueError(f"Invalid date type: {type(date_input)}. Expected string or date object")
 
     def _find_ia_folder(self):
-        """Find the dynamic NBD_MF_23_IA folder inside working directory."""
+        """Find the latest NBD_MF_23_IA date folder inside the working directory."""
         try:
-            # If working_dir is provided by app.py, use it directly (app.py already provides the NBD_MF_23_IA path)
-            if self.working_dir:
-                ia_folder_path = self.working_dir
-                if not os.path.exists(ia_folder_path):
-                    os.makedirs(ia_folder_path)
-                    logger.info(f"Created IA folder at: {ia_folder_path}")
-                else:
-                    logger.info(f"Found IA folder at: {ia_folder_path}")
-                return ia_folder_path
-
-            # Otherwise, use the old logic for standalone execution
-            # Step 1: Go back to root (one level above report_automations)
+            # Step 1: Locate project root (one level above report_automations)
             root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-            # Step 2: Construct path to working/monthly
-            monthly_dir = os.path.join(root_dir, "working", "monthly")
-            if not os.path.exists(monthly_dir):
-                error_msg = f"'monthly' folder not found in '{monthly_dir}'."
+            # Step 2: Path to working/NBD_MF_23_IA
+            ia_root = os.path.join(root_dir, "working", "NBD_MF_23_IA")
+            if not os.path.exists(ia_root):
+                error_msg = f"'NBD_MF_23_IA' folder not found at '{ia_root}'."
                 logger.error(error_msg)
                 raise FileNotFoundError(error_msg)
 
-            # Step 3: Get the only dynamic folder inside monthly
-            monthly_folders = [f for f in glob.glob(os.path.join(monthly_dir, "*")) if os.path.isdir(f)]
-            if not monthly_folders:
-                error_msg = f"No subfolder found inside '{monthly_dir}'."
+            # Step 3: Get all subfolders (date-based)
+            date_folders = [f for f in glob.glob(os.path.join(ia_root, "*")) if os.path.isdir(f)]
+            if not date_folders:
+                error_msg = f"No subfolders found under '{ia_root}'."
                 logger.error(error_msg)
                 raise FileNotFoundError(error_msg)
 
-            if len(monthly_folders) > 1:
-                logger.warning(f"Multiple folders found in '{monthly_dir}'. Using the first one: {monthly_folders[0]}")
+            # Step 4: Pick latest modified folder
+            date_folders.sort(key=os.path.getmtime, reverse=True)
+            latest_folder = date_folders[0]
 
-            dynamic_folder = monthly_folders[0]
-
-            # Step 4: Inside dynamic folder, find/create NBD_MF_23_IA
-            ia_folder_path = os.path.join(dynamic_folder, "NBD_MF_23_IA")
-            if not os.path.exists(ia_folder_path):
-                os.makedirs(ia_folder_path)
-                logger.info(f"Created IA folder at: {ia_folder_path}")
-            else:
-                logger.info(f"Found IA folder at: {ia_folder_path}")
-
-            return ia_folder_path
+            logger.info(f"Found latest IA working folder: {latest_folder}")
+            return latest_folder
 
         except Exception as e:
             logger.error(f"Error finding IA folder: {e}")
@@ -614,28 +595,67 @@ class NBD_MF23_IA_Report:
 
             
             # Type of Loans classification
+            # Excel formula: =XLOOKUP(A3,Product_Cat!L:L,Product_Cat!M:M,
+            #                 IF(OR(B3="MT",B3="Margin Trading"),"Margin Trading Loans",
+            #                 IF(OR(B3="FDL",B3="FD Loan"),"Loans against Cash/Deposits",
+            #                 XLOOKUP((B3&D3&E3&F3),Product_Cat!F:F,Product_Cat!E:E))))
             try:
-                special_cat_map = dict(zip(df_product_cat["SPECIAL CATEGORIES"], df_product_cat["M"]))
-                lookup_map = dict(zip(df_product_cat["LOOKUP"], df_product_cat["Classification"]))
-                
-                df_prod_loans["Type of Loans (1.3.1.0.0.0)"] = self.safe_apply(
-                    df_prod_loans,
-                    lambda row: (
-                        special_cat_map.get(row["Contract No"])
-                        if special_cat_map.get(row["Contract No"]) is not None else (
-                            "Margin Trading Loans" if row["Product"] in ["MT", "Margin Trading"]
-                            else "Loans against Cash/Deposits" if row["Product"] in ["FDL", "FD Loan"]
-                            else lookup_map.get(
-                                f"{row['Product']}{row['Equipment']}{row['Purpose']}{row['Corporate Clients']}",
-                                None
-                            )
-                        )
-                    ),
-                    default_value=None
-                )
+                # Create lookup dictionaries from Product_Cat sheet
+                # L:L = SPECIAL CATEGORIES (Contract No), M:M = result
+                # Clean NaN values before creating dict
+                special_cat_df = df_product_cat[["SPECIAL CATEGORIES", "M"]].dropna(subset=["SPECIAL CATEGORIES"])
+                special_cat_map = dict(zip(special_cat_df["SPECIAL CATEGORIES"], special_cat_df["M"]))
+
+                # F:F = LOOKUP (Product&Equipment&Purpose&Corporate), E:E = Classification
+                lookup_df = df_product_cat[["LOOKUP", "Classification"]].dropna(subset=["LOOKUP"])
+                lookup_map = dict(zip(lookup_df["LOOKUP"], lookup_df["Classification"]))
+
+                logger.info(f"Special categories map has {len(special_cat_map)} entries")
+                logger.info(f"Lookup map has {len(lookup_map)} entries")
+
+                def classify_loan_type(row):
+                    """Classify loan type matching Excel XLOOKUP formula."""
+                    contract_no = str(row["Contract No"]) if pd.notna(row["Contract No"]) else ""
+                    product = str(row["Product"]) if pd.notna(row["Product"]) else ""
+                    equipment = str(row["Equipment"]) if pd.notna(row["Equipment"]) else ""
+                    purpose = str(row["Purpose"]) if pd.notna(row["Purpose"]) else ""
+                    corporate_clients = str(row["Corporate Clients"]) if pd.notna(row["Corporate Clients"]) else ""
+
+                    # First XLOOKUP: Check special categories by Contract No (A3 in L:L column)
+                    if contract_no and contract_no in special_cat_map:
+                        return special_cat_map[contract_no]
+
+                    # IF condition 1: Check for Margin Trading (B3="MT" or "Margin Trading")
+                    if product in ["MT", "Margin Trading"]:
+                        return "Margin Trading Loans"
+
+                    # IF condition 2: Check for FD Loans (B3="FDL" or "FD Loan")
+                    if product in ["FDL", "FD Loan"]:
+                        return "Loans against Cash/Deposits"
+
+                    # Second XLOOKUP: Use concatenated key (B3&D3&E3&F3) in F:F column
+                    lookup_key = f"{product}{equipment}{purpose}{corporate_clients}"
+                    result = lookup_map.get(lookup_key)
+
+                    if result is not None and pd.notna(result):
+                        return result
+
+                    return None
+
+                df_prod_loans["Type of Loans (1.3.1.0.0.0)"] = df_prod_loans.apply(classify_loan_type, axis=1)
+
+                # Log statistics and sample results
+                null_count = df_prod_loans["Type of Loans (1.3.1.0.0.0)"].isna().sum()
+                logger.info(f"Type of Loans classification: {len(df_prod_loans) - null_count} classified, {null_count} null")
+
+                # Show value counts for debugging
+                value_counts = df_prod_loans["Type of Loans (1.3.1.0.0.0)"].value_counts()
+                logger.info(f"Type of Loans value distribution:\n{value_counts}")
+
                 logger.info("✓ Type of Loans classification completed")
             except Exception as e:
                 logger.error(f"Error in Type of Loans classification: {e}")
+                logger.error(traceback.format_exc())
 
             # PD Category mapping (MUST happen before Collateral classification)
             try:
@@ -1049,11 +1069,11 @@ class NBD_MF23_IA_Report:
                 # Use command line override if master data extraction failed
                 if hasattr(self, 'minimum_rate_override') and self.minimum_rate_override is not None:
                     logger.info(f"Using command line minimum rate override: {self.minimum_rate_override}%")
-                    minimum_rate_final = self.minimum_rate_override
+                    minimum_rate_final = self.minimum_rate_override / 100
 
                 exception_report_path = os.path.join(self.ia_folder, "Minimum_Rate_Exceptions.xlsx")
 
-                logger.info(f"Validating Minimum Rate (Final) against threshold: {minimum_rate_final}%")
+                logger.info(f"Validating Minimum Rate (Final) against threshold: {minimum_rate_final * 100}%")
 
                 # Ensure required columns exist
                 required_cols = ["Contract No", "Minimum Rate (Final)"]
@@ -1082,10 +1102,10 @@ class NBD_MF23_IA_Report:
 
                         # Export to Excel in same folder
                         exceptions.to_excel(exception_report_path, index=False)
-                        logger.warning(f"Exception report generated at {exception_report_path} with {len(exceptions)} records exceeding {minimum_rate_final}%")
+                        logger.warning(f"Exception report generated at {exception_report_path} with {len(exceptions)} records exceeding {minimum_rate_final * 100}%")
                         logger.warning(f"Contracts with high rates: {exceptions['Contract No'].tolist()[:10]}...")  # Show first 10
                     else:
-                        logger.info(f"✓ All {len(df_prod_loans)} contracts have rates within threshold ({minimum_rate_final}%)")
+                        logger.info(f"✓ All {len(df_prod_loans)} contracts have rates within threshold ({minimum_rate_final * 100}%)")
 
             except Exception as e:
                 logger.error(f"Error in minimum rate validation: {e}")
@@ -1491,12 +1511,15 @@ class NBD_MF23_IA_Report:
                 # Check if command line override is available
                 if hasattr(self, 'minimum_rate_override') and self.minimum_rate_override is not None:
                     logger.info(f"Using command line minimum rate override: {self.minimum_rate_override}%")
-                    return self.minimum_rate_override
+                    return self.minimum_rate_override / 100
                 else:
-                    logger.warning("No command line override provided, using default value of 6.00%")
-                    return 6.00
+                    logger.warning("No command line override provided, using default value of 0.06 (6.00%)")
+                    return 0.06
 
-            logger.info(f"✓ Extracted minimum rate threshold from master data: {minimum_rate_threshold}%")
+            # Divide by 100 to convert percentage to decimal (e.g., 42 -> 0.42)
+            minimum_rate_threshold = minimum_rate_threshold / 100
+
+            logger.info(f"✓ Extracted minimum rate threshold from master data: {minimum_rate_threshold} (converted from {minimum_rate_threshold * 100}%)")
             return minimum_rate_threshold
 
         except Exception as e:
@@ -1504,10 +1527,10 @@ class NBD_MF23_IA_Report:
             # Check if command line override is available
             if hasattr(self, 'minimum_rate_override') and self.minimum_rate_override is not None:
                 logger.info(f"Using command line minimum rate override: {self.minimum_rate_override}%")
-                return self.minimum_rate_override
+                return self.minimum_rate_override / 100
             else:
-                logger.warning("No command line override provided, using default minimum rate threshold of 6.00%")
-                return 6.00
+                logger.warning("No command line override provided, using default minimum rate threshold of 0.06 (6.00%)")
+                return 0.06
 
     def load_scienter_valuation(self):
         """Load Scienter valuation bot with error handling."""

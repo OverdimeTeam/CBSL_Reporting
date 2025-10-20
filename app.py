@@ -9,18 +9,21 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Tuple, List
+import time
+import re
+import glob
+import zipfile
 
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_file
 from threading import Lock
 from collections import deque
-# from waitress import serve
+import openpyxl
 
 app = Flask(__name__)
 
-# Suppress Waitress task queue warnings (harmless, just indicates polling during long tasks)
+# Suppress Waitress task queue warnings
 import logging
 logging.getLogger('waitress.queue').setLevel(logging.ERROR)
-
 
 def kill_excel_instances():
     """Kill any running Excel instances to prevent COM conflicts."""
@@ -48,7 +51,6 @@ def kill_excel_instances():
             print("No Excel instances found")
     except Exception as e:
         print(f"Error killing Excel instances: {e}")
-
 
 def _append_run_history(
     frequency: str,
@@ -87,1495 +89,3672 @@ def _append_run_history(
     wb.save(HISTORY_XLSX)
     wb.close()
 
-
-
+# ==================== GLOBAL CONFIGURATION ====================
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
 WORKING_DIR = BASE_DIR / "working"
 REPORT_AUTOMATIONS_DIR = BASE_DIR / "report_automations"
 LOGS_DIR = BASE_DIR / "logs"
+MASTER_INPUTS_DIR = BASE_DIR / "Master Inputs"
 HISTORY_XLSX = LOGS_DIR / "run_history.xlsx"
+MASTER_DATA_XLSX = BASE_DIR / "Master_Data.xlsx"
+
+# Status tracking
 _status_lock = Lock()
 _status: dict[str, str | bool] = {
     "running": False,
     "stage": "idle",
-    "frequency": "",
-    "date": "",
     "message": "",
-    "eta_total_secs": 0,
-    "eta_started_iso": "",
 }
 
 _log_lock = Lock()
 _log_buffer: deque[str] = deque(maxlen=2000)
 _proc_lock = Lock()
-_current_proc: subprocess.Popen | None = None
 _stop_requested: bool = False
-_running_processes: dict[str, subprocess.Popen] = {}  # Track individual processes by script name
-_thread_pool: ThreadPoolExecutor | None = None
-_running_threads: dict[str, threading.Thread] = {}  # Track running threads by name
+_running_processes: dict[str, subprocess.Popen] = {}
 
 # Create timestamped log file for each run
-from datetime import datetime as _dt
-_timestamp_str = _dt.now().strftime('%Y%m%d_%H%M%S')
+_timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
 _run_log_dir = LOGS_DIR / f"run_{_timestamp_str}"
 _run_log_dir.mkdir(parents=True, exist_ok=True)
 RUN_LOG_FILE = _run_log_dir / "web_run.log"
 _status_feed: deque[str] = deque(maxlen=200)
 _report_checklist: list[dict] = []
 _report_messages: dict[str, deque[str]] = {}
-_last_output_dir: Path | None = None
+_last_output_dirs: dict[str, Path] = {}  # Track output dirs per report
+_download_files: list[Path] = []  # Track files to download
+_sofp_download_file: Path | None = None  # Track SOFP file for download after save
 
+# ==================== REPORT DEPENDENCY STRUCTURE ====================
+REPORT_STRUCTURE = {
+    # LEVEL 1 Reports
+    "NBD-MF-01-SOFP-SOCI": {
+        "level": 1,
+        "set": 1,
+        "step": 1,
+        "name": "Statement of Financial position",
+        "script": "NBD_MF_01_SOFP_SOCI.py",
+        "folder": "NBD_MF_01_SOFP_SOCI",
+        "dependencies": [],
+        "estimated_minutes": 5
+    },
+    "NBD-WF-18-DM": {
+        "level": 1,
+        "set": 2,
+        "step": 1,
+        "name": "Deposits Movement in Previous Week",
+        "script": "NBD_WF_18_DM.py",
+        "folder": "NBD-WF-18-DM",
+        "dependencies": [],
+        "estimated_minutes": 30
+    },
+    "NBD-WF-15-LA": {
+        "level": 1,
+        "set": 2,
+        "step": 2,
+        "name": "Liquid Assets",
+        "script": "NBD_WF_15_LA.py",
+        "folder": "NBD_WF_15_LA",
+        "dependencies": [],
+        "estimated_minutes": 3
+    },
+    "NBD-WF-18-ECS": {
+        "level": 1,
+        "set": 2,
+        "step": 3,
+        "name": "Expected Cashflow Summary",
+        "script": "NBD_WF_18_ECS.py",
+        "folder": "NBD_WF_18_ECS",
+        "dependencies": [],
+        "estimated_minutes": 4
+    },
 
-def _append_gui(line: str) -> None:
+    # LEVEL 2 Reports
+    "NBD-MF-04-LA": {
+        "level": 2,
+        "set": 3,
+        "step": 1,
+        "name": "Liquid Assets",
+        "script": "NBD_MF_04_LA.py",
+        "folder": "NBD_MF_04_LA",
+        "dependencies": ["NBD-MF-01-SOFP-SOCI"],
+        "estimated_minutes": 8
+    },
+    "NBD-MF-06-ID": {
+        "level": 2,
+        "set": 4,
+        "step": 1,
+        "name": "Interest Deposit",
+        "script": "NBD_MF_06_ID.py",
+        "folder": "NBD_MF_06_ID",
+        "dependencies": ["NBD-MF-01-SOFP-SOCI"],
+        "estimated_minutes": 10
+    },
+    "NBD-MF-10-GA-11-IS-SET8": {
+        "level": 2,
+        "set": 5,
+        "step": 1,
+        "name": "GA & IS Pipeline",
+        "script": "NBD_MF_10_GA_NBD_MF_11_IS.py",
+        "folder": "NBD-MF-10-GA & NBD-MF-11-IS",
+        "dependencies": ["NBD-MF-01-SOFP-SOCI"],
+        "estimated_minutes": 25
+    },
+    "NBD-MF-23-IA": {
+        "level": 2,
+        "set": 6,
+        "step": 1,
+        "name": "Product wise Classification of Loans",
+        "script": "NBD_MF_23_IA.py",
+        "folder": "NBD_MF_23_IA",
+        "dependencies": [],
+        "estimated_minutes": 15
+    },
+    "NBD-MF-23-C1-C2": {
+        "level": 2,
+        "set": 6,
+        "step": 2,
+        "name": "Product wise Classification of Loans (Amounts)",
+        "script": "NBD_MF_23_C1C2.py",
+        "folder": "NBD_MF_23_C1C2",
+        "dependencies": [],
+        "estimated_minutes": 10
+    },
+    "NBD-MF-20-C1": {
+        "level": 2,
+        "set": 7,
+        "step": 1,
+        "name": "Form 1 : Computation of Capital Ratios",
+        "script": "NBD_MF_20_C1.py",
+        "folder": "NBD_MF_20_C1_C6",
+        "dependencies": [],
+        "estimated_minutes": 10
+    },
+    "NBD-MF-20-C2": {
+        "level": 2,
+        "set": 7,
+        "step": 2,
+        "name": "Form 2 : Computation of Total Capital",
+        "script": "NBD_MF_20_C2.py",
+        "folder": "NBD_MF_20_C1_C6",
+        "dependencies": [],
+        "estimated_minutes": 12
+    },
+    "NBD-MF-20-C3": {
+        "level": 2,
+        "set": 7,
+        "step": 3,
+        "name": "Form 3: Computation of Risk Weighted Amount for Credit Risk",
+        "script": "NBD_MF_20_C3.py",
+        "folder": "NBD_MF_20_C1_C6",
+        "dependencies": [],
+        "estimated_minutes": 15
+    },
+    "NBD-MF-20-C4": {
+        "level": 2,
+        "set": 7,
+        "step": 4,
+        "name": "Form 4: Credit equivalent of Off-Balance Sheet Item",
+        "script": "NBD_MF_20_C4.py",
+        "folder": "NBD_MF_20_C1_C6",
+        "dependencies": [],
+        "estimated_minutes": 10
+    },
+    "NBD-MF-20-C5": {
+        "level": 2,
+        "set": 7,
+        "step": 5,
+        "name": "Form 5: Exposures recognized under Credit Risk Mitigation CRM",
+        "script": "NBD_MF_20_C5.py",
+        "folder": "NBD_MF_20_C1_C6",
+        "dependencies": [],
+        "estimated_minutes": 12
+    },
+    "NBD-MF-20-C6": {
+        "level": 2,
+        "set": 7,
+        "step": 6,
+        "name": "Form 6: Computation of Risk Weighted Amount for Operational Risk",
+        "script": "NBD_MF_20_C6.py",
+        "folder": "NBD_MF_20_C1_C6",
+        "dependencies": [],
+        "estimated_minutes": 15
+    },
+
+    # LEVEL 2 Reports - Set 5 (GA & IS combined pipeline)
+    "NBD-MF-10-GA-11-IS-SET8": {
+        "level": 2,
+        "set": 5,
+        "step": 1,
+        "name": "GA & IS Pipeline",
+        "script": "NBD_MF_10_GA_NBD_MF_11_IS.py",
+        "dependencies": [],
+        "folder": "NBD-MF-10-GA & NBD-MF-11-IS",
+        "estimated_minutes": 25
+    },
+
+    # LEVEL 2 Reports - Set 8 (C4 standalone)
+    "NBD-MF-23-C4": {
+        "level": 2,
+        "set": 8,
+        "step": 1,
+        "name": "Loan CF Analysis",
+        "script": "NBD-MF-23-C4.py",
+        "dependencies": [],
+        "folder": "NBD_MF_23_C4",
+        "estimated_minutes": 30
+    },
+
+    # LEVEL 3 Reports
+    "NBD-QF-23-C9": {
+        "level": 3,
+        "set": 8,
+        "step": 1,
+        "name": "Sector Wise Credit Exposures",
+        "script": "NBD_QF_23_C9.py",
+        "folder": "NBD_QF_23_C9",
+        "dependencies": ["NBD-MF-23-IA", "NBD-MF-23-C1", "NBD-MF-23-C2"],
+        "estimated_minutes": 8
+    },
+    "NBD-QF-23-C10": {
+        "level": 3,
+        "set": 8,
+        "step": 2,
+        "name": "District Wise Credit Exposures",
+        "script": "NBD_QF_23_C10.py",
+        "folder": "NBD_QF_23_C10",
+        "dependencies": ["NBD-MF-23-IA", "NBD-MF-23-C1", "NBD-MF-23-C2"],
+        "estimated_minutes": 8
+    },
+    "NBD-QF-23-C6": {
+        "level": 3,
+        "set": 8,
+        "step": 3,
+        "name": "Large Exposures (Top 50 Borrowers)",
+        "script": "NBD_QF_23_C6.py",
+        "folder": "NBD_QF_23_C6",
+        "dependencies": ["NBD-MF-23-IA", "NBD-MF-23-C1", "NBD-MF-23-C2"],
+        "estimated_minutes": 6
+    },
+    "NBD-QF-23-C7": {
+        "level": 3,
+        "set": 9,
+        "step": 1,
+        "name": "Detailed breakdown of the stage-wise movement of loans",
+        "script": "NBD_QF_23_C7.py",
+        "folder": "NBD_QF_23_C7",
+        "dependencies": ["NBD-MF-23-IA", "NBD-MF-23-C1", "NBD-MF-23-C2"],
+        "estimated_minutes": 10
+    },
+    "NBD-QF-23-C8": {
+        "level": 3,
+        "set": 10,
+        "step": 1,
+        "name": "Classification of Loans based on Internal Credit Risk Rating",
+        "script": "NBD_QF_23_C8.py",
+        "folder": "NBD_QF_23_C8",
+        "dependencies": [],
+        "estimated_minutes": 12
+    },
+    "NBD-QF-23-C4": {
+        "level": 3,
+        "set": 11,
+        "step": 1,
+        "name": "Product wise Probability of Default and Loss Given Default of Loans",
+        "script": "NBD_QF_23_C4.py",
+        "folder": "NBD_MF_23_C4",
+        "dependencies": [],
+        "estimated_minutes": 15
+    },
+    "NBD-QF-23-C3": {
+        "level": 3,
+        "set": 12,
+        "step": 1,
+        "name": "Measurement of Credit Risk in Loans Based on Regulatory Classification",
+        "script": "NBD_QF_23_C3.py",
+        "folder": "NBD_QF_23_C3",
+        "dependencies": ["NBD-MF-23-IA", "NBD-MF-23-C1", "NBD-MF-23-C2"],
+        "estimated_minutes": 12
+    },
+    "NBD-QF-16-SF": {
+        "level": 3,
+        "set": 13,
+        "step": 1,
+        "name": "Sustainable Finance Activities (SFAs)",
+        "script": "NBD_QF_16_SF.py",
+        "folder": "NBD_QF_16_SF",
+        "dependencies": ["NBD-MF-23-IA", "NBD-MF-23-C1", "NBD-MF-23-C2"],
+        "estimated_minutes": 10
+    },
+    "NBD-QF-16-FI": {
+        "level": 3,
+        "set": 14,
+        "step": 1,
+        "name": "National Financial Inclusion Council Survey",
+        "script": "NBD_QF_16_FI.py",
+        "folder": "NBD_QF_16_FI",
+        "dependencies": ["NBD-MF-23-IA", "NBD-MF-23-C1", "NBD-MF-23-C2"],
+        "estimated_minutes": 8
+    },
+}
+
+# ==================== HELPER FUNCTIONS ====================
+
+def _emit_log(message: str, *, important: bool = False) -> None:
+    """Emit log message."""
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
     with _log_lock:
         _log_buffer.append(line)
-
-
-def _append_file(line: str) -> None:
     try:
         with RUN_LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
-        # Avoid UI crashes if log file cannot be written
         pass
-
-
-def _timestamp() -> str:
-    return datetime.now().strftime("%H:%M:%S")
-
-
-def _is_important(msg: str) -> bool:
-    text = msg.lower()
-    keywords = [
-        "starting", "ensuring", "copying", "running", "saving",
-        "completed", "done", "stopping", "stop requested",
-        "error", "failed", "warning", "destination already exists",
-    ]
-    return any(k in text for k in keywords)
-
-
-def _emit_log(message: str, *, important: bool = False, skip_web_log: bool = False) -> None:
-    """
-    Emit log message.
-
-    Args:
-        message: Log message text
-        important: If True, always show in GUI feed
-        skip_web_log: If True, skip writing to web_run.log (for verbose report output)
-    """
-    line = f"[{_timestamp()}] {message}"
-
-    # Only write to web_run.log if not skipped (skip verbose report output)
-    if not skip_web_log:
-        _append_file(line)
-
-    # Show in GUI if important or matches keywords
-    if important or _is_important(message):
-        _append_gui(line)
-
-
-def _detect_log_file_creation(line: str) -> None:
-    """Detect when a descriptive log file is created and emit status update."""
-    if "run log file:" in line.lower() or "run log saved to:" in line.lower():
-        # Extract log file path from the line
-        import re
-        match = re.search(r'([A-Za-z0-9_\-\.]+\.log)', line)
-        if match:
-            log_file = match.group(1)
-            _emit_log(f"Created descriptive log file: {log_file}", important=True)
-
-
-def _log(message: str) -> None:
-    # Backward compatible: treat direct _log calls as important UI messages
-    _emit_log(message, important=True)
-
-
-def _clear_logs() -> None:
-    with _log_lock:
-        _log_buffer.clear()
-
-
-def _initialize_new_run() -> None:
-    """Initialize a new run with fresh timestamp and log directory."""
-    global _timestamp_str, _run_log_dir, RUN_LOG_FILE, _thread_pool
-    _timestamp_str = _dt.now().strftime('%Y%m%d_%H%M%S')
-    _run_log_dir = LOGS_DIR / f"run_{_timestamp_str}"
-    _run_log_dir.mkdir(parents=True, exist_ok=True)
-    RUN_LOG_FILE = _run_log_dir / "web_run.log"
-    _thread_pool = ThreadPoolExecutor(max_workers=4)  # C6..C2, IA, NBD-MF-23-C4, and GA-IS
-    _emit_log(f"Starting new run: {_timestamp_str}", important=True)
-
-
-def _request_stop() -> None:
-    """Request to stop all processes and threads."""
-    global _stop_requested, _thread_pool
-    _stop_requested = True
-    
-    with _proc_lock:
-        # Stop all running processes
-        for report_name, proc in _running_processes.items():
-            try:
-                proc.terminate()
-                _emit_log(f"Stopped {report_name}", important=True)
-            except Exception:
-                pass
-        _running_processes.clear()
-        
-        # Also stop the current process if it exists
-        if _current_proc:
-            try:
-                _current_proc.terminate()
-            except Exception:
-                pass
-    
-    # Shutdown thread pool
-    if _thread_pool:
-        try:
-            _thread_pool.shutdown(wait=False)
-        except Exception:
-            pass
-        _thread_pool = None
-
-
-def _stop_individual_script(report_name: str) -> bool:
-    """Stop a specific script by name. Returns True if stopped, False if not found."""
-    with _proc_lock:
-        if report_name in _running_processes:
-            try:
-                _running_processes[report_name].terminate()
-                del _running_processes[report_name]
-                _emit_log(f"Stopped {report_name}", important=True)
-                return True
-            except Exception:
-                return False
-    return False
 
 
 def _set_status(**kwargs) -> None:
     with _status_lock:
-        prev = _status.copy()
         _status.update(kwargs)
-        # Record status changes in a compact feed for the UI
-        stage = _status.get("stage", "") or ""
-        msg = _status.get("message", "") or ""
-        freq = _status.get("frequency", "") or ""
-        date = _status.get("date", "") or ""
-        parts = []
-        if stage:
-            parts.append(stage.capitalize())
-        if freq:
-            parts.append(f"{freq}")
-        if date:
-            parts.append(f"{date}")
-        if msg:
-            parts.append(msg)
-        summary = " | ".join(parts)
-        if summary:
-            ts_line = f"[{_timestamp()}] {summary}"
-            _status_feed.append(ts_line)
 
 
 def _reset_status() -> None:
-    _set_status(running=False, stage="idle", message="", frequency="", date="", eta_total_secs=0, eta_started_iso="")
-    # Do not clear report checklist here so UI can still show last results until next start
+    _set_status(running=False, stage="idle", message="")
 
 
-def _init_report_checklist(script_names: list[str]) -> None:
-    global _report_checklist
-    _report_checklist = [{"name": name.replace(".py", ""), "status": "pending"} for name in script_names]
-    # Initialize per-report message buffers
-    global _report_messages
-    _report_messages = {name.replace(".py", ""): deque(maxlen=200) for name in script_names}
+def _initialize_new_run() -> None:
+    """Initialize a new run with fresh timestamp and log directory."""
+    global _timestamp_str, _run_log_dir, RUN_LOG_FILE
+    _timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _run_log_dir = LOGS_DIR / f"run_{_timestamp_str}"
+    _run_log_dir.mkdir(parents=True, exist_ok=True)
+    RUN_LOG_FILE = _run_log_dir / "web_run.log"
+    _emit_log(f"Starting new run: {_timestamp_str}", important=True)
 
 
-def _ensure_reports_in_checklist(script_names: list[str]) -> None:
-    """Ensure provided scripts exist in the checklist and message buffers without resetting existing entries."""
-    existing_names = {it["name"] for it in _report_checklist}
-    for name in script_names:
-        stem = name.replace(".py", "")
-        if stem not in existing_names:
-            _report_checklist.append({"name": stem, "status": "pending"})
-            _report_messages.setdefault(stem, deque(maxlen=200))
+def _init_report_checklist(report_ids: list[str]) -> None:
+    """Initialize report checklist for the UI."""
+    global _report_checklist, _report_messages
+    _report_checklist = []
+    _report_messages = {}
+    for report_id in report_ids:
+        if report_id in REPORT_STRUCTURE:
+            name = REPORT_STRUCTURE[report_id]["name"]
+            est_min = REPORT_STRUCTURE[report_id].get("estimated_minutes", 10)
+            _report_checklist.append({
+                "name": report_id,
+                "display_name": name,
+                "status": "pending",
+                "estimated_minutes": est_min,
+                "start_time": None,
+                "elapsed_seconds": 0
+            })
+            _report_messages[report_id] = deque(maxlen=200)
 
-def _ensure_checklist_item(name: str) -> None:
-    stem = name.replace(".py", "")
-    exists = any(it.get("name") == stem for it in _report_checklist)
-    if not exists:
-        _report_checklist.append({"name": stem, "status": "pending"})
-    if stem not in _report_messages:
-        _report_messages[stem] = deque(maxlen=200)
 
-
-def _set_report_status(script_name: str, status: str) -> None:
-    """Set status by script name instead of index"""
+def _set_report_status(report_id: str, status: str) -> None:
+    """Set status for a report by ID."""
     for item in _report_checklist:
-        if item["name"] == script_name.replace(".py", ""):
+        if item["name"] == report_id:
             item["status"] = status
+            if status == "running":
+                item["start_time"] = time.time()
+            elif status in ["completed", "failed", "stopped"]:
+                if item["start_time"]:
+                    item["elapsed_seconds"] = int(time.time() - item["start_time"])
             break
 
 
-def _append_report_message(report_stem: str, message: str) -> None:
-    # Filter and simplify: include only notable lines, trim length
-    txt = message.strip()
-    lower = txt.lower()
-    include = (
-        " - info - " in lower
-        or " - warning - " in lower
-        or " - error - " in lower
-        or "running" in lower
-        or "opened workbook" in lower
-        or "saved" in lower
-        or "completed" in lower
-        or "failed" in lower
-    )
-    if not include:
-        return
-    # Remove noisy prefixes if present
-    for marker in [" - info - ", " - warning - ", " - error - "]:
-        idx = lower.find(marker)
-        if idx != -1:
-            txt = txt[idx + len(marker):]
+def _update_report_elapsed_time(report_id: str) -> None:
+    """Update elapsed time for running report."""
+    for item in _report_checklist:
+        if item["name"] == report_id and item["status"] == "running" and item["start_time"]:
+            item["elapsed_seconds"] = int(time.time() - item["start_time"])
             break
-    if len(txt) > 180:
-        txt = txt[:177] + "..."
-    ts = _timestamp()
-    line = f"[{ts}] {txt}"
-    buf = _report_messages.get(report_stem)
-    if buf is not None:
-        buf.append(line)
 
 
-
-def ensure_directories_exist() -> None:
-    for sub in ["weekly", "monthly", "quarterly", "annually"]:
-        target = OUTPUTS_DIR / sub
-        target.mkdir(parents=True, exist_ok=True)
-        completed_file = target / "completed_dates.txt"
-        if not completed_file.exists():
-            completed_file.write_text("")
-    for sub in ["weekly", "monthly", "quarterly", "annually"]:
-        (WORKING_DIR / sub).mkdir(parents=True, exist_ok=True)
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _estimate_script_duration_seconds(script_name: str) -> int:
-    """Estimate duration from past descriptive logs. Defaults to 600 seconds."""
+def parse_date_folder_name(folder_name: str) -> datetime:
+    """Parse date from folder name format: 30/09/2025 or 31/10/2025(1)"""
+    base_name = re.sub(r'\(\d+\)$', '', folder_name)
     try:
-        logs_dir = REPORT_AUTOMATIONS_DIR / "logs"
-        if not logs_dir.exists():
-            return 600
-        import re
-        import statistics
-        durations: list[float] = []
-        # Filter logs for this specific script by filename prefix
-        prefix = Path(script_name).stem + "_"
-        candidates = [p for p in sorted(logs_dir.glob("*.log")) if p.name.startswith(prefix)]
-        for p in candidates[-20:]:
-            try:
-                txt = p.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                continue
-            # Heuristic: look for lines like "Run log saved to:" and first INFO line timestamp
-            lines = txt.splitlines()
-            if not lines:
-                continue
-            # Parse timestamps at line starts: 2025-09-17 22:11:47,123 - INFO - ...
-            ts_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
-            first_ts = None
-            last_ts = None
-            for ln in lines:
-                m = ts_pattern.match(ln)
-                if m:
-                    from datetime import datetime as _dt
-                    t = _dt.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-                    if first_ts is None:
-                        first_ts = t
-                    last_ts = t
-            if first_ts and last_ts and last_ts > first_ts:
-                durations.append((last_ts - first_ts).total_seconds())
-        if durations:
-            return int(statistics.median(durations))
-    except Exception:
-        pass
-    return 600
-
-
-def list_report_names() -> list[str]:
-    # No longer used for creating placeholders; leaving for possible future use.
-    if not REPORT_AUTOMATIONS_DIR.exists():
-        return []
-    names: list[str] = []
-    for item in REPORT_AUTOMATIONS_DIR.iterdir():
-        if item.is_file() and item.suffix == ".py" and not item.name.startswith("__"):
-            names.append(item.stem)
-    names.sort()
-    return names
-
-
-def parse_ui_date(date_str: str) -> datetime:
-    """Accepts either yyyy-mm-dd (HTML date input) or mm/dd/yyyy (legacy)."""
-    date_str = date_str.strip()
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        return datetime.strptime(base_name, "%d/%m/%Y")
+    except ValueError:
         try:
-            return datetime.strptime(date_str, fmt)
+            return datetime.strptime(base_name, "%d-%m-%Y")
         except ValueError:
-            continue
-    raise ValueError(f"Unsupported date format: {date_str}")
+            try:
+                return datetime.strptime(base_name, "%m/%d/%Y")
+            except ValueError:
+                raise ValueError(f"Cannot parse date from folder name: {folder_name}")
 
 
-def ui_date_to_folder_name(ui_date: str) -> str:
-    dt = parse_ui_date(ui_date)
-    return dt.strftime("%m-%d-%Y")
-
-
-def ui_date_to_display(ui_date: str) -> str:
-    dt = parse_ui_date(ui_date)
-    return dt.strftime("%m/%d/%Y")
-
-
-def append_completed_date(frequency: str, ui_date: str) -> None:
-    completed_path = OUTPUTS_DIR / frequency / "completed_dates.txt"
-    with completed_path.open("a", encoding="utf-8") as f:
-        f.write(ui_date_to_display(ui_date) + "\n")
-
-
-def get_last_completed_date(frequency: str) -> str | None:
-    completed_path = OUTPUTS_DIR / frequency / "completed_dates.txt"
-    if not completed_path.exists():
+def find_latest_date_folder(report_folder: Path) -> Path | None:
+    """Find the latest versioned date folder in a report folder."""
+    if not report_folder.exists():
         return None
-    lines = [ln.strip() for ln in completed_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    if not lines:
-        return None
-    return lines[-1]
-
-
-def find_latest_versioned_folder(parent: Path, base_name: str) -> Path | None:
-    candidates: list[tuple[int, Path]] = []
-    for child in parent.iterdir():
+    
+    candidates: list[tuple[datetime, int, Path]] = []
+    
+    for child in report_folder.iterdir():
         if not child.is_dir():
             continue
-        name = child.name
-        if name == base_name:
-            candidates.append((0, child))
-        elif name.startswith(base_name + "(") and name.endswith(")"):
-            middle = name[len(base_name) + 1 : -1]
-            if middle.isdigit():
-                candidates.append((int(middle), child))
+        
+        folder_name = child.name
+        try:
+            date_obj = parse_date_folder_name(folder_name)
+            version_match = re.search(r'\((\d+)\)$', folder_name)
+            version = int(version_match.group(1)) if version_match else 0
+            candidates.append((date_obj, version, child))
+        except ValueError:
+            continue
+    
     if not candidates:
         return None
-    candidates.sort(key=lambda t: t[0])
-    return candidates[-1][1]
+    
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return candidates[0][2]
 
 
-def create_reports_structure(target_dir: Path) -> None:
-    # Intentionally no-op: no python files or report subfolders are created inside date folders.
-    return
-
-
-def copy_latest_weekly_to_working() -> tuple[bool, str]:
-    last_ui_date = get_last_completed_date("weekly")
-    if not last_ui_date:
-        return False, "No completed weekly date found."
-    base_name = ui_date_to_folder_name(last_ui_date)
-    latest_folder = find_latest_versioned_folder(OUTPUTS_DIR / "weekly", base_name)
-    if latest_folder is None:
-        return False, f"No folder found for {last_ui_date}."
-    dest = WORKING_DIR / "weekly" / latest_folder.name
-    if dest.exists():
-        shutil.rmtree(dest)
-    shutil.copytree(latest_folder, dest)
-    return True, f"Copied {latest_folder.name} to working/weekly."
-
-
-def copy_latest_for_date_to_working(frequency: str, ui_date: str, *, clean_working: bool = True) -> tuple[bool, str]:
-    """Copy latest versioned folder for the picked date into working/<frequency>.
-
-    If clean_working is True, attempt to clear existing items under working/<frequency> first.
+def find_latest_completed_date(source_folder: Path) -> tuple[datetime | None, Path | None]:
     """
-    base_name = ui_date_to_folder_name(ui_date)
-    parent = OUTPUTS_DIR / frequency
-    if not parent.exists():
-        return False, f"Source base folder not found: {parent}"
-    latest_folder = find_latest_versioned_folder(parent, base_name)
-    if latest_folder is None:
-        try:
-            existing = ", ".join(sorted([p.name for p in parent.iterdir() if p.is_dir()])) or "<none>"
-        except Exception:
-            existing = "<unknown>"
-        return False, (
-            f"No folder found for {ui_date_to_display(ui_date)} (expected '{base_name}' or versioned). "
-            f"Existing under {parent.name}: {existing}"
-        )
-    working_freq_dir = WORKING_DIR / frequency
-    if clean_working:
-        try:
-            if working_freq_dir.exists():
-                for child in working_freq_dir.iterdir():
-                    if child.is_dir():
-                        shutil.rmtree(child)
-                    else:
-                        try:
-                            child.unlink()
-                        except Exception:
-                            pass
-            else:
-                working_freq_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            return False, f"Failed to clean working/{frequency}: {exc}"
-    else:
-        # Ensure dir exists, then remove existing subfolder(s) only
-        working_freq_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            for child in working_freq_dir.iterdir():
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-        except Exception:
-            # Best-effort; continue
-            pass
-
-    dest = working_freq_dir / latest_folder.name
-    try:
-        if dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
-        shutil.copytree(latest_folder, dest)
-    except Exception as exc:
-        return False, f"Failed to copy '{latest_folder.name}' to '{dest}': {exc}"
-    return True, f"Copied {latest_folder.name} to working/{frequency}."
-
-
-def copy_from_last_completed_to_working(frequency: str) -> tuple[bool, str]:
-    last_ui_date = get_last_completed_date(frequency)
-    if not last_ui_date:
-        return False, f"No completed {frequency} date found."
-    return copy_latest_for_date_to_working(frequency, last_ui_date)
-
-
-def _run_script_direct(script_name: str, date_folder: Path, report_month: str, report_year: str) -> tuple[bool, str]:
-    """Run a script directly in the current thread using importlib (for COM compatibility)."""
-    import importlib.util
-    import sys
-
-    script_path = REPORT_AUTOMATIONS_DIR / script_name
-    if not script_path.exists():
-        return False, f"Script not found: {script_path}"
-
-    _ensure_checklist_item(script_name)
-    _set_report_status(script_name, "running")
-
-    # Create individual log file
-    script_log_file = _run_log_dir / f"{script_name.replace('.py', '')}.log"
-
-    # Set up environment
-    original_dir = os.getcwd()
-    original_argv = sys.argv.copy()
-
-    try:
-        # Determine working directory
-        desired_working = date_folder
-        if script_name in ["NBD_MF_23_IA.py", "NBD_MF_23_C1C2.py"]:
-            ia_folder = date_folder / "NBD_MF_23_IA"
-            if ia_folder.exists():
-                desired_working = ia_folder
-        elif script_name == "NBD_MF_10_GA_IS.py":
-            ga_is_folder = date_folder / "NBD-MF-10-GA & NBD-MF-11-IS"
-            if ga_is_folder.exists():
-                desired_working = ga_is_folder
-
-        # Change to working directory
-        os.chdir(str(desired_working))
-        _emit_log(f"Running {script_name} in {desired_working}", important=True)
-
-        # Set up sys.argv for argparse
-        sys.argv = [
-            str(script_path),
-            "--working-dir", str(desired_working),
-            "--month", report_month,
-            "--year", report_year
-        ]
-
-        # Set log directory environment variable
-        os.environ['REPORT_LOG_DIR'] = str(_run_log_dir)
-
-        # Redirect stdout/stderr to capture logs
-        import io
-        from contextlib import redirect_stdout, redirect_stderr
-
-        log_buffer = io.StringIO()
-
-        with redirect_stdout(log_buffer), redirect_stderr(log_buffer):
-            # Load and execute the script module
-            spec = importlib.util.spec_from_file_location(f"script_{script_name.replace('.', '_')}", str(script_path))
-            module = importlib.util.module_from_spec(spec)
-
-            # Execute the module (this runs the script)
-            spec.loader.exec_module(module)
-
-        # Get captured output
-        output = log_buffer.getvalue()
-
-        # Write to log file and emit
-        with script_log_file.open('w', encoding='utf-8') as f:
-            f.write(output)
-
-        for line in output.split('\n'):
-            if line.strip():
-                _emit_log(line, important=False, skip_web_log=True, script=script_name)
-
-        _set_report_status(script_name, "completed")
-        return True, "Completed"
-
-    except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        _emit_log(error_msg, important=True)
-        import traceback
-        _emit_log(traceback.format_exc(), important=False, skip_web_log=True)
-        _set_report_status(script_name, "failed")
-        return False, error_msg
-
-    finally:
-        # Restore original state
-        os.chdir(original_dir)
-        sys.argv = original_argv
-
-
-def _run_single_script(script_name: str, date_folder: Path, report_month: str, report_year: str) -> tuple[bool, str]:
-    """Run a single report script and return (success, message)."""
-    script_path = REPORT_AUTOMATIONS_DIR / script_name
-    if not script_path.exists():
-        msg = f"Script not found: {script_path}; skipping"
-        _emit_log(msg, important=True)
-        _set_report_status(script_name, "skipped")
-        return True, msg
+    Find the latest completed date from completed_dates.txt in source folder.
+    Returns tuple of (datetime, date_folder_path)
+    """
+    completed_dates_file = source_folder / "completed_dates.txt"
+    
+    if not completed_dates_file.exists():
+        _emit_log(f"No completed_dates.txt found in {source_folder}", important=True)
+        return None, None
     
     try:
-        # Special handling for C4 and C6 scripts - run them directly without --working-dir
-        if script_name in ["NBD_MF_20_C4.py", "NBD_MF_20_C6.py", "NBD_MF_20_C5.py", "NBD_MF_20_C2.py", "NBD_MF_20_C3_report.py"]:
-            # For C6, C5, C4, C2, and C3, run directly with python command
-            cmd = [
-                "python", 
-                script_name,
-                "--month",
-                report_month,
-                "--year",
-                report_year,
-            ]
-            # Set working directory to the report_automations folder for these scripts
-            run_cwd = str(REPORT_AUTOMATIONS_DIR)
+        with open(completed_dates_file, 'r') as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+        
+        if not lines:
+            _emit_log(f"completed_dates.txt is empty in {source_folder}", important=True)
+            return None, None
+        
+        # Get the last date from file
+        last_date_str = lines[-1]
+        _emit_log(f"Found last completed date: {last_date_str}", important=True)
+        
+        # Parse the date (supports DD-MM-YYYY and DD/MM/YYYY)
+        try:
+            last_date = datetime.strptime(last_date_str, "%d-%m-%Y")
+        except ValueError:
+            last_date = datetime.strptime(last_date_str, "%d/%m/%Y")
+        
+        # Find the folder with this date (including variations)
+        date_folder = find_date_folder_with_variations(source_folder, last_date_str)
+        
+        if date_folder:
+            _emit_log(f"Found date folder: {date_folder}", important=True)
+            return last_date, date_folder
         else:
-            # For other scripts like IA, use the full path and working directory
-            # Special case: GA_IS uses a different folder name
-            if script_name == "NBD_MF_10_GA_IS.py":
-                desired_working = date_folder / "NBD-MF-10-GA & NBD-MF-11-IS"
-                if not desired_working.exists():
-                    desired_working = date_folder
+            _emit_log(f"Date folder not found for: {last_date_str}", important=True)
+            return last_date, None
+            
+    except Exception as e:
+        _emit_log(f"Error reading completed_dates.txt: {e}", important=True)
+        return None, None
+
+
+def find_date_folder_with_variations(parent_folder: Path, date_str: str) -> Path | None:
+    """
+    Find the latest variation of a date folder (e.g., 30/09/2025, 30/09/2025(1), etc.)
+    """
+    if not parent_folder.exists():
+        return None
+    
+    candidates: list[tuple[int, Path]] = []
+    
+    date_variants = {date_str}
+    # Accept both DD/MM/YYYY and DD-MM-YYYY
+    try:
+        _dt = datetime.strptime(date_str, "%d/%m/%Y")
+        date_variants.add(_dt.strftime("%d-%m-%Y"))
+    except Exception:
+        try:
+            _dt = datetime.strptime(date_str, "%d-%m-%Y")
+            date_variants.add(_dt.strftime("%d/%m/%Y"))
+        except Exception:
+            pass
+    
+    for child in parent_folder.iterdir():
+        if not child.is_dir():
+            continue
+        
+        folder_name = child.name
+        
+        # Check if folder name starts with the date
+        if any(folder_name.startswith(v) for v in date_variants):
+            # Extract version number
+            version_match = re.search(r'\((\d+)\)$', folder_name)
+            version = int(version_match.group(1)) if version_match else 0
+            candidates.append((version, child))
+    
+    if not candidates:
+        return None
+    
+    # Sort by version descending and return the latest
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def format_date_folder_name(date_str: str) -> str:
+    """Convert date from HTML format (YYYY-MM-DD) to folder format (DD-MM-YYYY)."""
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    return dt.strftime("%d-%m-%Y")
+
+
+def copy_ia_to_additional_outputs(ia_file_path: Path, gui_date_str: str) -> None:
+    """
+    Copy the IA 'Prod. wise Class. of Loans' file to three additional output folders:
+    1. outputs/NBD_MF_20_C1_C6/{latest-date-folder}/
+    2. outputs/NBD_QF_23_C8/{latest-date-folder}/
+    3. outputs/NBD-QF-23-C3-C10-SF-FI/{latest-date-folder}/Input/
+
+    Before copying, deletes old 'Prod. wise Class. of Loans*.xlsb' files.
+    Uses completed_dates.txt to find the latest date folder.
+    """
+    import shutil
+
+    # Define the three target output folders
+    target_configs = [
+        {
+            "name": "C1-C6",
+            "base_folder": OUTPUTS_DIR / "NBD_MF_20_C1_C6",
+            "subfolder": None  # Copy directly to date folder
+        },
+        {
+            "name": "C8",
+            "base_folder": OUTPUTS_DIR / "NBD_QF_23_C8",
+            "subfolder": None  # Copy directly to date folder
+        },
+        {
+            "name": "C3-C10",
+            "base_folder": OUTPUTS_DIR / "NBD-QF-23-C3-C10-SF-FI",
+            "subfolder": "Input"  # Copy to Input subfolder
+        }
+    ]
+
+    for config in target_configs:
+        try:
+            base_folder = config["base_folder"]
+
+            # Check if base folder exists
+            if not base_folder.exists():
+                _emit_log(f"{config['name']}: Base folder does not exist: {base_folder}", important=True)
+                continue
+
+            # Find latest completed date folder
+            _, date_folder = find_latest_completed_date(base_folder)
+
+            if not date_folder or not date_folder.exists():
+                _emit_log(f"{config['name']}: Could not find latest date folder in {base_folder}", important=True)
+                continue
+
+            # Determine the actual target directory
+            if config["subfolder"]:
+                target_dir = date_folder / config["subfolder"]
+                target_dir.mkdir(parents=True, exist_ok=True)
             else:
-                desired_working = date_folder / script_name.replace(".py", "")
-                if not desired_working.exists():
-                    desired_working = date_folder
-            cmd = [
-                sys.executable,
-                str(script_path),
-                "--working-dir",
-                str(desired_working),
-                "--month",
-                report_month,
-                "--year",
-                report_year,
-            ]
-            run_cwd = str(REPORT_AUTOMATIONS_DIR)
+                target_dir = date_folder
+
+            # Remove old "Prod. wise Class. of Loans*.xlsb" files
+            old_files = list(target_dir.glob("Prod. wise Class. of Loans*.xlsb"))
+            for old_file in old_files:
+                try:
+                    old_file.unlink()
+                    _emit_log(f"{config['name']}: Removed old file: {old_file.name}", important=True)
+                except Exception as e:
+                    _emit_log(f"{config['name']}: Failed to remove old file {old_file.name}: {e}", important=True)
+
+            # Copy the new file
+            dest_file = target_dir / ia_file_path.name
+            shutil.copy2(ia_file_path, dest_file)
+            _emit_log(f"{config['name']}: Copied to {dest_file}", important=True)
+
+        except Exception as e:
+            _emit_log(f"{config['name']}: Error copying file: {e}", important=True)
+
+
+def _append_report_message(report_id: str, message: str) -> None:
+    """Append a single log line to the per-report buffer for UI display."""
+    buf = _report_messages.get(report_id)
+    if buf is None:
+        _report_messages[report_id] = deque(maxlen=200)
+        buf = _report_messages[report_id]
+    ts = datetime.now().strftime('%H:%M:%S')
+    buf.append(f"[{ts}] {message.strip()}")
+
+
+def save_master_data(sofp_data: dict | None, ia_data: dict | None, c1c6_data: dict | None = None) -> tuple[bool, str]:
+    """Save master data to Master_Data.xlsx"""
+    try:
+        wb = openpyxl.load_workbook(MASTER_DATA_XLSX)
         
-        # Estimate duration based on past runs
-        estimated_secs = max(60, _estimate_script_duration_seconds(script_name))
-        from datetime import datetime as _dt
+        # Generate current timestamp
+        current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        _emit_log(f"Running: {' '.join(cmd)} (cwd={run_cwd})", important=True)
-        _set_report_status(script_name, "running")
+        # Save SOFP-SOCI data only if provided and non-empty
+        if sofp_data:
+            has_sofp_values = any((sofp_data.get("bank_loans"), sofp_data.get("securitization_loans"), sofp_data.get("foreign_funding")))
+            if has_sofp_values and "NBD-MF-01-SOFP-SOCI" in wb.sheetnames:
+                ws = wb["NBD-MF-01-SOFP-SOCI"]
+                next_row = ws.max_row + 1
+                ws[f"A{next_row}"] = current_timestamp
+                ws[f"B{next_row}"] = sofp_data.get("bank_loans", "")
+                ws[f"C{next_row}"] = sofp_data.get("securitization_loans", "")
+                ws[f"D{next_row}"] = sofp_data.get("foreign_funding", "")
         
-        # Create individual log file for this script
-        script_log_file = _run_log_dir / f"{script_name.replace('.py', '')}.log"
-        _emit_log(f"Creating individual log file: {script_log_file.name}", important=True)
+        # Save IA data only if provided and non-empty
+        if ia_data:
+            has_ia_values = bool(ia_data.get("annual_interest_rate"))
+            if has_ia_values and "NBD-MF-23-IA-C1&C2-C5-IP" in wb.sheetnames:
+                ws = wb["NBD-MF-23-IA-C1&C2-C5-IP"]
+                next_row = ws.max_row + 1
+                ws[f"A{next_row}"] = current_timestamp
+                ws[f"B{next_row}"] = ia_data.get("annual_interest_rate", "")
+
+        # Save C1-C6 data (Guarantees)
+        if c1c6_data is not None:
+            has_c1c6_values = bool(c1c6_data.get("guarantees"))
+            if has_c1c6_values and "NBD-MF-20-C1-C6" in wb.sheetnames:
+                ws = wb["NBD-MF-20-C1-C6"]
+                next_row = ws.max_row + 1
+                ws[f"A{next_row}"] = current_timestamp
+                ws[f"B{next_row}"] = c1c6_data.get("guarantees", "")
         
-        # Add environment setup for C6 and C4 to ensure they can find required files
+        wb.save(MASTER_DATA_XLSX)
+        wb.close()
+        return True, "Master data saved successfully"
+    except Exception as e:
+        return False, f"Failed to save master data: {e}"
+
+
+def get_latest_master_data() -> tuple[dict, dict, dict]:
+    """Get latest master data from Excel sheets for pre-filling form"""
+    sofp_data = {"timestamp": "", "bank_loans": "", "securitization_loans": "", "foreign_funding": ""}
+    ia_data = {"timestamp": "", "annual_interest_rate": ""}
+    c1c6_data = {"timestamp": "", "guarantees": ""}
+    
+    try:
+        wb = openpyxl.load_workbook(MASTER_DATA_XLSX)
+        
+        # Get latest SOFP-SOCI data
+        if "NBD-MF-01-SOFP-SOCI" in wb.sheetnames:
+            ws = wb["NBD-MF-01-SOFP-SOCI"]
+            if ws.max_row > 1:  # Has data beyond header
+                last_row = ws.max_row
+                sofp_data = {
+                    "timestamp": str(ws[f"A{last_row}"].value or ""),
+                    "bank_loans": str(ws[f"B{last_row}"].value or ""),
+                    "securitization_loans": str(ws[f"C{last_row}"].value or ""),
+                    "foreign_funding": str(ws[f"D{last_row}"].value or "")
+                }
+        
+        # Get latest IA data
+        if "NBD-MF-23-IA-C1&C2-C5-IP" in wb.sheetnames:
+            ws = wb["NBD-MF-23-IA-C1&C2-C5-IP"]
+            if ws.max_row > 1:  # Has data beyond header
+                last_row = ws.max_row
+                ia_data = {
+                    "timestamp": str(ws[f"A{last_row}"].value or ""),
+                    "annual_interest_rate": str(ws[f"B{last_row}"].value or "")
+                }
+        
+        # Get latest C1-C6 data
+        if "NBD-MF-20-C1-C6" in wb.sheetnames:
+            ws = wb["NBD-MF-20-C1-C6"]
+            if ws.max_row > 1:
+                last_row = ws.max_row
+                c1c6_data = {
+                    "timestamp": str(ws[f"A{last_row}"].value or ""),
+                    "guarantees": str(ws[f"B{last_row}"].value or "")
+                }
+
+        wb.close()
+    except Exception as e:
+        # Return empty data if file doesn't exist or can't be read
+        pass
+    
+    return sofp_data, ia_data, c1c6_data
+
+
+def get_latest_uploaded_files() -> dict:
+    """Get latest uploaded files from Master Inputs directories"""
+    file_info = {}
+
+    categories = [
+        "ALCL Management Accounts",
+        "Investment Schedule",
+        "Loan Schedule",
+        "Supporting Schedules",
+        "Borrowing report",
+        "Disbursement with Budget",
+        "Information Request from Credit",
+        "Net Portfolio",
+        "Cadre",
+        "Unutilized Amount",
+        "Rec Target"
+    ]
+    
+    for category in categories:
+        category_dir = MASTER_INPUTS_DIR / category
+        if category_dir.exists():
+            # Find the most recent file (.xlsx for most categories, .xlsm for Borrowing report)
+            if category == "Borrowing report":
+                files = list(category_dir.glob("*.xlsm"))
+            else:
+                files = list(category_dir.glob("*.xlsx"))
+            
+            if files:
+                latest_file = max(files, key=lambda x: x.stat().st_mtime)
+                file_info[category] = latest_file.name
+            else:
+                file_info[category] = "No files uploaded"
+        else:
+            file_info[category] = "No files uploaded"
+    
+    return file_info
+
+
+def copy_uploaded_file_to_sofp_outputs(category: str, file_path: str, month: str) -> None:
+    """Copy a single uploaded file to SOFP outputs folder immediately"""
+    try:
+        # Find the latest SOFP outputs date folder
+        sofp_outputs_dir = OUTPUTS_DIR / "NBD_MF_01_SOFP_SOCI"
+        if not sofp_outputs_dir.exists():
+            _emit_log("SOFP outputs directory not found", important=True)
+            return
+            
+        # Find latest completed date
+        last_date, date_folder = find_latest_completed_date(sofp_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            _emit_log("No completed date folder found for SOFP", important=True)
+            return
+            
+        # Use the original filename (already renamed when stored)
+        new_name = Path(file_path).name
+            
+        # Remove existing files with same prefix
+        removed = 0
+        _emit_log(f"Scanning {date_folder} for existing files to remove for category: {category}", important=True)
+        
+        for f in date_folder.iterdir():
+            if f.is_file() and f.suffix.lower() == ".xlsx":
+                _emit_log(f"Found file: {f.name}", important=True)
+                should_remove = False
+                
+                if category == "ALCL Management Accounts" and f.name.startswith("ALCL Management Accounts"):
+                    should_remove = True
+                    _emit_log(f"Marking for removal (ALCL): {f.name}", important=True)
+                elif category == "Investment Schedule" and f.name.startswith("Investment Schedule"):
+                    should_remove = True
+                    _emit_log(f"Marking for removal (Investment): {f.name}", important=True)
+                elif category == "Loan Schedule" and f.name.startswith("Loan Schedule"):
+                    should_remove = True
+                    _emit_log(f"Marking for removal (Loan): {f.name}", important=True)
+                elif category == "Supporting Schedules" and f.name.startswith("Supporting Schedules"):
+                    should_remove = True
+                    _emit_log(f"Marking for removal (Supporting): {f.name}", important=True)
+                
+                if should_remove:
+                    try:
+                        f.unlink()
+                        removed += 1
+                        _emit_log(f"Successfully removed existing file: {f.name}", important=True)
+                    except Exception as e:
+                        _emit_log(f"ERROR: Failed to remove existing file {f.name}: {e}", important=True)
+        
+        if removed:
+            _emit_log(f"Removed {removed} existing {category} file(s) in {date_folder}", important=True)
+        
+        # Copy the file
+        dest_path = date_folder / new_name
+        shutil.copy2(file_path, dest_path)
+        _emit_log(f"Copied {category} file to {dest_path}", important=True)
+        
+    except Exception as e:
+        _emit_log(f"Failed to copy {category} file to SOFP outputs: {e}", important=True)
+
+
+def validate_sofp_file_for_ia(report_ids_with_dates: dict) -> tuple[bool, str]:
+    """Validate that SOFP file exists for the selected month before running IA"""
+    try:
+        # Get the selected date from the first report (they should all be the same)
+        if not report_ids_with_dates:
+            return False, "No report data found"
+            
+        first_report_id = list(report_ids_with_dates.keys())[0]
+        selected_date_str = report_ids_with_dates[first_report_id][0]  # Get the date string
+        
+        # Parse the selected date to get month and year
+        from datetime import datetime
+        try:
+            # Try different date formats
+            try:
+                selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d")  # YYYY-MM-DD format
+            except ValueError:
+                try:
+                    selected_date = datetime.strptime(selected_date_str, "%d/%m/%Y")  # DD/MM/YYYY format
+                except ValueError:
+                    try:
+                        selected_date = datetime.strptime(selected_date_str, "%m/%d/%Y")  # MM/DD/YYYY format
+                    except ValueError:
+                        return False, f"Invalid date format: {selected_date_str}"
+            
+            month_name = selected_date.strftime("%B")  # Full month name like "October"
+            year = selected_date.year
+        except Exception as e:
+            return False, f"Error parsing date: {e}"
+        
+        # Check if SOFP file exists in IA outputs using selected month and year
+        ia_outputs_dir = OUTPUTS_DIR / "NBD_MF_23_IA"
+        if not ia_outputs_dir.exists():
+            return False, f"IA outputs directory not found"
+            
+        # Find latest completed date folder
+        last_date, date_folder = find_latest_completed_date(ia_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            return False, f"No completed IA date folder found"
+        
+        # Look for the SOFP file with the expected name using selected month and year
+        expected_filename = f"NBD-MF-01-SOFP & SOCI AFL Monthly FS {month_name} {year}.xlsx"
+        sofp_file_path = date_folder / expected_filename
+
+        if not sofp_file_path.exists():
+            # Try to find any SOFP file for debugging
+            import glob
+            sofp_pattern = str(date_folder / "NBD-MF-01-SOFP & SOCI AFL Monthly FS*.xlsx")
+            found_files = glob.glob(sofp_pattern)
+            if found_files:
+                _emit_log(f"SOFP file exists but name doesn't match. Expected: '{expected_filename}', Found: {[Path(f).name for f in found_files]}", important=True)
+                return False, f"'{expected_filename}' file not available. Please run NBD-MF-01-SOFP-SOCI - Statement of Financial position first for {month_name} {year}."
+            else:
+                return False, f"'{expected_filename}' file not available. Please run NBD-MF-01-SOFP-SOCI - Statement of Financial position first for {month_name} {year}."
+
+        _emit_log(f"SOFP file validation passed for IA: {expected_filename} found", important=True)
+        return True, "SOFP file validation passed"
+        
+    except Exception as e:
+        return False, f"Error validating SOFP file for IA: {e}"
+
+
+def validate_ia_file_for_c1c2(report_ids_with_dates: dict) -> tuple[bool, str]:
+    """Validate that IA file exists for the selected month before running C1-C2"""
+    try:
+        # Get the selected date from the first report (they should all be the same)
+        if not report_ids_with_dates:
+            return False, "No report data found"
+            
+        first_report_id = list(report_ids_with_dates.keys())[0]
+        selected_date_str = report_ids_with_dates[first_report_id][0]  # Get the date string
+        
+        # Parse the selected date to get month and year
+        from datetime import datetime
+        try:
+            # Try different date formats
+            try:
+                selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d")  # YYYY-MM-DD format
+            except ValueError:
+                try:
+                    selected_date = datetime.strptime(selected_date_str, "%d/%m/%Y")  # DD/MM/YYYY format
+                except ValueError:
+                    try:
+                        selected_date = datetime.strptime(selected_date_str, "%m/%d/%Y")  # MM/DD/YYYY format
+                    except ValueError:
+                        return False, f"Invalid date format: {selected_date_str}"
+            
+            month_name = selected_date.strftime("%B")  # Full month name like "October"
+            year = selected_date.year
+        except Exception as e:
+            return False, f"Error parsing date: {e}"
+        
+        # Check if IA file exists in IA outputs using selected month and year
+        ia_outputs_dir = OUTPUTS_DIR / "NBD_MF_23_IA"
+        if not ia_outputs_dir.exists():
+            return False, f"IA outputs directory not found"
+            
+        # Find latest completed date folder
+        last_date, date_folder = find_latest_completed_date(ia_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            return False, f"No completed IA date folder found"
+        
+        # Look for the IA file with the expected name using selected month and year
+        expected_filename = f"Prod. wise Class. of Loans - {month_name} {year}.xlsb"
+        ia_file_path = date_folder / expected_filename
+        
+        if not ia_file_path.exists():
+            return False, f"Prod. wise Class. of Loans - {month_name} {year}.xlsb file not available, run NBD-MF-23-IA - Product wise Classification of Loans first for the {month_name} {year}."
+        
+        _emit_log(f"IA file validation passed for C1-C2: {expected_filename} found", important=True)
+        return True, "IA file validation passed"
+        
+    except Exception as e:
+        return False, f"Error validating IA file for C1-C2: {e}"
+
+
+def validate_set7_required_files(report_ids_with_dates: dict) -> tuple[bool, str]:
+    """Validate if required files exist for Set 7 reports (C2-C6)"""
+    try:
+        # Get the first report's date to determine month/year
+        first_report_id = next(iter(report_ids_with_dates.keys()))
+        date_data = report_ids_with_dates[first_report_id]
+        
+        # Handle both tuple format (date_str, month, year) and string format
+        if isinstance(date_data, tuple):
+            date_str = date_data[0]  # Extract date string from tuple
+        else:
+            date_str = date_data  # Use string directly
+        
+        # Parse the date to get month and year
+        try:
+            # Try YYYY-MM-DD format first
+            parsed_date = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            try:
+                # Try DD/MM/YYYY format
+                parsed_date = datetime.strptime(date_str, "%d/%m/%Y")
+            except ValueError:
+                # Try MM/DD/YYYY format
+                parsed_date = datetime.strptime(date_str, "%m/%d/%Y")
+        
+        month_name = parsed_date.strftime("%B")
+        year = parsed_date.year
+        
+        # Check if C1-C6 outputs directory exists
+        c1c6_outputs_dir = OUTPUTS_DIR / "NBD_MF_20_C1_C6"
+        if not c1c6_outputs_dir.exists():
+            return False, "C1-C6 outputs directory not found. Please run C1-C6 reports first."
+            
+        # Find latest completed date
+        last_date, date_folder = find_latest_completed_date(c1c6_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            return False, f"No completed C1-C6 date folder found. Please run C1-C6 reports first for {month_name} {year}."
+            
+        # Check for the IA file (Prod. wise Class. of Loans)
+        ia_filename = f"Prod. wise Class. of Loans - {month_name} {year}.xlsb"
+        ia_file_path = date_folder / ia_filename
+        
+        if not ia_file_path.exists():
+            return False, f"'{ia_filename}' file not available. Please run NBD-MF-23-IA - Product wise Classification of Loans first for {month_name} {year}."
+            
+        # Check for the SOFP file
+        sofp_filename = f"NBD-MF-01-SOFP & SOCI AFL Monthly FS {month_name} {year}.xlsx"
+        sofp_file_path = date_folder / sofp_filename
+        
+        if not sofp_file_path.exists():
+            return False, f"'{sofp_filename}' file not available. Please run NBD-MF-01-SOFP-SOCI - Statement of Financial position first for {month_name} {year}."
+            
+        return True, f"Set 7 validation passed: '{ia_filename}' and '{sofp_filename}' found"
+        
+    except Exception as e:
+        return False, f"Error validating Set 7 required files: {str(e)}"
+
+
+def validate_sofp_file_for_ga_is(report_ids_with_dates: dict) -> tuple[bool, str]:
+    """Validate that SOFP file exists for the selected month before running GA IS"""
+    try:
+        # Get the selected date from the first report (they should all be the same)
+        if not report_ids_with_dates:
+            return False, "No report data found"
+            
+        first_report_id = list(report_ids_with_dates.keys())[0]
+        selected_date_str = report_ids_with_dates[first_report_id][0]  # Get the date string
+        
+        # Parse the selected date to get month and year
+        from datetime import datetime
+        try:
+            # Try different date formats
+            try:
+                selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d")  # YYYY-MM-DD format
+            except ValueError:
+                try:
+                    selected_date = datetime.strptime(selected_date_str, "%d/%m/%Y")  # DD/MM/YYYY format
+                except ValueError:
+                    try:
+                        selected_date = datetime.strptime(selected_date_str, "%m/%d/%Y")  # MM/DD/YYYY format
+                    except ValueError:
+                        return False, f"Invalid date format: {selected_date_str}"
+            
+            month_name = selected_date.strftime("%B")  # July, August, etc.
+            year = selected_date.year
+        except Exception as e:
+            return False, f"Error parsing date: {e}"
+        
+        # Check if SOFP file exists in outputs using selected month and year
+        sofp_outputs_dir = OUTPUTS_DIR / "NBD-MF-10-GA & NBD-MF-11-IS"
+        if not sofp_outputs_dir.exists():
+            return False, f"SOFP outputs directory not found"
+            
+        # Find latest completed date folder
+        last_date, date_folder = find_latest_completed_date(sofp_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            return False, f"No completed SOFP date folder found"
+        
+        # Look for the SOFP file with the expected name using selected month and year
+        expected_filename = f"NBD-MF-01-SOFP & SOCI AFL Monthly FS {month_name} {year}.xlsx"
+        sofp_file_path = date_folder / expected_filename
+
+        if not sofp_file_path.exists():
+            # Try to find any SOFP file for debugging
+            import glob
+            sofp_pattern = str(date_folder / "NBD-MF-01-SOFP & SOCI AFL Monthly FS*.xlsx")
+            found_files = glob.glob(sofp_pattern)
+            if found_files:
+                _emit_log(f"SOFP file exists but name doesn't match. Expected: '{expected_filename}', Found: {[Path(f).name for f in found_files]}", important=True)
+                return False, f"'{expected_filename}' file not available. Please run NBD-MF-01-SOFP-SOCI - Statement of Financial position first for {month_name} {year}."
+            else:
+                return False, f"'{expected_filename}' file not available. Please run NBD-MF-01-SOFP-SOCI - Statement of Financial position first for {month_name} {year}."
+
+        _emit_log(f"SOFP file validation passed: {expected_filename} found", important=True)
+        return True, "SOFP file validation passed"
+        
+    except Exception as e:
+        return False, f"Error validating SOFP file: {e}"
+
+
+def cleanup_duplicate_ia_files() -> None:
+    """Clean up duplicate files in IA outputs folder, keeping only the latest ones"""
+    try:
+        # Find the latest IA outputs date folder
+        ia_outputs_dir = OUTPUTS_DIR / "NBD_MF_23_IA"
+        if not ia_outputs_dir.exists():
+            return
+            
+        # Find latest completed date
+        last_date, date_folder = find_latest_completed_date(ia_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            return
+            
+        _emit_log(f"Cleaning up duplicate files in {date_folder}", important=True)
+        
+        # Define categories to clean up
+        categories_to_clean = [
+            "Disbursement with Budget",
+            "Information Request from Credit", 
+            "Net Portfolio"
+        ]
+        
+        for category in categories_to_clean:
+            # Find all files with this prefix
+            matching_files = []
+            for f in date_folder.iterdir():
+                if f.is_file() and f.suffix.lower() == ".xlsx" and f.name.startswith(category):
+                    matching_files.append(f)
+            
+            if len(matching_files) > 1:
+                _emit_log(f"Found {len(matching_files)} files for {category}, keeping only the latest", important=True)
+                
+                # Sort by modification time (newest first)
+                matching_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                
+                # Keep the newest file, remove the rest
+                for i, file_path in enumerate(matching_files):
+                    if i == 0:
+                        _emit_log(f"Keeping latest file: {file_path.name}", important=True)
+                    else:
+                        try:
+                            _emit_log(f"Removing older file: {file_path.name}", important=True)
+                            file_path.unlink()
+                        except Exception as e:
+                            _emit_log(f"ERROR: Failed to remove {file_path.name}: {e}", important=True)
+            elif len(matching_files) == 1:
+                _emit_log(f"Only one file found for {category}: {matching_files[0].name}", important=True)
+            else:
+                _emit_log(f"No files found for {category}", important=True)
+                
+    except Exception as e:
+        _emit_log(f"Error cleaning up duplicate IA files: {e}", important=True)
+
+
+def get_full_month_name(month_abbr: str) -> str:
+    """Convert month abbreviation to full month name"""
+    month_mapping = {
+        'Jan': 'January', 'Feb': 'February', 'Mar': 'March', 'Apr': 'April',
+        'May': 'May', 'Jun': 'June', 'Jul': 'July', 'Aug': 'August',
+        'Sep': 'September', 'Oct': 'October', 'Nov': 'November', 'Dec': 'December',
+        'January': 'January', 'February': 'February', 'March': 'March', 'April': 'April',
+        'May': 'May', 'June': 'June', 'July': 'July', 'August': 'August',
+        'September': 'September', 'October': 'October', 'November': 'November', 'December': 'December'
+    }
+    return month_mapping.get(month_abbr, month_abbr)
+
+
+def copy_uploaded_files_to_ia_outputs(uploaded_files: dict, months: dict, years: dict) -> None:
+    """Copy uploaded files to IA outputs folder after renaming"""
+    try:
+        # Find the latest IA outputs date folder
+        ia_outputs_dir = OUTPUTS_DIR / "NBD_MF_23_IA"
+        if not ia_outputs_dir.exists():
+            _emit_log("IA outputs directory not found", important=True)
+            return
+            
+        # Find latest completed date
+        last_date, date_folder = find_latest_completed_date(ia_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            _emit_log("No completed date folder found for IA", important=True)
+            return
+            
+        # Process each uploaded file
+        for category, file_path in uploaded_files.items():
+            if not file_path or not Path(file_path).exists():
+                continue
+                
+            # Get the month and year for this category
+            month_field = f"{category.lower().replace(' ', '_')}_month"
+            year_field = f"{category.lower().replace(' ', '_')}_year"
+            month = months.get(month_field, "")
+            year = years.get(year_field, "")
+            
+            # For file removal, we don't need month/year - just remove files with matching prefix
+            # But we still need month/year for the actual file processing
+            if not month or not year:
+                _emit_log(f"No month/year specified for {category}, skipping file processing", important=True)
+                # Don't continue - we still want to remove old files even if month/year are missing
+                
+            # Use the original filename (already renamed when stored)
+            new_name = Path(file_path).name
+                
+            # Only copy the file if month and year are available
+            if month and year:
+                dest_path = date_folder / new_name
+                shutil.copy2(file_path, dest_path)
+                _emit_log(f"Copied {category} file to {dest_path}", important=True)
+                
+                # AFTER copying, remove ALL OLD files with same prefix (excluding the one we just copied)
+                removed = 0
+                _emit_log(f"Scanning {date_folder} for OLD files to remove for category: {category}", important=True)
+
+                # Determine the prefix to match based on category
+                prefix_to_remove = None
+                if category == "Disbursement with Budget":
+                    prefix_to_remove = "Disbursement with Budget"
+                elif category == "Information Request from Credit":
+                    prefix_to_remove = "Information Request from Credit"
+                elif category == "Net Portfolio":
+                    prefix_to_remove = "Net Portfolio"
+
+                if prefix_to_remove:
+                    for f in date_folder.iterdir():
+                        if f.is_file() and f.suffix.lower() == ".xlsx":
+                            _emit_log(f"Found xlsx file: {f.name}", important=True)
+                            if f.name.startswith(prefix_to_remove) and f.name != new_name:
+                                try:
+                                    _emit_log(f"Removing OLD file: {f.name} (keeping latest: {new_name})", important=True)
+                                    f.unlink()
+                                    removed += 1
+                                except Exception as e:
+                                    _emit_log(f"ERROR: Failed to remove OLD file {f.name}: {e}", important=True)
+                            elif f.name.startswith(prefix_to_remove) and f.name == new_name:
+                                _emit_log(f"Keeping latest file: {f.name}", important=True)
+                            else:
+                                _emit_log(f"File does not match prefix '{prefix_to_remove}': {f.name}", important=True)
+
+                    if removed:
+                        _emit_log(f"Removed {removed} OLD {category} file(s) in {date_folder}, kept latest: {new_name}", important=True)
+                    else:
+                        _emit_log(f"No OLD {category} files found to remove, latest file: {new_name}", important=True)
+            else:
+                _emit_log(f"Skipped copying {category} file due to missing month/year", important=True)
+            
+    except Exception as e:
+        _emit_log(f"Failed to copy uploaded files to IA outputs: {e}", important=True)
+
+
+def cleanup_duplicate_c1c2_files() -> None:
+    """Clean up duplicate files in C1-C2 outputs folder, keeping only the latest ones"""
+    try:
+        # Find the latest IA outputs date folder (C1-C2 uses IA outputs)
+        ia_outputs_dir = OUTPUTS_DIR / "NBD_MF_23_IA"
+        if not ia_outputs_dir.exists():
+            return
+            
+        # Find latest completed date
+        last_date, date_folder = find_latest_completed_date(ia_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            return
+            
+        _emit_log(f"Cleaning up duplicate C1-C2 files in {date_folder}", important=True)
+        
+        # Define categories to clean up
+        categories_to_clean = [
+            "Cadre",
+            "Unutilized Amount"
+        ]
+        
+        for category in categories_to_clean:
+            # Find all files with this prefix
+            matching_files = []
+            for f in date_folder.iterdir():
+                if f.is_file() and f.suffix.lower() == ".xlsx" and f.name.startswith(category):
+                    matching_files.append(f)
+            
+            if len(matching_files) > 1:
+                _emit_log(f"Found {len(matching_files)} files for {category}, keeping only the latest", important=True)
+                
+                # Sort by modification time (newest first)
+                matching_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                
+                # Keep the newest file, remove the rest
+                for i, file_path in enumerate(matching_files):
+                    if i == 0:
+                        _emit_log(f"Keeping latest file: {file_path.name}", important=True)
+                    else:
+                        try:
+                            _emit_log(f"Removing older file: {file_path.name}", important=True)
+                            file_path.unlink()
+                        except Exception as e:
+                            _emit_log(f"ERROR: Failed to remove {file_path.name}: {e}", important=True)
+            elif len(matching_files) == 1:
+                _emit_log(f"Only one file found for {category}: {matching_files[0].name}", important=True)
+            else:
+                _emit_log(f"No files found for {category}", important=True)
+                
+    except Exception as e:
+        _emit_log(f"Error cleaning up duplicate C1-C2 files: {e}", important=True)
+
+
+def copy_uploaded_files_to_c1c2_outputs(uploaded_files: dict, dates: dict, months: dict, years: dict) -> None:
+    """Copy uploaded files to C1-C2 outputs folder after renaming"""
+    try:
+        # Find the latest IA outputs date folder (C1-C2 uses IA outputs)
+        ia_outputs_dir = OUTPUTS_DIR / "NBD_MF_23_IA"
+        if not ia_outputs_dir.exists():
+            _emit_log("IA outputs directory not found", important=True)
+            return
+            
+        # Find latest completed date
+        last_date, date_folder = find_latest_completed_date(ia_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            _emit_log("No completed date folder found for IA", important=True)
+            return
+            
+        # Process each uploaded file
+        for category, file_path in uploaded_files.items():
+            if not file_path or not Path(file_path).exists():
+                continue
+                
+            # Get the date/month/year for this category
+            if category == "Cadre":
+                date_field = f"{category.lower().replace(' ', '_')}_date"
+                date_value = dates.get(date_field, "")
+                if not date_value:
+                    _emit_log(f"No date specified for {category}, skipping", important=True)
+                    continue
+            else:
+                month_field = f"{category.lower().replace(' ', '_')}_month"
+                year_field = f"{category.lower().replace(' ', '_')}_year"
+                month = months.get(month_field, "")
+                year = years.get(year_field, "")
+                if not month or not year:
+                    _emit_log(f"No month/year specified for {category}, skipping", important=True)
+                    continue
+                
+            # Use the original filename (already renamed when stored)
+            new_name = Path(file_path).name
+                
+            # Remove ALL existing files with same prefix (regardless of date/month/year)
+            removed = 0
+            _emit_log(f"Scanning {date_folder} for existing files to remove for category: {category}", important=True)
+
+            # Determine the prefix to match based on category
+            prefix_to_remove = None
+            if category == "Cadre":
+                prefix_to_remove = "Cadre"
+            elif category == "Unutilized Amount":
+                prefix_to_remove = "Unutilized Amount"
+
+            if prefix_to_remove:
+                for f in date_folder.iterdir():
+                    if f.is_file() and f.suffix.lower() == ".xlsx":
+                        _emit_log(f"Found xlsx file: {f.name}", important=True)
+                        if f.name.startswith(prefix_to_remove):
+                            try:
+                                _emit_log(f"Removing old file: {f.name}", important=True)
+                                f.unlink()
+                                removed += 1
+                            except Exception as e:
+                                _emit_log(f"ERROR: Failed to remove existing file {f.name}: {e}", important=True)
+                        else:
+                            _emit_log(f"File does not match prefix '{prefix_to_remove}': {f.name}", important=True)
+
+                if removed:
+                    _emit_log(f"Removed {removed} existing {category} file(s) in {date_folder}", important=True)
+                else:
+                    _emit_log(f"No old {category} files found to remove", important=True)
+            
+            # Copy the file
+            dest_path = date_folder / new_name
+            shutil.copy2(file_path, dest_path)
+            _emit_log(f"Copied {category} file to {dest_path}", important=True)
+            
+    except Exception as e:
+        _emit_log(f"Failed to copy uploaded files to C1-C2 outputs: {e}", important=True)
+
+
+def copy_uploaded_files_to_ga_is_outputs(uploaded_files: dict, dates: dict) -> None:
+    """Copy uploaded files to GA IS outputs folder after renaming"""
+    try:
+        # Find the latest GA IS outputs date folder
+        ga_is_outputs_dir = OUTPUTS_DIR / "NBD-MF-10-GA & NBD-MF-11-IS"
+        if not ga_is_outputs_dir.exists():
+            _emit_log("GA IS outputs directory not found", important=True)
+            return
+            
+        # Find latest completed date
+        last_date, date_folder = find_latest_completed_date(ga_is_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            _emit_log("No completed date folder found for GA IS", important=True)
+            return
+            
+        # Process each uploaded file
+        for category, file_path in uploaded_files.items():
+            if not file_path or not Path(file_path).exists():
+                continue
+                
+            # Use the original filename (already renamed when stored)
+            new_name = Path(file_path).name
+                
+            # Remove existing files with same prefix
+            removed = 0
+            _emit_log(f"Scanning {date_folder} for existing files to remove for category: {category}", important=True)
+            
+            for f in date_folder.iterdir():
+                if f.is_file() and f.suffix.lower() in [".xlsm", ".xlsx"]:
+                    _emit_log(f"Found file: {f.name}", important=True)
+                    should_remove = False
+                    
+                    if category == "Borrowing report" and f.name.startswith("Borrowing report"):
+                        should_remove = True
+                        _emit_log(f"Marking for removal (Borrowing report): {f.name}", important=True)
+                    
+                    if should_remove:
+                        try:
+                            f.unlink()
+                            removed += 1
+                            _emit_log(f"Successfully removed existing file: {f.name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"ERROR: Failed to remove existing file {f.name}: {e}", important=True)
+            
+            if removed:
+                _emit_log(f"Removed {removed} existing {category} file(s) in {date_folder}", important=True)
+            
+            # Copy the file
+            dest_path = date_folder / new_name
+            shutil.copy2(file_path, dest_path)
+            _emit_log(f"Copied {category} file to {dest_path}", important=True)
+            
+    except Exception as e:
+        _emit_log(f"Failed to copy uploaded files to GA IS outputs: {e}", important=True)
+
+
+def copy_uploaded_files_to_sofp_outputs(uploaded_files: dict, months: dict) -> None:
+    """Copy uploaded files to SOFP outputs folder after renaming"""
+    try:
+        # Find the latest SOFP outputs date folder
+        sofp_outputs_dir = OUTPUTS_DIR / "NBD_MF_01_SOFP_SOCI"
+        if not sofp_outputs_dir.exists():
+            _emit_log("SOFP outputs directory not found", important=True)
+            return
+            
+        # Find latest completed date
+        last_date, date_folder = find_latest_completed_date(sofp_outputs_dir)
+        if not date_folder or not date_folder.exists():
+            _emit_log("No completed date folder found for SOFP", important=True)
+            return
+            
+        # Process each uploaded file
+        for category, file_path in uploaded_files.items():
+            if not file_path or not Path(file_path).exists():
+                continue
+                
+            # Get the month for this category
+            month_field = f"{category.lower().replace(' ', '_')}_month"
+            month = months.get(month_field, "")
+            if not month:
+                _emit_log(f"No month specified for {category}, skipping", important=True)
+                continue
+                
+            # Use the original filename (already renamed when stored)
+            new_name = Path(file_path).name
+                
+            # Remove existing files with same prefix
+            removed = 0
+            _emit_log(f"Scanning {date_folder} for existing files to remove for category: {category}", important=True)
+            
+            for f in date_folder.iterdir():
+                if f.is_file() and f.suffix.lower() == ".xlsx":
+                    _emit_log(f"Found file: {f.name}", important=True)
+                    should_remove = False
+                    
+                    if category == "ALCL Management Accounts" and f.name.startswith("ALCL Management Accounts"):
+                        should_remove = True
+                        _emit_log(f"Marking for removal (ALCL): {f.name}", important=True)
+                    elif category == "Investment Schedule" and f.name.startswith("Investment Schedule"):
+                        should_remove = True
+                        _emit_log(f"Marking for removal (Investment): {f.name}", important=True)
+                    elif category == "Loan Schedule" and f.name.startswith("Loan Schedule"):
+                        should_remove = True
+                        _emit_log(f"Marking for removal (Loan): {f.name}", important=True)
+                    elif category == "Supporting Schedules" and f.name.startswith("Supporting Schedules"):
+                        should_remove = True
+                        _emit_log(f"Marking for removal (Supporting): {f.name}", important=True)
+                    
+                    if should_remove:
+                        try:
+                            f.unlink()
+                            removed += 1
+                            _emit_log(f"Successfully removed existing file: {f.name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"ERROR: Failed to remove existing file {f.name}: {e}", important=True)
+            
+            if removed:
+                _emit_log(f"Removed {removed} existing {category} file(s) in {date_folder}", important=True)
+            
+            # Copy the file
+            dest_path = date_folder / new_name
+            shutil.copy2(file_path, dest_path)
+            _emit_log(f"Copied {category} file to {dest_path}", important=True)
+            
+    except Exception as e:
+        _emit_log(f"Failed to copy uploaded files to SOFP outputs: {e}", important=True)
+
+
+def copy_working_to_outputs_with_versioning(report_ids_with_dates: dict) -> None:
+    """Copy working folders to outputs with proper versioning after completion."""
+    for report_id in report_ids_with_dates:
+        if report_id not in ("NBD-MF-01-SOFP-SOCI", "NBD-MF-23-IA"):
+            continue
+            
+        date_str, _, _ = report_ids_with_dates[report_id]
+        folder_name = REPORT_STRUCTURE[report_id]["folder"]
+        
+        # Get working folder
+        working_report_dir = WORKING_DIR / folder_name
+        if not working_report_dir.exists():
+            _emit_log(f"Working folder not found: {working_report_dir}", important=True)
+            continue
+            
+        # Find the date folder in working
+        date_folders = [p for p in working_report_dir.iterdir() if p.is_dir()]
+        if len(date_folders) != 1:
+            _emit_log(f"Expected one date folder in {working_report_dir}, found {len(date_folders)}", important=True)
+            continue
+            
+        source_folder = date_folders[0]
+        target_date_name = format_date_folder_name(date_str)
+        
+        # Create output report directory
+        output_report_dir = OUTPUTS_DIR / folder_name
+        output_report_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Check if target date folder exists and find next version
+        target_path = output_report_dir / target_date_name
+        if target_path.exists():
+            version = 1
+            while (output_report_dir / f"{target_date_name}({version})").exists():
+                version += 1
+            target_path = output_report_dir / f"{target_date_name}({version})"
+        
+        try:
+            shutil.copytree(source_folder, target_path)
+            _emit_log(f"Copied {source_folder} to {target_path}", important=True)
+        except Exception as e:
+            _emit_log(f"Failed to copy {source_folder} to {target_path}: {e}", important=True)
+
+
+def auto_download_files() -> None:
+    """Automatically prepare and download files after successful completion."""
+    global _download_files
+
+    if not _download_files:
+        _emit_log("No files in _download_files to prepare for download", important=True)
+        return
+    
+    # Filter out non-existent files
+    existing_files = [f for f in _download_files if f.exists() and f.is_file()]
+    
+    if not existing_files:
+        _emit_log("No existing files found in _download_files", important=True)
+        return
+    
+    # If only one file, keep it as-is for direct download
+    if len(existing_files) == 1:
+        _download_files = existing_files
+        _emit_log(f"Single file ready for download: {existing_files[0].name}", important=True)
+        return
+    
+    # Multiple files - create zip
+    temp_zip_dir = BASE_DIR / "temp_zips"
+    temp_zip_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_path = temp_zip_dir / f"reports_{timestamp}.zip"
+
+    try:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            files_added = 0
+            
+            for file_path in existing_files:
+                arcname = f"output_files/{file_path.name}"
+                zipf.write(file_path, arcname=arcname)
+                files_added += 1
+                _emit_log(f"Added to zip: {arcname}", important=False)
+
+            _emit_log(f"Created zip with {files_added} files", important=True)
+
+        if files_added > 0:
+            # Store the zip path for potential download
+            _download_files = [zip_path]
+            _emit_log(f"Files prepared for download: {zip_path}", important=True)
+        else:
+            _emit_log("No files found to download", important=True)
+
+    except Exception as e:
+        _emit_log(f"Failed to prepare files for download: {e}", important=True)
+
+
+def copy_folder_from_outputs_to_working(source_report_id: str, dest_report_id: str) -> tuple[bool, str, Path | None]:
+    """
+    Copy the latest completed date folder from outputs/source to working/dest.
+    For NBD-MF-23-IA, source is NBD_MF_23_C4.
+    """
+    if source_report_id not in REPORT_STRUCTURE or dest_report_id not in REPORT_STRUCTURE:
+        return False, f"Unknown report: {source_report_id} or {dest_report_id}", None
+    
+    source_folder_name = REPORT_STRUCTURE[source_report_id]["folder"]
+    dest_folder_name = REPORT_STRUCTURE[dest_report_id]["folder"]
+    
+    source_dir = OUTPUTS_DIR / source_folder_name
+    dest_report_dir = WORKING_DIR / dest_folder_name
+    
+    if not source_dir.exists():
+        return False, f"Source folder not found: {source_dir}", None
+    
+    # Find latest completed date
+    last_date, date_folder = find_latest_completed_date(source_dir)
+    
+    if not date_folder or not date_folder.exists():
+        return False, f"No completed date folder found in: {source_dir}", None
+    
+    # Create working report directory
+    dest_report_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Remove existing date folders in working
+    for child in dest_report_dir.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+    
+    # Copy latest folder to working
+    dest_path = dest_report_dir / date_folder.name
+    try:
+        shutil.copytree(date_folder, dest_path)
+        _emit_log(f"Copied {date_folder} to {dest_path}", important=True)
+        return True, f"Copied {date_folder.name}", dest_path
+    except Exception as e:
+        return False, f"Failed to copy: {e}", None
+
+
+def copy_folder_to_working(report_id: str) -> tuple[bool, str, Path | None]:
+    """Copy latest completed date folder from outputs/<folder> to working/<folder>.
+
+    For this app, the authoritative latest date comes from completed_dates.txt in the
+    corresponding outputs/<folder>. We find the last line, locate the matching date
+    folder (including version suffix), clear existing subfolders in working/<folder>,
+    then copy that folder in full.
+    """
+    if report_id not in REPORT_STRUCTURE:
+        return False, f"Unknown report: {report_id}", None
+
+    folder_name = REPORT_STRUCTURE[report_id]["folder"]
+    # Special-case GA & IS SET8: outputs folder uses ampersand name; working uses underscore name
+    if report_id == "NBD-MF-10-GA-11-IS-SET8":
+        source_report_dir = OUTPUTS_DIR / "NBD-MF-10-GA & NBD-MF-11-IS"
+        dest_report_dir = WORKING_DIR / "NBD_MF_10_GA_NBD_MF_11_IS"
+    else:
+        source_report_dir = OUTPUTS_DIR / folder_name
+        dest_report_dir = WORKING_DIR / folder_name
+    
+    if not source_report_dir.exists():
+        return False, f"Report folder not found: {source_report_dir}", None
+    
+    # Find latest completed date from completed_dates.txt
+    last_date, date_folder = find_latest_completed_date(source_report_dir)
+    if last_date is None:
+        return False, f"No completed_dates.txt or last date in: {source_report_dir}", None
+    if not date_folder or not date_folder.exists():
+        return False, f"Date folder not found for: {last_date.strftime('%d-%m-%Y')} under {source_report_dir}", None
+    
+    dest_report_dir.mkdir(parents=True, exist_ok=True)
+
+    # Preserve CBSL Provision Comparison files ONLY for IA (not for GA/IS or other reports)
+    # These files are created by GA/IS and should persist in IA folder across C1-C2 runs
+    # But GA/IS process should manage its own CBSL files independently
+    cbsl_files_to_preserve = []
+    if report_id == "NBD-MF-23-IA":
+        for child in list(dest_report_dir.iterdir()):
+            if child.is_dir():
+                try:
+                    for f in child.rglob("CBSL Provision Comparison*.xlsb"):
+                        # Save file to temp location
+                        temp_path = dest_report_dir / f.name
+                        shutil.copy2(f, temp_path)
+                        cbsl_files_to_preserve.append(temp_path)
+                        _emit_log(f"Preserving CBSL file for IA: {f.name}", important=True)
+                except Exception as e:
+                    _emit_log(f"Warning: Failed to preserve CBSL files: {e}", important=True)
+
+    # Remove existing subfolders before copying
+    for child in list(dest_report_dir.iterdir()):
+        if child.is_dir():
+            try:
+                _emit_log(f"Removing existing folder: {child}", important=True)
+                shutil.rmtree(child)
+                _emit_log(f"Successfully removed: {child.name}", important=True)
+            except PermissionError as e:
+                _emit_log(f"Permission error removing {child}: {e}. Trying to handle locked files...", important=True)
+                # Try to handle locked files by using onerror callback
+                def handle_remove_error(func, path, exc_info):
+                    """Error handler for shutil.rmtree - tries to unlock and remove files"""
+                    import stat
+                    import time
+                    try:
+                        # Try to change permissions and remove
+                        os.chmod(path, stat.S_IWRITE)
+                        time.sleep(0.1)  # Brief pause
+                        func(path)
+                    except Exception:
+                        # If still fails, skip this file
+                        _emit_log(f"Cannot remove locked file: {path}", important=True)
+
+                try:
+                    shutil.rmtree(child, onerror=handle_remove_error)
+                    _emit_log(f"Successfully removed {child.name} with error handling", important=True)
+                except Exception as e2:
+                    _emit_log(f"Still cannot remove {child.name}: {e2}. Attempting force delete...", important=True)
+                    # Last resort - try Windows robocopy to mirror an empty directory
+                    import subprocess
+                    import tempfile
+                    try:
+                        # Create a temporary empty directory
+                        with tempfile.TemporaryDirectory() as empty_dir:
+                            # Use robocopy to mirror empty dir over the target (effectively deleting it)
+                            subprocess.run(
+                                ["robocopy", empty_dir, str(child), "/MIR", "/R:0", "/W:0"],
+                                capture_output=True,
+                                timeout=30
+                            )
+                            # robocopy returns 0-7 for success, > 7 for failure
+                            # Now try to remove the directory
+                            time.sleep(0.5)
+                            if child.exists():
+                                shutil.rmtree(child, ignore_errors=True)
+
+                        if not child.exists():
+                            _emit_log(f"Force deleted {child.name} using robocopy", important=True)
+                        else:
+                            _emit_log(f"WARNING: Could not fully remove {child.name}, but continuing...", important=True)
+                    except Exception as e3:
+                        _emit_log(f"Force delete also failed: {e3}. Continuing anyway...", important=True)
+            except Exception as e:
+                _emit_log(f"Unexpected error removing {child}: {e}", important=True)
+                return False, f"Cannot remove existing folder {child.name}: {e}", None
+
+    dest_path = dest_report_dir / date_folder.name
+
+    # Final check - if destination exists, try one more time to remove it
+    if dest_path.exists():
+        _emit_log(f"Destination still exists after cleanup, attempting final removal: {dest_path}", important=True)
+        try:
+            import time
+            time.sleep(1)  # Wait for any file handles to close
+            shutil.rmtree(dest_path, ignore_errors=True)
+            if dest_path.exists():
+                _emit_log(f"WARNING: Could not remove destination, will try dirs_exist_ok=True", important=True)
+        except Exception as e:
+            _emit_log(f"Final removal attempt failed: {e}", important=True)
+
+    try:
+        # Try to copy with dirs_exist_ok=True to handle any remaining files
+        if dest_path.exists():
+            shutil.copytree(date_folder, dest_path, dirs_exist_ok=True)
+            _emit_log(f"Copied {date_folder} to {dest_path} (with dirs_exist_ok=True)", important=True)
+        else:
+            shutil.copytree(date_folder, dest_path)
+            _emit_log(f"Copied {date_folder} to {dest_path}", important=True)
+
+        # Restore preserved CBSL files to the new date folder
+        for cbsl_file in cbsl_files_to_preserve:
+            try:
+                restored_path = dest_path / cbsl_file.name
+                shutil.move(str(cbsl_file), str(restored_path))
+                _emit_log(f"Restored CBSL file: {cbsl_file.name}", important=True)
+            except Exception as e:
+                _emit_log(f"Warning: Failed to restore CBSL file {cbsl_file.name}: {e}", important=True)
+                # Clean up temp file if move failed
+                try:
+                    cbsl_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        return True, f"Copied {date_folder.name}", dest_path
+    except Exception as e:
+        # Clean up preserved files if copy failed
+        for cbsl_file in cbsl_files_to_preserve:
+            try:
+                cbsl_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return False, f"Failed to copy: {e}", None
+
+
+def run_report_script(report_id: str, date_str: str, report_month: str, report_year: str) -> tuple[bool, str]:
+    """Run a single report script."""
+    if report_id not in REPORT_STRUCTURE:
+        return False, f"Unknown report: {report_id}"
+
+    script_name = REPORT_STRUCTURE[report_id]["script"]
+    folder_name = REPORT_STRUCTURE[report_id]["folder"]
+    script_path = REPORT_AUTOMATIONS_DIR / script_name
+
+    if not script_path.exists():
+        msg = f"Script not found: {script_path}"
+        _emit_log(msg, important=True)
+        return False, msg
+
+    # Determine working directory. For C1/C2, reuse IA's date folder.
+    if report_id in ("NBD-MF-23-C1", "NBD-MF-23-C2", "NBD-MF-23-C1-C2"):
+        ia_folder_name = REPORT_STRUCTURE["NBD-MF-23-IA"]["folder"]
+        ia_working_dir = WORKING_DIR / ia_folder_name
+
+        # For C1-C2 only mode: Use IA outputs directly if working folder doesn't exist
+        if not ia_working_dir.exists():
+            _emit_log(f"Working directory not found for {report_id}, checking IA outputs", important=True)
+            ia_outputs_dir = OUTPUTS_DIR / "NBD_MF_23_IA"
+            if not ia_outputs_dir.exists():
+                return False, f"Neither working nor outputs directory found for IA"
+            # Find latest completed date folder in outputs
+            from pathlib import Path
+            date_folders = [p for p in ia_outputs_dir.iterdir() if p.is_dir() and not p.name.startswith('.')]
+            if not date_folders:
+                return False, f"No date folders found in IA outputs"
+            # Get the most recent folder
+            latest_folder = max(date_folders, key=lambda x: x.stat().st_mtime)
+            working_dir = latest_folder
+            _emit_log(f"Using IA outputs folder: {working_dir}", important=True)
+        else:
+            ia_date_folders = [p for p in ia_working_dir.iterdir() if p.is_dir()]
+            if len(ia_date_folders) != 1:
+                return False, f"Expected exactly one date folder in {ia_working_dir}, found {len(ia_date_folders)}"
+            working_dir = ia_date_folders[0]
+    elif report_id == "NBD-MF-10-GA-11-IS-SET8":
+        # Special case for GA & IS SET8: working folder uses underscore name
+        working_report_dir = WORKING_DIR / "NBD_MF_10_GA_NBD_MF_11_IS"
+        if not working_report_dir.exists():
+            return False, f"Working directory not found: {working_report_dir}"
+        date_folders = [p for p in working_report_dir.iterdir() if p.is_dir()]
+        if len(date_folders) != 1:
+            return False, f"Expected exactly one date folder in {working_report_dir}, found {len(date_folders)}"
+        working_dir = date_folders[0]
+    else:
+        working_report_dir = WORKING_DIR / folder_name
+        if not working_report_dir.exists():
+            return False, f"Working directory not found: {working_report_dir}"
+        date_folders = [p for p in working_report_dir.iterdir() if p.is_dir()]
+        if len(date_folders) != 1:
+            return False, f"Expected exactly one date folder in {working_report_dir}, found {len(date_folders)}"
+        working_dir = date_folders[0]
+
+    _emit_log(f"Starting {report_id}: {REPORT_STRUCTURE[report_id]['name']}", important=True)
+    _set_report_status(report_id, "running")
+
+    # Build command according to script-specific CLI expectations
+    ui_date = None
+    # Convert UI date to the formats scripts expect
+    try:
+        ui_dt = datetime.strptime(date_str, "%Y-%m-%d")
+    except Exception:
+        try:
+            ui_dt = datetime.strptime(date_str, "%d-%m-%Y")
+        except Exception:
+            ui_dt = None
+    ui_date_mmddyyyy = ui_dt.strftime("%m/%d/%Y") if ui_dt else date_str
+
+    if script_name == "NBD_MF_01_SOFP_SOCI.py":
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--date", ui_date_mmddyyyy,
+        ]
+    elif script_name == "NBD_MF_23_IA.py":
+        cmd = [
+            sys.executable,
+            str(script_path),
+            ui_date_mmddyyyy,
+        ]
+    elif script_name == "NBD_MF_23_C1C2.py":
+        cmd = [
+            sys.executable,
+            str(script_path),
+        ]
+    elif script_name == "NBD_MF_20_C3.py":
+        # C3 now works like C4 - auto-discovers files from working directory
+        # Pass the parent NBD_MF_20_C1_C6 folder, not the dated folder
+        base_working_dir = working_dir.parent if working_dir.name != "NBD_MF_20_C1_C6" else working_dir
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--working-dir", str(base_working_dir),
+        ]
+        if report_month and report_year:
+            cmd.extend(["--month", report_month, "--year", report_year])
+    elif script_name == "NBD_MF_10_GA_NBD_MF_11_IS.py":
+        # GA & IS script expects --working-dir parameter
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--working-dir", str(working_dir),
+        ]
+    elif script_name == "NBD_QF_23_C8.py":
+        # C8 script expects date in MM/DD/YYYY format
+        cmd = [
+            sys.executable,
+            str(script_path),
+            ui_date_mmddyyyy,
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--month", report_month,
+            "--year", report_year,
+        ]
+
+    log_file = _run_log_dir / f"{report_id}.log"
+
+    try:
+        _emit_log(f"Running: {' '.join(cmd)} (cwd={working_dir})", important=True)
+
         env = os.environ.copy()
-        if script_name in ["NBD_MF_20_C4.py", "NBD_MF_20_C6.py", "NBD_MF_20_C5.py", "NBD_MF_20_C2.py", "NBD_MF_20_C3_report.py"]:
-            # Ensure Python can find the script and any dependencies
-            env["PYTHONPATH"] = str(REPORT_AUTOMATIONS_DIR)
-        
+        env["PYTHONIOENCODING"] = "utf-8"
+
         with subprocess.Popen(
             cmd,
-            cwd=run_cwd,
+            cwd=str(working_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding='utf-8',
-            errors='replace',  # Replace undecodable characters instead of crashing
+            errors='replace',
             bufsize=1,
             env=env,
         ) as proc:
-            # Track individual process and global stop requests
-            global _current_proc, _stop_requested, _running_processes
-            report_name = Path(script_name).stem
-            
             with _proc_lock:
-                _current_proc = proc
-                _running_processes[report_name] = proc
-            
-            assert proc.stdout is not None
-            # Open individual script log file
-            with open(script_log_file, 'w', encoding='utf-8') as script_log:
+                _running_processes[report_id] = proc
+
+            with open(log_file, 'w', encoding='utf-8') as lf:
                 for line in proc.stdout:
-                    # Check for individual script stop or global stop
-                    if _stop_requested or report_name not in _running_processes:
-                        break
-                    raw = line.rstrip()
-                    
-                    # Write to individual script log file
-                    script_log.write(raw + '\n')
-                    script_log.flush()
-
-                    # Skip verbose report output from web_run.log (already in individual log)
-                    _emit_log(raw, important=False, skip_web_log=True)
-                    # Check for log file creation
-                    _detect_log_file_creation(raw)
-                    # Append compact message to the per-report feed (lightly filtered)
-                    _append_report_message(report_name, raw[:500])
-            
-            # Clean up process tracking
-            with _proc_lock:
-                # Check if script was stopped BEFORE removing from running processes
-                was_stopped = _stop_requested or report_name not in _running_processes
-                if report_name in _running_processes:
-                    del _running_processes[report_name]
-                if was_stopped:
-                    try:
+                    if _stop_requested:
                         proc.terminate()
-                    except Exception:
-                        pass
-                ret = proc.wait()
-                _current_proc = None
-                
-    except Exception as exc:
-        _emit_log(f"Failed to start {script_name}: {exc}", important=True)
-        _set_report_status(script_name, "failed")
-        return False, f"Failed to start {script_name}: {exc}"
+                        _set_report_status(report_id, "stopped")
+                        return False, "Stopped by user"
 
-    # Check if script was stopped vs failed
-    if was_stopped:
-        _emit_log(f"Script {script_name} stopped by user", important=True)
-        _set_report_status(script_name, "stopped")
-        return False, f"Script {script_name} stopped by user"
-    elif ret != 0:
-        _emit_log(f"Script {script_name} failed with exit code {ret}", important=True)
-        _set_report_status(script_name, "failed")
-        return False, f"Script {script_name} failed with exit code {ret}"
+                    raw = line.rstrip()
+                    lf.write(raw + '\n')
+                    lf.flush()
+                    _emit_log(raw, important=False)
+                    _append_report_message(report_id, raw)
 
-    _set_report_status(script_name, "completed")
-    return True, f"Script {script_name} completed successfully"
-
-
-def _run_download_bot(date_folder: Path) -> tuple[bool, str]:
-    """Run the Selenium download bot before automations to fetch latest source files."""
-    try:
-        bot_path = BASE_DIR / "bots" / "report_download_bot_IA_C1C2.py"
-        if not bot_path.exists():
-            _emit_log(f"Download bot not found: {bot_path}", important=True)
-            return False, f"Bot not found: {bot_path}"
-
-        cmd = [
-            sys.executable,
-            str(bot_path),
-        ]
-        run_cwd = str(bot_path.parent)
-        _emit_log(f"Running download bot: {' '.join(cmd)} (cwd={run_cwd})", important=True)
-        _set_status(stage="running", message="Downloading latest reports (bot)")
-        # Add bot to checklist (first time) and mark running
-        if not any(it["name"] == "Download_Bot" for it in _report_checklist):
-            _report_checklist.insert(0, {"name": "Download_Bot", "status": "running"})
-            _report_messages["Download_Bot"] = deque(maxlen=200)
-        else:
-            _set_report_status("Download_Bot.py", "running")
-
-        with subprocess.Popen(
-            cmd,
-            cwd=run_cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        ) as proc:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                raw = line.rstrip()
-                _emit_log(raw, important=False, skip_web_log=True)
-                # Mirror bot output into IA and Bot message feeds
-                _append_report_message("NBD_MF_23_IA", raw[:500])
-                _append_report_message("Download_Bot", raw[:500])
             ret = proc.wait()
 
-        if ret != 0:
-            _emit_log(f"Download bot failed with exit code {ret}", important=True)
-            _set_report_status("Download_Bot.py", "failed")
-            return False, f"Download bot failed with exit code {ret}"
+            with _proc_lock:
+                if report_id in _running_processes:
+                    del _running_processes[report_id]
 
-        _emit_log("Download bot completed successfully", important=True)
-        _append_report_message("NBD_MF_23_IA", "Download bot completed successfully")
-        _set_report_status("Download_Bot.py", "completed")
-        return True, "Download bot completed"
+            if ret != 0:
+                _emit_log(f"{report_id} failed with exit code {ret}", important=True)
+                _set_report_status(report_id, "failed")
+                return False, f"Failed with exit code {ret}"
+
+            _emit_log(f"{report_id} completed successfully", important=True)
+            _set_report_status(report_id, "completed")
+            return True, "Completed"
 
     except Exception as exc:
-        _emit_log(f"Failed to run download bot: {exc}", important=True)
-        return False, f"Failed to run download bot: {exc}"
-
-def _run_c6_c4_thread(date_folder: Path, report_month: str, report_year: str) -> Dict[str, Tuple[bool, str]]:
-    """Run C6 -> C5 -> C4 -> C2 -> C3 sequentially in a single thread."""
-    results = {}
-    thread_name = "C6_C4_Thread"
-    _running_threads[thread_name] = threading.current_thread()
-
-    try:
-        _emit_log("Starting C6->C5->C4->C2->C3 thread", important=True)
-        _emit_log(f"Working folder: {date_folder}", important=True)
-        _emit_log(f"Report month: {report_month}, year: {report_year}", important=True)
-
-        sequence = [
-            ("NBD_MF_20_C6.py", "Running C6"),
-            ("NBD_MF_20_C5.py", "Running C5 (after C6)"),
-            ("NBD_MF_20_C4.py", "Running C4 (after C5)"),
-            ("NBD_MF_20_C2.py", "Running C2 (after C4)"),
-            ("NBD_MF_20_C3_report.py", "Running C3 (after C2)"),
-        ]
-        for script, status_msg in sequence:
-            script_path = REPORT_AUTOMATIONS_DIR / script
-            if not script_path.exists():
-                msg = f"{script} not found at: {script_path}; skipping"
-                _emit_log(msg, important=True)
-                _set_report_status(script, "skipped")
-                results[script.replace('.py','')] = (True, msg)
-                continue
-            _set_status(stage="running", message=status_msg)
-            ok, msg = _run_single_script(script, date_folder, report_month, report_year)
-            results[script.replace('.py','')] = (ok, msg)
-            if not ok:
-                _emit_log(f"{script} failed, stopping sequence: {msg}", important=True)
-                return results
-        _emit_log("C6->C5->C4->C2->C3 thread completed successfully", important=True)
-            
-    except Exception as e:
-        _emit_log(f"C6+C4+C2+C3 thread failed: {e}", important=True)
-        import traceback
-        _emit_log(f"C6+C4+C2+C3 thread traceback: {traceback.format_exc()}", important=False, skip_web_log=True)
-        results["NBD_MF_20_C6"] = results.get("NBD_MF_20_C6", (False, str(e)))
-        results["NBD_MF_20_C4"] = results.get("NBD_MF_20_C4", (False, str(e)))
-        results["NBD_MF_20_C2"] = results.get("NBD_MF_20_C2", (False, str(e)))
-        results["NBD_MF_20_C3_report"] = results.get("NBD_MF_20_C3_report", (False, str(e)))
-    finally:
-        if thread_name in _running_threads:
-            del _running_threads[thread_name]
-    
-    return results
+        _emit_log(f"Failed to run {report_id}: {exc}", important=True)
+        _set_report_status(report_id, "failed")
+        return False, str(exc)
 
 
-def _run_ia_thread(date_folder: Path, report_month: str, report_year: str) -> Dict[str, Tuple[bool, str]]:
-    """Run IA script followed by C1C2 script sequentially in a separate thread."""
-    results = {}
-    thread_name = "IA_C1C2_Thread"
-    _running_threads[thread_name] = threading.current_thread()
-
-    try:
-        _emit_log("Starting IA → C1C2 thread (sequential)", important=True)
-        _set_status(stage="running", message="Running IA → C1C2 (parallel)")
-
-        # Run IA first
-        success_ia, msg_ia = _run_single_script("NBD_MF_23_IA.py", date_folder, report_month, report_year)
-        results["NBD_MF_23_IA"] = (success_ia, msg_ia)
-
-        if success_ia:
-            _emit_log("IA completed successfully, starting C1C2", important=True)
-
-            # Run C1C2 after IA succeeds
-            success_c1c2, msg_c1c2 = _run_single_script("NBD_MF_23_C1C2.py", date_folder, report_month, report_year)
-            results["NBD_MF_23_C1C2"] = (success_c1c2, msg_c1c2)
-
-            if success_c1c2:
-                _emit_log("IA → C1C2 thread completed successfully", important=True)
-            else:
-                _emit_log("IA succeeded but C1C2 failed", important=True)
-        else:
-            _emit_log("IA failed, skipping C1C2", important=True)
-            results["NBD_MF_23_C1C2"] = (False, "Skipped due to IA failure")
-            _set_report_status("NBD_MF_23_C1C2.py", "skipped")
-
-    except Exception as e:
-        _emit_log(f"IA → C1C2 thread failed: {e}", important=True)
-        results["NBD_MF_23_IA"] = (False, str(e))
-        results["NBD_MF_23_C1C2"] = (False, "Skipped due to thread error")
-    finally:
-        if thread_name in _running_threads:
-            del _running_threads[thread_name]
-
-    return results
-
-
-def _run_23_c4_thread(date_folder: Path, report_month: str, report_year: str) -> Dict[str, Tuple[bool, str]]:
-    """Run NBD-MF-23-C4.py as subprocess."""
-    results = {}
-    thread_name = "NBD_MF_23_C4_Thread"
-    _running_threads[thread_name] = threading.current_thread()
-    script_filename = "NBD-MF-23-C4.py"
-
-    try:
-        _emit_log("Starting NBD_MF_23_C4 (subprocess)", important=True)
-        _ensure_checklist_item(script_filename)
-        _set_report_status(script_filename, "running")
-
-        script_path = REPORT_AUTOMATIONS_DIR / script_filename
-        if not script_path.exists():
-            msg = f"{script_filename} not found at: {script_path}; skipping"
-            _emit_log(msg, important=True)
-            _set_report_status(script_filename, "skipped")
-            results["NBD_MF_23_C4"] = (True, msg)
-            return results
-
-        # Determine working directory
-        c4_folder = date_folder / "NBD_MF_23_C4"
-        if not c4_folder.exists():
-            c4_folder = date_folder
-
-        _emit_log(f"Working directory for C4: {c4_folder}", important=True)
-
-        # Run as subprocess
-        cmd = [sys.executable, str(script_path)]
-        _emit_log(f"Running: {' '.join(cmd)} (cwd={c4_folder})", important=True)
-
-        # Create individual log file
-        log_file = _run_log_dir / script_filename.replace(".py", ".log")
-        _emit_log(f"Creating individual log file: {log_file.name}", important=True)
-
-        with subprocess.Popen(
-            cmd,
-            cwd=str(c4_folder),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding='utf-8',
-            errors='replace'
-        ) as proc:
-            with open(log_file, "w", encoding="utf-8", errors="replace") as lf:
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line:
-                        lf.write(line + "\n")
-                        _emit_log(line, important=False, skip_web_log=True)
-
-                proc.wait()
-
-                if proc.returncode == 0:
-                    _set_report_status(script_filename, "completed")
-                    results["NBD_MF_23_C4"] = (True, "Completed")
-                    _emit_log("NBD_MF_23_C4 completed successfully", important=True)
-                else:
-                    msg = f"Script failed with exit code {proc.returncode}"
-                    _emit_log(f"Script {script_filename} {msg}", important=True)
-                    _set_report_status(script_filename, "failed")
-                    results["NBD_MF_23_C4"] = (False, msg)
-
-    except Exception as e:
-        _emit_log(f"NBD_MF_23_C4 thread failed: {e}", important=True)
-        import traceback
-        _emit_log(traceback.format_exc(), important=False, skip_web_log=True)
-        _set_report_status(script_filename, "failed")
-        results["NBD_MF_23_C4"] = (False, str(e))
-    finally:
-        if thread_name in _running_threads:
-            del _running_threads[thread_name]
-
-    return results
-
-
-def _run_ga_is_thread(date_folder: Path, report_month: str, report_year: str) -> Dict[str, Tuple[bool, str]]:
-    """Run NBD_MF_10_GA_IS.py as subprocess to avoid COM threading issues with long operations."""
-    results = {}
-    thread_name = "NBD_MF_10_GA_IS_Thread"
-    _running_threads[thread_name] = threading.current_thread()
-    script_filename = "NBD_MF_10_GA_IS.py"
-
-    try:
-        _emit_log("Starting NBD_MF_10_GA_IS (subprocess)", important=True)
-        _ensure_checklist_item(script_filename)
-        _set_report_status(script_filename, "running")
-        _set_status(stage="running", message="Running NBD_MF_10_GA_IS (parallel)")
-
-        script_path = REPORT_AUTOMATIONS_DIR / script_filename
-        if not script_path.exists():
-            msg = f"{script_filename} not found at: {script_path}; skipping"
-            _emit_log(msg, important=True)
-            _set_report_status(script_filename, "skipped")
-            results["NBD_MF_10_GA_IS"] = (True, msg)
-            return results
-
-        # Determine working directory
-        ga_is_folder = date_folder / "NBD-MF-10-GA & NBD-MF-11-IS"
-        if not ga_is_folder.exists():
-            ga_is_folder = date_folder
-
-        _emit_log(f"Working directory for GA_IS: {ga_is_folder}", important=True)
-
-        # Create individual log file
-        log_file = _run_log_dir / script_filename.replace(".py", ".log")
-        _emit_log(f"Creating individual log file: {log_file.name}", important=True)
-
-        # Run as subprocess
-        env = os.environ.copy()
-        env['REPORT_LOG_DIR'] = str(_run_log_dir)
-
-        cmd = [sys.executable, str(script_path)]
-        _emit_log(f"Running: {' '.join(cmd)} (cwd={ga_is_folder})", important=True)
-
-        with open(log_file, "w", encoding="utf-8", errors="replace") as lf:
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(ga_is_folder),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                env=env
-            )
-
-            # Stream output line by line
-            for line in process.stdout:
-                line = line.rstrip()
-                if line:
-                    lf.write(line + "\n")
-                    lf.flush()
-                    _emit_log(line, important=False, skip_web_log=True)
-
-            process.wait()
-
-        if process.returncode == 0:
-            _set_report_status(script_filename, "completed")
-            results["NBD_MF_10_GA_IS"] = (True, "Completed")
-            _emit_log("NBD_MF_10_GA_IS completed successfully", important=True)
-        else:
-            _set_report_status(script_filename, "failed")
-            results["NBD_MF_10_GA_IS"] = (False, f"Exit code {process.returncode}")
-            _emit_log(f"NBD_MF_10_GA_IS failed with exit code {process.returncode}", important=True)
-
-    except Exception as e:
-        _emit_log(f"NBD_MF_10_GA_IS thread failed: {e}", important=True)
-        import traceback
-        _emit_log(traceback.format_exc(), important=False, skip_web_log=True)
-        _set_report_status(script_filename, "failed")
-        results["NBD_MF_10_GA_IS"] = (False, str(e))
-    finally:
-        if thread_name in _running_threads:
-            del _running_threads[thread_name]
-
-    return results
-
-
-def _run_single_script_in_dir(script_name: str, working_dir: Path, log_file: Path, env: dict = None) -> tuple[bool, str]:
-    """Run a single script in a specific working directory with custom environment."""
-    script_path = REPORT_AUTOMATIONS_DIR / script_name
-    if not script_path.exists():
-        return False, f"Script not found: {script_path}"
-
-    _ensure_checklist_item(script_name)
-    _set_report_status(script_name, "running")
-
-    if env is None:
-        env = os.environ.copy()
-
-    try:
-        with log_file.open("w", encoding="utf-8") as lf:
-            proc = subprocess.Popen(
-                [sys.executable, str(script_path)],
-                cwd=str(working_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1,
-                env=env
-            )
-
-            with _proc_lock:
-                _running_processes[script_name] = proc
-
-            for line in iter(proc.stdout.readline, ''):
-                if not line:
-                    break
-                _emit_log(line.rstrip(), important=False, skip_web_log=True, script=script_name)
-                lf.write(line)
-                lf.flush()
-
-                if _stop_requested:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    _set_report_status(script_name, "stopped")
-                    return False, "Stopped by user"
-
-            proc.wait()
-
-            with _proc_lock:
-                if script_name in _running_processes:
-                    del _running_processes[script_name]
-
-            if proc.returncode == 0:
-                _set_report_status(script_name, "completed")
-                return True, "Completed"
-            else:
-                _set_report_status(script_name, "failed")
-                return False, f"Exit code {proc.returncode}"
-
-    except Exception as e:
-        _set_report_status(script_name, "failed")
-        return False, str(e)
-
-
-def run_reports_for_frequency(frequency: str, ui_date: str) -> tuple[bool, str]:
-    """Run report automation scripts using threading for the given frequency.
-
-    For monthly reports:
-    - Thread 1 (sequential): C6 → C5 → C4 → C2 → C3
-    - Thread 2 (sequential): IA → C1C2
-    - Thread 3 (parallel): NBD-MF-23-C4
-    - Thread 4 (parallel): GA-IS
-
-    Returns (ok, message).
+def find_output_files(report_id: str, file_pattern: str) -> list[Path]:
     """
-    scripts_by_frequency: dict[str, list[str]] = {
-        "monthly": [
-           "NBD_MF_20_C6.py", "NBD_MF_20_C5.py", "NBD_MF_20_C4.py", "NBD_MF_20_C2.py", "NBD_MF_20_C3_report.py",
-           "NBD_MF_23_IA.py", "NBD_MF_23_C1C2.py", "NBD-MF-23-C4.py", "NBD_MF_10_GA_IS.py",
-        ],
-        "weekly": [],
-        "quarterly": [],
-        "annually": [],
-    }
+    Find output files in working directory matching the pattern.
+    Returns list of matching file paths.
+    """
+    if report_id not in REPORT_STRUCTURE:
+        return []
+    
+    folder_name = REPORT_STRUCTURE[report_id]["folder"]
+    working_report_dir = WORKING_DIR / folder_name
+    
+    if not working_report_dir.exists():
+        return []
+    
+    date_folders = [p for p in working_report_dir.iterdir() if p.is_dir()]
+    if len(date_folders) != 1:
+        return []
+    
+    date_folder = date_folders[0]
+    
+    # Find files matching pattern
+    matches = glob.glob(str(date_folder / file_pattern))
+    return [Path(p) for p in matches]
 
-    scripts = scripts_by_frequency.get(frequency, [])
-    if not scripts:
-        return True, f"No automation scripts configured for {frequency}."
 
-    # Initialize checklist for UI only if not already initialized; otherwise ensure all scripts are present
-    if not _report_checklist:
-        _init_report_checklist(scripts)
+def _copy_sofp_fs_to_outputs_targets() -> None:
+    """Copy latest SOFP Monthly FS file from working SOFP date folder to
+    latest versioned date folders of outputs/NBD_MF_23_IA and outputs/NBD_MF_20_C1_C6.
+    If a file with same name exists at destination, remove it before copying.
+    """
+    try:
+        # Locate source file in working/SOFP date folder
+        sofp_dir = WORKING_DIR / REPORT_STRUCTURE["NBD-MF-01-SOFP-SOCI"]["folder"]
+        sofp_dates = [p for p in sofp_dir.iterdir() if p.is_dir()]
+        if len(sofp_dates) != 1:
+            _emit_log("SOFP working folder not in expected single-date structure; skipping extra copies", important=True)
+            return
+        sofp_date_dir = sofp_dates[0]
+        matches = glob.glob(str(sofp_date_dir / "NBD-MF-01-SOFP & SOCI AFL Monthly FS*.xlsx"))
+        if not matches:
+            _emit_log("No SOFP Monthly FS file found to copy", important=True)
+            return
+        src_file = Path(max(matches, key=lambda x: Path(x).stat().st_mtime))
+
+        # Helper to copy into a target outputs/<folder> latest date version
+        def copy_into_outputs_folder(folder_key: str) -> None:
+            out_dir = OUTPUTS_DIR / REPORT_STRUCTURE[folder_key]["folder"]
+            last_date, date_folder = find_latest_completed_date(out_dir)
+            if not last_date or not date_folder or not date_folder.exists():
+                _emit_log(f"Skip copy to {out_dir} (no completed date folder found)", important=True)
+                return
+            dest_path = date_folder / src_file.name
+            try:
+                # Remove any existing .xlsx file with the same prefix in the target folder
+                prefix = "NBD-MF-01-SOFP & SOCI AFL Monthly FS"
+                removed = 0
+                for f in date_folder.iterdir():
+                    if f.is_file() and f.suffix.lower() == ".xlsx" and f.name.startswith(prefix):
+                        try:
+                            f.unlink()
+                            removed += 1
+                        except Exception as _e:
+                            _emit_log(f"Warning: failed removing existing file {f}: {_e}", important=True)
+                if removed:
+                    _emit_log(f"Removed {removed} existing SOFP Monthly FS .xlsx file(s) in {date_folder}", important=True)
+                shutil.copy2(src_file, dest_path)
+                _emit_log(f"Copied {src_file.name} to {dest_path}", important=True)
+            except Exception as e:
+                _emit_log(f"Failed to copy {src_file.name} to {dest_path}: {e}", important=True)
+
+        # Copy to IA outputs latest date folder
+        copy_into_outputs_folder("NBD-MF-23-IA")
+        # Copy to C1_C6 outputs latest date folder
+        copy_into_outputs_folder("NBD-MF-20-C1")
+        # Copy to GA & IS outputs latest date folder
+        try:
+            copy_into_outputs_folder("NBD-MF-10-GA-11-IS-SET8")
+        except Exception as _e:
+            _emit_log(f"Skip copy to GA & IS outputs: {_e}", important=True)
+
+    except Exception as e:
+        _emit_log(f"Extra copy of SOFP FS to outputs targets failed: {e}", important=True)
+
+
+def save_folder_to_outputs(report_id: str, selected_date: str) -> tuple[bool, str, Path | None]:
+    """
+    Copy report folder from working back to outputs with selected date.
+    Returns (success, message, output_path)
+    """
+    if report_id not in REPORT_STRUCTURE:
+        return False, f"Unknown report: {report_id}", None
+
+    folder_name = REPORT_STRUCTURE[report_id]["folder"]
+    # Special-case GA & IS SET8: working folder uses underscore name; outputs uses ampersand name
+    if report_id == "NBD-MF-10-GA-11-IS-SET8":
+        working_report_dir = WORKING_DIR / "NBD_MF_10_GA_NBD_MF_11_IS"
+        output_report_dir = OUTPUTS_DIR / "NBD-MF-10-GA & NBD-MF-11-IS"
     else:
-        _ensure_reports_in_checklist(scripts)
+        working_report_dir = WORKING_DIR / folder_name
+        output_report_dir = OUTPUTS_DIR / folder_name
+    
+    # Find the date folder in working
+    date_folders = [p for p in working_report_dir.iterdir() if p.is_dir()]
+    if len(date_folders) != 1:
+        return False, f"Expected one date folder in {working_report_dir}", None
+    
+    source_folder = date_folders[0]
+    target_date_name = format_date_folder_name(selected_date)
+    
+    # Create output report directory
+    output_report_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if target date folder exists
+    target_path = output_report_dir / target_date_name
+    if target_path.exists():
+        # Find next version number
+        version = 1
+        while (output_report_dir / f"{target_date_name}({version})").exists():
+            version += 1
+        target_path = output_report_dir / f"{target_date_name}({version})"
+    
+    try:
+        shutil.copytree(source_folder, target_path)
+        _emit_log(f"Saved {report_id} to {target_path}", important=True)
+        return True, f"Saved to {target_path.name}", target_path
+    except Exception as e:
+        return False, f"Failed to save: {e}", None
 
-    # Determine working dir: there should be exactly one subfolder inside working/<frequency>
-    working_freq_dir = WORKING_DIR / frequency
-    if not working_freq_dir.exists():
-        return False, f"Working directory not found: {working_freq_dir}"
-    subdirs = [p for p in working_freq_dir.iterdir() if p.is_dir()]
-    if len(subdirs) != 1:
-        return False, f"Expected exactly one folder in {working_freq_dir}, found {len(subdirs)}."
-    date_folder = subdirs[0]
 
-    # Derive reporting month (previous month) and year from picked date
-    dt = parse_ui_date(ui_date)
-    prev_month_anchor = dt.replace(day=1) - timedelta(days=1)
-    report_month = prev_month_anchor.strftime("%b")  # e.g., Jul
-    report_year = str(prev_month_anchor.year)
+def get_report_dependencies(report_id: str) -> list[str]:
+    """Get all dependencies for a report (recursive)."""
+    if report_id not in REPORT_STRUCTURE:
+        return []
 
-    global _thread_pool
-    if not _thread_pool:
-        _thread_pool = ThreadPoolExecutor(max_workers=4)
+    deps = []
+    for dep in REPORT_STRUCTURE[report_id]["dependencies"]:
+        deps.append(dep)
+        deps.extend(get_report_dependencies(dep))
+
+    seen = set()
+    result = []
+    for item in deps:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def get_execution_order(report_ids: list[str]) -> list[str]:
+    """Get execution order including all dependencies."""
+    all_reports = set()
+
+    # IA and C1C2 always run together - no standalone C1C2 anymore
+    for report_id in report_ids:
+        all_reports.add(report_id)
+        all_reports.update(get_report_dependencies(report_id))
+
+    sorted_reports = sorted(
+        all_reports,
+        key=lambda x: (REPORT_STRUCTURE[x]["level"], REPORT_STRUCTURE[x]["set"], REPORT_STRUCTURE[x]["step"])
+    )
+
+    return sorted_reports
+
+
+def run_selected_reports(report_ids_with_dates: dict) -> tuple[bool, str]:
+    """Run selected reports in correct order with modular approach."""
+    global _download_files, _sofp_download_file
+    _download_files = []
+    _sofp_download_file = None
 
     try:
-        # Submit both thread tasks
-        future_c6_c4 = _thread_pool.submit(_run_c6_c4_thread, date_folder, report_month, report_year)
-        future_ia = _thread_pool.submit(_run_ia_thread, date_folder, report_month, report_year)
-        future_23_c4 = _thread_pool.submit(_run_23_c4_thread, date_folder, report_month, report_year)
-        future_ga_is = _thread_pool.submit(_run_ga_is_thread, date_folder, report_month, report_year)
-        
-        # Wait for all threads to complete
-        results_c6_c4 = future_c6_c4.result()
-        results_ia = future_ia.result()
-        results_23_c4 = future_23_c4.result()
-        results_ga_is = future_ga_is.result()
-        
-        # Combine results
-        all_results = {**results_c6_c4, **results_ia, **results_23_c4, **results_ga_is}
-        
-        # Check if all scripts succeeded
-        all_success = all(success for success, _ in all_results.values())
-        
-        # Build summary message
-        executed = []
-        failed = []
-        for script_key, (success, msg) in all_results.items():
-            script_name = script_key + ".py"
-            if success:
-                executed.append(script_name)
-            else:
-                failed.append(f"{script_name}: {msg}")
-        
-        if all_success:
-            return True, f"All scripts completed successfully: {', '.join(executed)}"
-        else:
-            failure_msg = "; ".join(failed)
-            return False, f"Some scripts failed - Successful: {', '.join(executed)}; Failed: {failure_msg}"
-            
+        report_ids = list(report_ids_with_dates.keys())
+        execution_order = get_execution_order(report_ids)
     except Exception as e:
-        _emit_log(f"Threading execution failed: {e}", important=True)
-        return False, f"Threading execution failed: {e}"
+        _emit_log(f"Error in execution order: {e}", important=True)
+        import traceback
+        _emit_log(traceback.format_exc(), important=True)
+        return False, f"Error in execution order: {e}"
+    # Ensure SOFP appears first when IA is selected WITHOUT C1-C2
+    # When both IA and C1-C2 are selected, don't include SOFP
+    if "NBD-MF-23-IA" in report_ids and "NBD-MF-23-C1-C2" not in report_ids:
+        if "NBD-MF-01-SOFP-SOCI" in execution_order:
+            execution_order = ["NBD-MF-01-SOFP-SOCI"] + [r for r in execution_order if r != "NBD-MF-01-SOFP-SOCI"]
+
+    _emit_log(f"Execution order: {', '.join(execution_order)}", important=True)
+    only_sofp_flow = set(report_ids) == {"NBD-MF-01-SOFP-SOCI"}
+
+    # Build checklist: Only show reports that will actually run
+    checklist_ids = list(execution_order)
+
+    # Determine if we should show SOFP in the checklist
+    # SOFP is shown only when IA is selected WITHOUT C1-C2 (but now they always run together)
+    # Since IA and C1C2 always run together, we don't show SOFP in the checklist
+    # The validation will ensure SOFP file exists before running
+
+    _init_report_checklist(checklist_ids)
+    
+    # Detect if this is the C1–C6 set flow
+    c1c6_ids = {"NBD-MF-20-C1","NBD-MF-20-C2","NBD-MF-20-C3","NBD-MF-20-C4","NBD-MF-20-C5","NBD-MF-20-C6"}
+    is_c1c6_flow = any(r in c1c6_ids for r in execution_order)
+    is_ga_is_set8 = any(r == "NBD-MF-10-GA-11-IS-SET8" for r in execution_order)
+    is_c8_flow = any(r == "NBD-QF-23-C8" for r in execution_order)
+    is_c4_flow = any(r == "NBD-MF-23-C4" for r in execution_order)
+    is_dm_flow = any(r == "NBD-WF-18-DM" for r in execution_order)
+
+    # Detect IA flow (IA and C1C2 always run together)
+    is_ia_flow = "NBD-MF-23-IA" in report_ids or "NBD-MF-23-C1-C2" in report_ids
+    
+    # Copy all required reports to working
+    _set_status(stage="copying", message="Copying reports to working directory")
+    try:
+        if is_c1c6_flow:
+            # Copy only NBD_MF_20_C1_C6 based on completed_dates.txt
+            _emit_log("Preparing working folder for C1–C6 set", important=True)
+            ok, msg, _ = copy_folder_to_working("NBD-MF-20-C1")
+            if not ok:
+                return False, f"Failed to copy NBD-MF-20-C1_C6: {msg}"
+        elif is_ga_is_set8:
+            _emit_log("Preparing working folder for GA & IS Set 8", important=True)
+            ok, msg, _ = copy_folder_to_working("NBD-MF-10-GA-11-IS-SET8")
+            if not ok:
+                return False, f"Failed to copy GA & IS: {msg}"
+        elif is_c8_flow:
+            _emit_log("Preparing working folder for C8", important=True)
+            ok, msg, _ = copy_folder_to_working("NBD-QF-23-C8")
+            if not ok:
+                return False, f"Failed to copy C8: {msg}"
+        elif is_c4_flow:
+            _emit_log("Preparing working folder for C4", important=True)
+            ok, msg, _ = copy_folder_to_working("NBD-MF-23-C4")
+            if not ok:
+                return False, f"Failed to copy C4: {msg}"
+        elif is_dm_flow:
+            _emit_log("Preparing working folder for DM", important=True)
+            ok, msg, _ = copy_folder_to_working("NBD-WF-18-DM")
+            if not ok:
+                return False, f"Failed to copy DM: {msg}"
+        elif is_ia_flow:
+            _emit_log("Preparing working folder for IA flow (IA and C1C2 run together)", important=True)
+            # Copy IA folder first
+            ok, msg, _ = copy_folder_to_working("NBD-MF-23-IA")
+            if not ok:
+                return False, f"Failed to copy IA: {msg}"
+            # C1-C2 will use the same IA working folder
+    except Exception as e:
+        _emit_log(f"Error during copy phase: {e}", important=True)
+        import traceback
+        _emit_log(traceback.format_exc(), important=True)
+        return False, f"Copy phase error: {e}"
+    else:
+        allowed_copy = {"NBD-MF-01-SOFP-SOCI"}
+        for report_id in execution_order:
+            # Copy only SOFP-SOCI and IA; skip others
+            if report_id not in allowed_copy:
+                _emit_log(f"Skipping copy for {report_id} (copy only SOFP-SOCI and IA)", important=True)
+                continue
+            success, msg, _ = copy_folder_to_working(report_id)
+            if not success:
+                return False, f"Failed to copy {report_id}: {msg}"
+    
+    # Track which scripts have been run to avoid duplicates
+    executed_scripts = {}
+    all_success = True
+    failed_reports = []
+    
+    # Run reports sequentially
+    if is_c1c6_flow:
+        # Specific enforced order for C1–C6: C6 → C5 → C4 → C3 → C2
+        enforced_order = ["NBD-MF-20-C6","NBD-MF-20-C5","NBD-MF-20-C4","NBD-MF-20-C3","NBD-MF-20-C2"]
+        sequence = [rid for rid in enforced_order if rid in execution_order]
+    else:
+        sequence = execution_order
+
+    for report_id in sequence:
+        if _stop_requested:
+            _emit_log("Stop requested, halting execution", important=True)
+            break
+            
+        # Get date for this report
+        if report_id in report_ids_with_dates:
+            date_str, report_month, report_year = report_ids_with_dates[report_id]
+        else:
+            date_str, report_month, report_year = list(report_ids_with_dates.values())[0]
+        
+        script_name = REPORT_STRUCTURE[report_id]["script"]
+
+        # Determine if this report should run based on the flow
+        # Normal flows (IA and C1C2 always run together)
+        run_allowed = (report_id in ("NBD-MF-01-SOFP-SOCI", "NBD-MF-23-IA", "NBD-MF-23-C1-C2")) or (is_c1c6_flow and report_id in c1c6_ids) or (is_ga_is_set8 and report_id == "NBD-MF-10-GA-11-IS-SET8") or (is_c8_flow and report_id == "NBD-QF-23-C8") or (is_c4_flow and report_id == "NBD-MF-23-C4") or (is_dm_flow and report_id == "NBD-WF-18-DM") or (is_ia_flow and report_id in ("NBD-MF-23-IA", "NBD-MF-23-C1-C2"))
+        
+        # Check if this script was already executed
+        if script_name in executed_scripts:
+            prev_report_id = executed_scripts[script_name]
+            _emit_log(f"Skipping {report_id} - script {script_name} already executed by {prev_report_id}", important=True)
+            _set_report_status(report_id, "completed")
+            continue
+        
+        # Skip running non-required reports while keeping them visible
+        if not run_allowed:
+            _emit_log(f"Skipping run for {report_id} (only SOFP-SOCI → IA → C1C2 run in this set)", important=True)
+            _set_report_status(report_id, "skipped")
+            continue
+        
+        # Emit clear sequence status line for the UI
+        try:
+            seq_name = REPORT_STRUCTURE[report_id]["folder"]
+        except Exception:
+            seq_name = report_id
+        _set_status(stage="running", message=f"running {seq_name}")
+
+        # For IA, copy its latest working folder only after SOFP completes
+        if not is_c1c6_flow and report_id == "NBD-MF-23-IA":
+            _emit_log("Preparing IA working folder after SOFP completion", important=True)
+            ok_copy, copy_msg, _copy_path = copy_folder_to_working("NBD-MF-23-IA")
+            if not ok_copy:
+                _set_report_status(report_id, "failed")
+                return False, f"Failed to copy NBD-MF-23-IA: {copy_msg}"
+            # Remove old SOFP monthly FS file in IA date folder, if exists
+            try:
+                ia_working_dir = WORKING_DIR / REPORT_STRUCTURE["NBD-MF-23-IA"]["folder"]
+                date_folders = [p for p in ia_working_dir.iterdir() if p.is_dir()]
+                if len(date_folders) == 1:
+                    ia_date_dir = date_folders[0]
+                    pattern = ia_date_dir / "NBD-MF-01-SOFP & SOCI AFL Monthly FS*.xlsx"
+                    match_paths = [Path(p) for p in glob.glob(str(pattern))]
+                    if len(match_paths) > 1:
+                        # Keep the latest by modified time; remove older ones
+                        match_paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                        keep = match_paths[0]
+                        to_remove = match_paths[1:]
+                        removed = 0
+                        for fp in to_remove:
+                            try:
+                                fp.unlink(missing_ok=True)
+                                removed += 1
+                            except Exception:
+                                pass
+                        if removed > 0:
+                            _emit_log(f"Kept latest '{keep.name}', removed {removed} older SOFP Monthly FS file(s) in {ia_date_dir}", important=True)
+                else:
+                    _emit_log("IA working folder structure unexpected; skip old file cleanup", important=True)
+            except Exception as _e:
+                _emit_log(f"IA old file cleanup skipped: {_e}", important=True)
+        
+        # Run the report script
+        success, msg = run_report_script(report_id, date_str, report_month, report_year)
+        
+        if success:
+            executed_scripts[script_name] = report_id
+            _set_status(stage="running", message=f"completed {seq_name}")
+            # After SOFP completes: rename output file with GUI month/year (don't queue for download yet)
+            if not is_c1c6_flow and report_id == "NBD-MF-01-SOFP-SOCI":
+                try:
+                    # Determine GUI month/year from provided date
+                    any_date = report_ids_with_dates.get(report_id) or list(report_ids_with_dates.values())[0]
+                    _gui_date_str, gui_month, gui_year = any_date
+                    sofp_work_dir = WORKING_DIR / REPORT_STRUCTURE["NBD-MF-01-SOFP-SOCI"]["folder"]
+                    date_folders = [p for p in sofp_work_dir.iterdir() if p.is_dir()]
+                    if len(date_folders) == 1:
+                        date_folder = date_folders[0]
+                        matches = glob.glob(str(date_folder / "NBD-MF-01-SOFP & SOCI AFL Monthly FS*.xlsx"))
+                        if matches:
+                            src = Path(max(matches, key=lambda x: Path(x).stat().st_mtime))
+                            base = "NBD-MF-01-SOFP & SOCI AFL Monthly FS"
+                            new_name = f"{base} {gui_month} {gui_year}.xlsx"
+                            dst = src.with_name(new_name)
+                            if src.name != new_name:
+                                try:
+                                    src.rename(dst)
+                                    src = dst
+                                    _emit_log(f"Renamed SOFP Monthly FS to {dst.name}", important=True)
+                                except Exception as e:
+                                    _emit_log(f"SOFP rename failed (continuing with original): {e}", important=True)
+                            # Store the renamed file info for later download queueing after save
+                            _sofp_download_file = src
+                        else:
+                            _emit_log("SOFP Monthly FS .xlsx not found for renaming", important=True)
+                    else:
+                        _emit_log("Unexpected SOFP working folder structure; skipping rename", important=True)
+                except Exception as e:
+                    _emit_log(f"SOFP post-processing failed: {e}", important=True)
+            
+            # Special handling for NBD-MF-23-C1 (download output file)
+            if report_id == "NBD-MF-23-C1":
+                _emit_log("Looking for output files to download...", important=True)
+                output_files = find_output_files("NBD-MF-23-IA", "Prod. wise Class. of Loans*.xlsb")
+                if output_files:
+                    _download_files.extend(output_files)
+                    _emit_log(f"Added {len(output_files)} file(s) for download", important=True)
+                else:
+                    _emit_log("Warning: No output files found matching pattern", important=True)
+            # After SOFP completes in IA flow, copy its Monthly FS file to outputs/IA and outputs/C1_C6 latest date folders
+            if not is_c1c6_flow and report_id == "NBD-MF-01-SOFP-SOCI":
+                try:
+                    _copy_sofp_fs_to_outputs_targets()
+                except Exception as e:
+                    _emit_log(f"Warning: extra copy of SOFP FS failed: {e}", important=True)
+            # Small delay before starting C1C2 after IA completes
+            if not is_c1c6_flow and report_id == "NBD-MF-23-IA":
+                try:
+                    time.sleep(3)
+                except Exception:
+                    pass
+        else:
+            all_success = False
+            failed_reports.append(f"{report_id}: {msg}")
+    
+    # Post-processing: rename/download/archive
+    if is_c1c6_flow:
+        # Rename the C1–C6 Excel file in working to GUI month/year
+        try:
+            c1c6_dir = WORKING_DIR / REPORT_STRUCTURE["NBD-MF-20-C1"]["folder"]
+            date_folders = [p for p in c1c6_dir.iterdir() if p.is_dir()]
+            if len(date_folders) == 1:
+                date_folder = date_folders[0]
+                # Find target file
+                matches = glob.glob(str(date_folder / "NBD-MF-20-C1 to C6*.xlsx"))
+                if matches:
+                    src = Path(max(matches, key=lambda x: Path(x).stat().st_mtime))
+                    # Build new name from GUI month/year (use one of selected dates)
+                    any_date = list(report_ids_with_dates.values())[0]
+                    _, gui_month, gui_year = any_date
+                    new_name = f"NBD-MF-20-C1 to C6 {gui_month} {gui_year}.xlsx"
+                    dst = src.with_name(new_name)
+                    if src.name != new_name:
+                        try:
+                            src.rename(dst)
+                            _emit_log(f"Renamed file to {dst.name}", important=True)
+                            src = dst
+                        except Exception as e:
+                            _emit_log(f"Rename failed (continuing with original): {e}", important=True)
+                    # Queue for download
+                    _download_files.append(src)
+                else:
+                    _emit_log("No C1–C6 output file found to rename/download", important=True)
+            else:
+                _emit_log("Unexpected working folder structure for C1–C6; skipping rename/download", important=True)
+        except Exception as e:
+            _emit_log(f"C1–C6 post-processing failed: {e}", important=True)
+
+        # Save working folder back to outputs with versioning using GUI date
+        _set_status(stage="saving", message="Saving C1–C6 to outputs")
+        date_str, _, _ = list(report_ids_with_dates.values())[0]
+        ok, msg, output_path = save_folder_to_outputs("NBD-MF-20-C1", date_str)
+        if ok and output_path:
+            _emit_log(f"Saved C1–C6: {msg}", important=True)
+            _last_output_dirs["NBD-MF-20-C1"] = output_path
+    elif is_ga_is_set8:
+        # Post-processing for GA & IS: rename files, queue downloads, archive working folder
+        try:
+            # Determine GUI date
+            any_date = list(report_ids_with_dates.values())[0]
+            gui_date_str, gui_month, gui_year = any_date
+            # working date folder - use underscore name for working directory
+            ga_work_dir = WORKING_DIR / "NBD_MF_10_GA_NBD_MF_11_IS"
+            date_folders = [p for p in ga_work_dir.iterdir() if p.is_dir()]
+            if len(date_folders) == 1:
+                date_folder = date_folders[0]
+                # Rename GA/IS file
+                matches = glob.glob(str(date_folder / "NBD-MF-10-GA & NBD-MF-11-IS*.xlsx"))
+                if matches:
+                    src = Path(max(matches, key=lambda x: Path(x).stat().st_mtime))
+                    new_name = f"NBD-MF-10-GA & NBD-MF-11-IS {gui_month} {gui_year}.xlsx"
+                    dst = src.with_name(new_name)
+                    if src.name != new_name:
+                        try:
+                            src.rename(dst)
+                            src = dst
+                            _emit_log(f"Renamed GA/IS file to {dst.name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"GA/IS rename failed (continuing): {e}", important=True)
+                    _download_files.append(src)
+                    _emit_log(f"Added GA/IS file to download queue: {src.name}", important=True)
+                else:
+                    _emit_log("GA/IS .xlsx file not found for renaming", important=True)
+
+                # Rename CBSL converted file to GUI month/year with .xlsb extension
+                cbsl_matches = glob.glob(str(date_folder / "CBSL Provision Comparison*converted.xlsx"))
+                cbsl_path_for_delete = None
+                if cbsl_matches:
+                    cbsl_src = Path(max(cbsl_matches, key=lambda x: Path(x).stat().st_mtime))
+                    new_cbsl = cbsl_src.with_name(f"CBSL Provision Comparison - {gui_month} {gui_year}.xlsb")
+                    try:
+                        cbsl_src.rename(new_cbsl)
+                        _emit_log(f"Renamed CBSL converted to {new_cbsl.name}", important=True)
+                        _download_files.append(new_cbsl)
+                        _emit_log(f"Added CBSL file to download queue: {new_cbsl.name}", important=True)
+                        cbsl_path_for_delete = new_cbsl
+                    except Exception as e:
+                        _emit_log(f"CBSL rename failed: {e}", important=True)
+
+                # Rename working folder to picked date format DD-MM-YYYY
+                try:
+                    dt = datetime.strptime(gui_date_str, "%Y-%m-%d")
+                except Exception:
+                    try:
+                        dt = datetime.strptime(gui_date_str, "%m/%d/%Y")
+                    except Exception:
+                        dt = None
+                if dt is not None:
+                    picked_name = dt.strftime("%d-%m-%Y")
+                    if date_folder.name != picked_name:
+                        target = date_folder.parent / picked_name
+                        if target.exists():
+                            shutil.rmtree(target)
+                        try:
+                            date_folder.rename(target)
+                            date_folder = target
+                            _emit_log(f"Renamed working folder to {picked_name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"Failed to rename working folder: {e}", important=True)
+
+                # Save to outputs with versioning using selected date
+                ok, msg, output_path = save_folder_to_outputs("NBD-MF-10-GA-11-IS-SET8", gui_date_str)
+                if ok and output_path:
+                    _emit_log(f"Saved GA & IS: {msg}", important=True)
+                    _last_output_dirs["NBD-MF-10-GA-11-IS-SET8"] = output_path
+                    
+                    # Update file paths in _download_files to point to the new output location
+                    updated_download_files = []
+                    for file_path in _download_files:
+                        if file_path.exists():
+                            # File still exists at original location, keep it
+                            updated_download_files.append(file_path)
+                        else:
+                            # File was moved, try to find it in the new output location
+                            new_path = output_path / file_path.name
+                            if new_path.exists():
+                                updated_download_files.append(new_path)
+                                _emit_log(f"Updated file path: {file_path.name} -> {new_path}", important=True)
+                            else:
+                                _emit_log(f"Could not find moved file: {file_path.name}", important=True)
+                    
+                    _download_files = updated_download_files
+                    _emit_log(f"Updated download files after move: {len(_download_files)} files", important=True)
+
+                # Prepare downloads
+                _set_status(stage="saving", message="Preparing files for download")
+                try:
+                    auto_download_files()
+                except Exception as e:
+                    _emit_log(f"Warning: GA&IS download prep failed: {e}", important=True)
+
+                # Note: CBSL Provision Comparison file is kept for download
+                _emit_log("CBSL Provision Comparison file kept for download", important=True)
+            else:
+                _emit_log("Unexpected working folder structure for GA & IS; skipping post-processing", important=True)
+        except Exception as e:
+            _emit_log(f"GA & IS post-processing failed: {e}", important=True)
+    elif is_c8_flow:
+        # Post-processing for C8: rename file, queue download, archive working folder
+        try:
+            # Determine GUI date
+            any_date = list(report_ids_with_dates.values())[0]
+            gui_date_str, gui_month, gui_year = any_date
+            # working date folder
+            c8_work_dir = WORKING_DIR / "NBD_QF_23_C8"
+            date_folders = [p for p in c8_work_dir.iterdir() if p.is_dir()]
+            if len(date_folders) == 1:
+                date_folder = date_folders[0]
+                # Rename C8 file: C8-Client Rating-Jun-2025.xlsx
+                matches = glob.glob(str(date_folder / "C8-Client Rating*.xlsx"))
+                if matches:
+                    src = Path(max(matches, key=lambda x: Path(x).stat().st_mtime))
+                    new_name = f"C8-Client Rating-{gui_month}-{gui_year}.xlsx"
+                    dst = src.with_name(new_name)
+                    if src.name != new_name:
+                        try:
+                            src.rename(dst)
+                            src = dst
+                            _emit_log(f"Renamed C8 file to {dst.name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"C8 rename failed (continuing): {e}", important=True)
+                    _download_files.append(src)
+                else:
+                    _emit_log("C8 .xlsx file not found for renaming", important=True)
+
+                # Rename working folder to picked date format DD-MM-YYYY
+                try:
+                    dt = datetime.strptime(gui_date_str, "%Y-%m-%d")
+                except Exception:
+                    try:
+                        dt = datetime.strptime(gui_date_str, "%m/%d/%Y")
+                    except Exception:
+                        dt = None
+                if dt is not None:
+                    picked_name = dt.strftime("%d-%m-%Y")
+                    if date_folder.name != picked_name:
+                        target = date_folder.parent / picked_name
+                        if target.exists():
+                            shutil.rmtree(target)
+                        try:
+                            date_folder.rename(target)
+                            date_folder = target
+                            _emit_log(f"Renamed working folder to {picked_name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"Failed to rename working folder: {e}", important=True)
+
+                # Save to outputs with versioning using selected date
+                ok, msg, output_path = save_folder_to_outputs("NBD-QF-23-C8", gui_date_str)
+                if ok and output_path:
+                    _emit_log(f"Saved C8: {msg}", important=True)
+                    _last_output_dirs["NBD-QF-23-C8"] = output_path
+
+                # Prepare downloads
+                _set_status(stage="saving", message="Preparing files for download")
+                try:
+                    auto_download_files()
+                except Exception as e:
+                    _emit_log(f"Warning: C8 download prep failed: {e}", important=True)
+            else:
+                _emit_log("Unexpected working folder structure for C8; skipping post-processing", important=True)
+        except Exception as e:
+            _emit_log(f"C8 post-processing failed: {e}", important=True)
+    elif is_c4_flow:
+        # Post-processing for C4: rename file, queue download, archive working folder
+        try:
+            # Determine GUI date
+            any_date = list(report_ids_with_dates.values())[0]
+            gui_date_str, gui_month, gui_year = any_date
+            # working date folder
+            c4_work_dir = WORKING_DIR / "NBD_MF_23_C4"
+            date_folders = [p for p in c4_work_dir.iterdir() if p.is_dir()]
+            if len(date_folders) == 1:
+                date_folder = date_folders[0]
+                # Rename C4 file: Loan CF Analysis NBD-MF-23-C4-Jun-2025.xlsb
+                matches = glob.glob(str(date_folder / "Loan CF Analysis*.xlsb"))
+                if matches:
+                    src = Path(max(matches, key=lambda x: Path(x).stat().st_mtime))
+                    new_name = f"Loan CF Analysis NBD-MF-23-C4-{gui_month}-{gui_year}.xlsb"
+                    dst = src.with_name(new_name)
+                    if src.name != new_name:
+                        try:
+                            src.rename(dst)
+                            src = dst
+                            _emit_log(f"Renamed C4 file to {dst.name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"C4 rename failed (continuing): {e}", important=True)
+                    _download_files.append(src)
+                else:
+                    _emit_log("C4 .xlsb file not found for renaming", important=True)
+
+                # Rename working folder to picked date format DD-MM-YYYY
+                try:
+                    dt = datetime.strptime(gui_date_str, "%Y-%m-%d")
+                except Exception:
+                    try:
+                        dt = datetime.strptime(gui_date_str, "%m/%d/%Y")
+                    except Exception:
+                        dt = None
+                if dt is not None:
+                    picked_name = dt.strftime("%d-%m-%Y")
+                    if date_folder.name != picked_name:
+                        target = date_folder.parent / picked_name
+                        if target.exists():
+                            shutil.rmtree(target)
+                        try:
+                            date_folder.rename(target)
+                            date_folder = target
+                            _emit_log(f"Renamed working folder to {picked_name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"Failed to rename working folder: {e}", important=True)
+
+                # Save to outputs with versioning using selected date
+                ok, msg, output_path = save_folder_to_outputs("NBD-MF-23-C4", gui_date_str)
+                if ok and output_path:
+                    _emit_log(f"Saved C4: {msg}", important=True)
+                    _last_output_dirs["NBD-MF-23-C4"] = output_path
+
+                # Prepare downloads
+                _set_status(stage="saving", message="Preparing files for download")
+                try:
+                    auto_download_files()
+                except Exception as e:
+                    _emit_log(f"Warning: C4 download prep failed: {e}", important=True)
+            else:
+                _emit_log("Unexpected working folder structure for C4; skipping post-processing", important=True)
+        except Exception as e:
+            _emit_log(f"C4 post-processing failed: {e}", important=True)
+    elif is_dm_flow:
+        # Post-processing for DM: rename file with week number, queue download, archive working folder
+        try:
+            # Determine GUI date
+            any_date = list(report_ids_with_dates.values())[0]
+            gui_date_str, gui_month, gui_year = any_date
+
+            # Calculate week number from the date
+            try:
+                dt = datetime.strptime(gui_date_str, "%Y-%m-%d")
+            except Exception:
+                try:
+                    dt = datetime.strptime(gui_date_str, "%m/%d/%Y")
+                except Exception:
+                    dt = datetime.now()
+
+            # Get ISO week number
+            week_number = dt.isocalendar()[1]
+
+            # working date folder
+            dm_work_dir = WORKING_DIR / "NBD-WF-18-DM"
+            date_folders = [p for p in dm_work_dir.iterdir() if p.is_dir()]
+            if len(date_folders) == 1:
+                date_folder = date_folders[0]
+                _emit_log(f"Looking for DM files in: {date_folder}", important=True)
+                
+                # List all files in the directory for debugging
+                all_files = list(date_folder.glob("*"))
+                _emit_log(f"Files found in directory: {[f.name for f in all_files]}", important=True)
+                
+                # Find DM file: NBD-WF-18-DM Deposit Liability Week*.xlsx
+                matches = glob.glob(str(date_folder / "NBD-WF-18-DM Deposit Liability Week*.xlsx")) + \
+                         glob.glob(str(date_folder / "NBD-WF-18-DM*.xlsx")) + \
+                         glob.glob(str(date_folder / "NBD*WF*18*DM*.xlsx"))
+                _emit_log(f"Pattern matches found: {matches}", important=True)
+                if matches:
+                    src = Path(max(matches, key=lambda x: Path(x).stat().st_mtime))
+                    new_name = f"NBD-WF-18-DM Deposit Liability Week {week_number}.xlsx"
+                    dst = src.with_name(new_name)
+                    if src.name != new_name:
+                        try:
+                            src.rename(dst)
+                            src = dst
+                            _emit_log(f"Renamed DM file to {dst.name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"DM rename failed (continuing): {e}", important=True)
+                    _download_files.append(src)
+                    _emit_log(f"Added main DM file to download queue: {src.name}", important=True)
+                else:
+                    _emit_log("DM .xlsx file not found for renaming", important=True)
+                    # Try to find any Excel file that might be the DM file
+                    excel_files = list(date_folder.glob("*.xlsx"))
+                    if excel_files:
+                        _emit_log(f"Found Excel files but none matched pattern: {[f.name for f in excel_files]}", important=True)
+                        # Use the most recent Excel file as fallback
+                        src = max(excel_files, key=lambda x: x.stat().st_mtime)
+                        _download_files.append(src)
+                        _emit_log(f"Added fallback Excel file to download queue: {src.name}", important=True)
+
+                # Add exceptions file if it exists
+                exceptions_file = date_folder / "NBD_WF_18_DM_Detailed_Exceptions.txt"
+                if exceptions_file.exists():
+                    _download_files.append(exceptions_file)
+                    _emit_log(f"Added exceptions file to download: {exceptions_file.name}", important=True)
+                else:
+                    _emit_log("No exceptions file found for DM", important=True)
+                
+                _emit_log(f"Total files in download queue: {len(_download_files)}", important=True)
+
+                # Rename working folder to picked date format DD-MM-YYYY
+                try:
+                    dt = datetime.strptime(gui_date_str, "%Y-%m-%d")
+                except Exception:
+                    try:
+                        dt = datetime.strptime(gui_date_str, "%m/%d/%Y")
+                    except Exception:
+                        dt = None
+                if dt is not None:
+                    picked_name = dt.strftime("%d-%m-%Y")
+                    if date_folder.name != picked_name:
+                        target = date_folder.parent / picked_name
+                        if target.exists():
+                            shutil.rmtree(target)
+                        try:
+                            date_folder.rename(target)
+                            date_folder = target
+                            _emit_log(f"Renamed working folder to {picked_name}", important=True)
+                        except Exception as e:
+                            _emit_log(f"Failed to rename working folder: {e}", important=True)
+
+                # Save to outputs with versioning using selected date
+                ok, msg, output_path = save_folder_to_outputs("NBD-WF-18-DM", gui_date_str)
+                if ok and output_path:
+                    _emit_log(f"Saved DM: {msg}", important=True)
+                    _last_output_dirs["NBD-WF-18-DM"] = output_path
+                    
+                    # Update file paths in _download_files to point to the new output location
+                    updated_download_files = []
+                    for file_path in _download_files:
+                        if file_path.exists():
+                            # File still exists at original location, keep it
+                            updated_download_files.append(file_path)
+                        else:
+                            # File was moved, try to find it in the new output location
+                            new_path = output_path / file_path.name
+                            if new_path.exists():
+                                updated_download_files.append(new_path)
+                                _emit_log(f"Updated file path: {file_path.name} -> {new_path}", important=True)
+                            else:
+                                _emit_log(f"Could not find moved file: {file_path.name}", important=True)
+                    
+                    _download_files = updated_download_files
+                    _emit_log(f"Updated download files after move: {len(_download_files)} files", important=True)
+
+                # Prepare downloads
+                _set_status(stage="saving", message="Preparing files for download")
+                try:
+                    auto_download_files()
+                except Exception as e:
+                    _emit_log(f"Warning: DM download prep failed: {e}", important=True)
+            else:
+                _emit_log("Unexpected working folder structure for DM; skipping post-processing", important=True)
+        except Exception as e:
+            _emit_log(f"DM post-processing failed: {e}", important=True)
+    elif is_ia_flow:
+        # Post-processing for IA flow: handle both IA and C1-C2 reports
+        try:
+            # Determine GUI date
+            any_date = list(report_ids_with_dates.values())[0]
+            gui_date_str, gui_month, gui_year = any_date
+            
+            # Handle IA report
+            # IA and C1C2 always run together, so IA will save to outputs and C1C2 will also save
+            # Both will save their respective outputs
+
+            if "NBD-MF-23-IA" in report_ids_with_dates:
+                ia_work_dir = WORKING_DIR / "NBD_MF_23_IA"
+                date_folders = [p for p in ia_work_dir.iterdir() if p.is_dir()]
+                if len(date_folders) == 1:
+                    date_folder = date_folders[0]
+
+                    # Find and rename IA output file
+                    ia_matches = glob.glob(str(date_folder / "Prod. wise Class. of Loans*.xlsb"))
+                    if ia_matches:
+                        src = Path(max(ia_matches, key=lambda x: Path(x).stat().st_mtime))
+                        new_name = f"Prod. wise Class. of Loans - {gui_month} {gui_year}.xlsb"
+                        dst = src.with_name(new_name)
+                        if src.name != new_name:
+                            try:
+                                src.rename(dst)
+                                src = dst
+                                _emit_log(f"Renamed IA file to {dst.name}", important=True)
+                            except Exception as e:
+                                _emit_log(f"IA rename failed (continuing): {e}", important=True)
+
+                    # Rename working folder to picked date format DD-MM-YYYY
+                    try:
+                        dt = datetime.strptime(gui_date_str, "%Y-%m-%d")
+                    except Exception:
+                        try:
+                            dt = datetime.strptime(gui_date_str, "%m/%d/%Y")
+                        except Exception:
+                            dt = None
+                    if dt is not None:
+                        picked_name = dt.strftime("%d-%m-%Y")
+                        if date_folder.name != picked_name:
+                            target = date_folder.parent / picked_name
+                            if target.exists():
+                                shutil.rmtree(target)
+                            try:
+                                date_folder.rename(target)
+                                date_folder = target
+                                _emit_log(f"Renamed working folder to {picked_name}", important=True)
+                            except Exception as e:
+                                _emit_log(f"Failed to rename working folder: {e}", important=True)
+
+                    # IA files stay in working folder for now
+                    # They will be saved to outputs after C1-C2 completes
+                    _emit_log("IA completed - files ready in working folder", important=True)
+
+            # Handle C1-C2 report (if selected)
+            if "NBD-MF-23-C1-C2" in report_ids_with_dates:
+                # C1-C2 uses the same working folder as IA
+                ia_work_dir = WORKING_DIR / "NBD_MF_23_IA"
+                date_folders = [p for p in ia_work_dir.iterdir() if p.is_dir()]
+                if len(date_folders) == 1:
+                    date_folder = date_folders[0]
+
+                    # Find the updated C1-C2 file (already renamed by IA section)
+                    c1c2_file_path = date_folder / f"Prod. wise Class. of Loans - {gui_month} {gui_year}.xlsb"
+                    if c1c2_file_path.exists():
+                        # Add to download queue
+                        _download_files.append(c1c2_file_path)
+                        _emit_log(f"Added C1-C2 file to download queue: {c1c2_file_path.name}", important=True)
+
+                        # Copy updated C1-C2 file from working folder to C1-C6, C8, and C3-C10/Input
+                        _emit_log(f"Copying updated C1-C2 file to additional output folders...", important=True)
+                        copy_ia_to_additional_outputs(c1c2_file_path, gui_date_str)
+                    else:
+                        _emit_log(f"Warning: C1-C2 file not found in working folder", important=True)
+
+                    # Find and add EXCEPTIONS.xlsx if it exists
+                    exceptions_file = date_folder / "EXCEPTIONS.xlsx"
+                    if exceptions_file.exists():
+                        _download_files.append(exceptions_file)
+                        _emit_log(f"Added EXCEPTIONS.xlsx to download queue", important=True)
+
+                    # Find and add Minimum_Rate_Exceptions.xlsx if it exists
+                    min_rate_exceptions = date_folder / "Minimum_Rate_Exceptions.xlsx"
+                    if min_rate_exceptions.exists():
+                        _download_files.append(min_rate_exceptions)
+                        _emit_log(f"Added Minimum_Rate_Exceptions.xlsx to download queue", important=True)
+
+                    # Save working folder to IA outputs (not C1-C2 outputs)
+                    ok, msg, output_path = save_folder_to_outputs("NBD-MF-23-IA", gui_date_str)
+                    if ok and output_path:
+                        _emit_log(f"Saved IA/C1-C2 working folder to IA outputs: {msg}", important=True)
+                        _last_output_dirs["NBD-MF-23-IA"] = output_path
+                        _last_output_dirs["NBD-MF-23-C1-C2"] = output_path
+                    else:
+                        _emit_log(f"Warning: Could not save working folder to outputs: {msg}", important=True)
+
+                    # C1C2 uses Ctrl+S method - files stay in working location for download
+                    _emit_log("C1C2 completed - files ready for download from working location", important=True)
+
+            # Prepare downloads
+            _set_status(stage="saving", message="Preparing files for download")
+            try:
+                auto_download_files()
+            except Exception as e:
+                _emit_log(f"Warning: IA flow download prep failed: {e}", important=True)
+                
+        except Exception as e:
+            _emit_log(f"IA flow post-processing failed: {e}", important=True)
+    else:
+        # Save completed reports back to outputs with selected dates (IA/SOFP flow)
+        _set_status(stage="saving", message="Saving reports to outputs")
+        for report_id in report_ids:
+            # Skip saving for C1/C2 as they don't have their own working folder
+            if report_id in ("NBD-MF-23-C1", "NBD-MF-23-C2"):
+                continue
+            if _stop_requested:
+                break
+            
+            date_str, _, _ = report_ids_with_dates[report_id]
+            success, msg, output_path = save_folder_to_outputs(report_id, date_str)
+            if success and output_path:
+                _emit_log(f"Saved {report_id}: {msg}", important=True)
+                _last_output_dirs[report_id] = output_path
+                # For SOFP-only flow, queue the file from working directory for download
+                if only_sofp_flow and report_id == "NBD-MF-01-SOFP-SOCI" and _sofp_download_file:
+                    # Download from working directory where the file was renamed
+                    if _sofp_download_file.exists():
+                        _download_files = [_sofp_download_file]
+                        _emit_log(f"Queued SOFP file from working directory for download: {_sofp_download_file}", important=True)
+    
+    if _stop_requested:
+        return False, "Process stopped by user"
+    
+    if all_success:
+        # Outputs have already been saved explicitly per-flow; avoid duplicating version folders
+        
+        # Prepare downloads: for SOFP-only, return the single renamed .xlsx; otherwise create zip
+        if not only_sofp_flow:
+            _set_status(stage="saving", message="Preparing files for download")
+            try:
+                auto_download_files()
+            except Exception as e:
+                _emit_log(f"Warning: Failed to prepare files for download: {e}", important=True)
+        
+        return True, "All reports completed successfully"
+    else:
+        return False, f"Some reports failed: {'; '.join(failed_reports)}"
 
 
-app = Flask(__name__)
-# Require a proper secret key in production; default only for local dev
+def ensure_directories_exist() -> None:
+    """Ensure all necessary directories exist."""
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    WORKING_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    MASTER_INPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Create Master Inputs subdirectories
+    (MASTER_INPUTS_DIR / "ALCL Management Accounts").mkdir(parents=True, exist_ok=True)
+    (MASTER_INPUTS_DIR / "Investment Schedule").mkdir(parents=True, exist_ok=True)
+    (MASTER_INPUTS_DIR / "Loan Schedule").mkdir(parents=True, exist_ok=True)
+    (MASTER_INPUTS_DIR / "Supporting Schedules").mkdir(parents=True, exist_ok=True)
+    (MASTER_INPUTS_DIR / "Borrowing report").mkdir(parents=True, exist_ok=True)
+    (MASTER_INPUTS_DIR / "Disbursement with Budget").mkdir(parents=True, exist_ok=True)
+    (MASTER_INPUTS_DIR / "Information Request from Credit").mkdir(parents=True, exist_ok=True)
+    (MASTER_INPUTS_DIR / "Net Portfolio").mkdir(parents=True, exist_ok=True)
+    (MASTER_INPUTS_DIR / "Cadre").mkdir(parents=True, exist_ok=True)
+    (MASTER_INPUTS_DIR / "Unutilized Amount").mkdir(parents=True, exist_ok=True)
+    
+    # Ensure Master_Data.xlsx exists with required sheets
+    if not MASTER_DATA_XLSX.exists():
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)  # Remove default sheet
+        wb.create_sheet("NBD-MF-01-SOFP-SOCI")
+        wb.create_sheet("NBD-MF-23-IA-C1&C2-C5-IP")
+        wb.create_sheet("NBD-MF-20-C1-C6")
+        wb.save(MASTER_DATA_XLSX)
+        wb.close()
+
+
+# ==================== FLASK ROUTES ====================
+
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-me-in-prod")
 
 
-@app.route("/", methods=["GET"]) 
+@app.route("/", methods=["GET"])
 def index():
     ensure_directories_exist()
     today_iso = datetime.today().strftime("%Y-%m-%d")
-    return render_template("index.html", today_iso=today_iso)
+
+    # Group reports by level and set
+    reports_by_level = {}
+    sets_info = {}
+
+    for report_id, info in REPORT_STRUCTURE.items():
+        level = info["level"]
+        if level not in reports_by_level:
+            reports_by_level[level] = {}
+
+        set_num = info["set"]
+        if set_num not in reports_by_level[level]:
+            reports_by_level[level][set_num] = []
+            sets_info[set_num] = {"estimated_minutes": 0}
+
+        # Filter out specific reports from Level 2 Set 7 UI (handled by C1–C6 flow)
+        if level == 2 and set_num == 7 and report_id in ("NBD-MF-20-C1", "NBD-MF-01-SOFP-SOCI"):
+            continue
+
+        # Filter out old GA & IS reports from Set 5 UI (replaced by NBD-MF-10-GA-11-IS-SET8)
+        if level == 2 and set_num == 5 and report_id in ("NBD-MF-10-GA", "NBD-MF-11-IS"):
+            continue
+
+        # Filter out SOFP-SOCI from Set 6 UI (not required to be listed)
+        if level == 2 and set_num == 6 and report_id == "NBD-MF-01-SOFP-SOCI":
+            continue
+
+        report_entry = {
+            "id": report_id,
+            "name": info["name"],
+            "step": info["step"],
+            "estimated_minutes": info.get("estimated_minutes", 10)
+        }
+        reports_by_level[level][set_num].append(report_entry)
+        sets_info[set_num]["estimated_minutes"] += report_entry["estimated_minutes"]
+
+    # Sort reports within each set by step
+    for level in reports_by_level:
+        for set_num in reports_by_level[level]:
+            reports_by_level[level][set_num].sort(key=lambda x: x["step"])
 
 
-@app.route("/start", methods=["POST"]) 
-def start_automation():
+    return render_template("index_new.html",
+                         today_iso=today_iso,
+                         reports_by_level=reports_by_level,
+                         sets_info=sets_info,
+                         report_structure=REPORT_STRUCTURE)
+
+
+@app.route("/run-reports", methods=["POST"])
+def run_reports():
+    """Run selected reports with individual dates per set."""
     ensure_directories_exist()
-    frequency = request.form.get("frequency", "").strip().lower()
+
+    form_data = request.form
+    report_ids_with_dates = {}
+
+    for key in form_data:
+        if key.startswith("date_"):
+            set_num = key.replace("date_", "")
+            date_str = form_data[key]
+
+            set_reports = form_data.getlist(f"reports_{set_num}")
+
+            if set_reports and date_str:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                report_month = dt.strftime("%B")
+                report_year = str(dt.year)
+
+                for report_id in set_reports:
+                    report_ids_with_dates[report_id] = (date_str, report_month, report_year)
+
+    if not report_ids_with_dates:
+        flash("Please select at least one report with a date.", "error")
+        return redirect(url_for("index"))
+
+    # Check if this set needs master data input
+    c1c6_ids = {"NBD-MF-20-C1","NBD-MF-20-C2","NBD-MF-20-C3","NBD-MF-20-C4","NBD-MF-20-C5","NBD-MF-20-C6"}
+    needs_master_data = any(report_id in ("NBD-MF-01-SOFP-SOCI", "NBD-MF-23-IA", "NBD-MF-23-C1-C2", "NBD-MF-10-GA-11-IS-SET8", "NBD-MF-23-C4") or report_id in c1c6_ids for report_id in report_ids_with_dates)
+    
+    if needs_master_data:
+        # Store report data in session and redirect to master data form
+        from flask import session
+        session['report_ids_with_dates'] = report_ids_with_dates
+        return redirect(url_for("master_data_form"))
+    
+    # Proceed directly if no master data needed
+    return start_automation_with_data(report_ids_with_dates, {}, {})
+
+
+@app.route("/master-data-form", methods=["GET"])
+def master_data_form():
+    """Display master data input form with latest data pre-filled."""
+    from flask import session
+    sofp_data, ia_data, c1c6_data = get_latest_master_data()
+    uploaded_files = get_latest_uploaded_files()
+    report_ids_with_dates = session.get('report_ids_with_dates', {})
+    selected_ids = set(report_ids_with_dates.keys())
+    c1c6_ids = {"NBD-MF-20-C1","NBD-MF-20-C2","NBD-MF-20-C3","NBD-MF-20-C4","NBD-MF-20-C5","NBD-MF-20-C6"}
+    show_sofp = any(x in ("NBD-MF-01-SOFP-SOCI",) for x in selected_ids)
+    show_ia = any(x in ("NBD-MF-23-IA",) for x in selected_ids)
+    show_c1c2 = any(x in ("NBD-MF-23-C1-C2",) for x in selected_ids)
+    show_c1c6 = any(x in c1c6_ids for x in selected_ids)
+    show_ga_is = any(x in ("NBD-MF-10-GA-11-IS-SET8",) for x in selected_ids)
+    show_c4 = any(x in ("NBD-MF-23-C4",) for x in selected_ids)
+
+    # Get form data from request parameters (for validation error preservation)
+    form_data = request.args.to_dict()
+
+    return render_template("master_data_form.html",
+                         sofp_data=sofp_data,
+                         ia_data=ia_data,
+                         c1c6_data=c1c6_data,
+                         show_sofp=show_sofp,
+                         show_ia=show_ia,
+                         show_c1c2=show_c1c2,
+                         show_c1c6=show_c1c6,
+                         show_ga_is=show_ga_is,
+                         show_c4=show_c4,
+                         uploaded_files=uploaded_files,
+                         form_data=form_data)
+
+
+@app.route("/submit-master-data", methods=["POST"])
+def submit_master_data():
+    """Process master data form submission."""
+    from flask import session
+
+    # Clear download files from any previous run to prevent unwanted downloads on validation failure
+    global _download_files, _sofp_download_file
+    _download_files = []
+    _sofp_download_file = None
+
+    # Get master data from form (exclude timestamp as it's auto-generated)
+    sofp_data = None
+    ia_data = None
+    c1c6_data = None
+
+    # Determine which sections were shown
+    show_sofp = request.form.get("_show_sofp") == "1"
+    show_ia = request.form.get("_show_ia") == "1"
+    show_c1c2 = request.form.get("_show_c1c2") == "1"
+    show_c1c6 = request.form.get("_show_c1c6") == "1"
+    show_ga_is = request.form.get("_show_ga_is") == "1"
+    show_c4 = request.form.get("_show_c4") == "1"
+
+    if show_sofp:
+        sofp_data = {
+            "bank_loans": request.form.get("bank_loans", ""),
+            "securitization_loans": request.form.get("securitization_loans", ""),
+            "foreign_funding": request.form.get("foreign_funding", "")
+        }
+    if show_ia:
+        ia_data = {
+            "annual_interest_rate": request.form.get("annual_interest_rate", "")
+        }
+    if show_c1c6:
+        c1c6_data = {
+            "guarantees": request.form.get("c1c6_guarantees", "")
+        }
+    
+    # Handle file uploads for SOFP
+    uploaded_files = {}
+    months = {}
+    if show_sofp:
+        categories = [
+            "ALCL Management Accounts",
+            "Investment Schedule", 
+            "Loan Schedule",
+            "Supporting Schedules"
+        ]
+        
+        for category in categories:
+            field_name = category.lower().replace(' ', '_')
+            month_field = f"{field_name}_month"
+
+            # Get month selection
+            month = request.form.get(month_field, "").strip()
+
+            # Handle file upload
+            if f"{field_name}_file" in request.files:
+                file = request.files[f"{field_name}_file"]
+                if file and file.filename:
+                    # Month is REQUIRED when file is uploaded
+                    if not month:
+                        flash(f"Month is required when uploading {category} file.", "error")
+                        return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                    # Save month for later use
+                    months[month_field] = month
+
+                    # Save file to Master Inputs directory
+                    category_dir = MASTER_INPUTS_DIR / category
+                    category_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Generate filename with month and year (exact format as specified)
+                    current_year = datetime.now().year
+                    if category == "ALCL Management Accounts":
+                        filename = f"ALCL Management Accounts {month}_{current_year}.xlsx"
+                    elif category == "Investment Schedule":
+                        filename = f"Investment Schedule - {month} {current_year}.xlsx"
+                    elif category == "Loan Schedule":
+                        filename = f"Loan Schedule {month} {current_year}.xlsx"
+                    elif category == "Supporting Schedules":
+                        filename = f"Supporting Schedules - {month} {current_year}.xlsx"
+                    else:
+                        filename = file.filename
+
+                    file_path = category_dir / filename
+                    file.save(str(file_path))
+                    uploaded_files[category] = str(file_path)
+                    _emit_log(f"Uploaded {category} file: {filename}", important=True)
+            elif month:
+                # Month provided but no file - still save the month
+                months[month_field] = month
+    
+    # Handle file uploads for GA IS
+    ga_is_uploaded_files = {}
+    ga_is_dates = {}
+    if show_ga_is:
+        # Handle Borrowing report upload
+        if "borrowing_report_file" in request.files:
+            file = request.files["borrowing_report_file"]
+            if file and file.filename:
+                # Get date selection
+                borrowing_date = request.form.get("borrowing_date", "").strip()
+                if borrowing_date:
+                    ga_is_dates["borrowing_date"] = borrowing_date
+                    
+                    # Save file to Master Inputs directory
+                    category_dir = MASTER_INPUTS_DIR / "Borrowing report"
+                    category_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Generate filename with date (format: Borrowing report 31-08-2025.xlsm)
+                    # Convert date from YYYY-MM-DD to DD-MM-YYYY format
+                    date_obj = datetime.strptime(borrowing_date, "%Y-%m-%d")
+                    formatted_date = date_obj.strftime("%d-%m-%Y")
+                    filename = f"Borrowing report {formatted_date}.xlsm"
+                    
+                    file_path = category_dir / filename
+                    file.save(str(file_path))
+                    ga_is_uploaded_files["Borrowing report"] = str(file_path)
+                    _emit_log(f"Uploaded Borrowing report file: {filename}", important=True)
+
+    # Handle file uploads for C4 (Rec Target)
+    c4_uploaded_files = {}
+    c4_months = {}
+    c4_years = {}
+    if show_c4:
+        # Handle Rec Target upload
+        if "rectarget_file" in request.files:
+            file = request.files["rectarget_file"]
+            if file and file.filename:
+                # Get month and year selection
+                month = request.form.get("rectarget_month", "").strip()
+                year = request.form.get("rectarget_year", "").strip()
+
+                # Month and Year are REQUIRED when file is uploaded
+                if not month or not year:
+                    flash(f"Month and Year are required when uploading Rec Target file.", "error")
+                    return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                # Validate year - must be exactly 4 digits, no symbols or characters
+                if not year.isdigit() or len(year) != 4:
+                    flash(f"Invalid year for Rec Target: {year}. Please enter a valid 4-digit year (e.g., 2025).", "error")
+                    return redirect(url_for("master_data_form", **request.form.to_dict()))
+                year_int = int(year)
+                if year_int < 2000 or year_int > 2100:
+                    flash(f"Invalid year for Rec Target: {year}. Please enter a year between 2000 and 2100.", "error")
+                    return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                # Save month/year for later use
+                c4_months["rectarget_month"] = month
+                c4_years["rectarget_year"] = year
+
+                # Save file to Master Inputs directory
+                category_dir = MASTER_INPUTS_DIR / "Rec Target"
+                category_dir.mkdir(parents=True, exist_ok=True)
+
+                # Generate filename: Rec Target - July 2025.xlsx
+                filename = f"Rec Target - {month} {year}.xlsx"
+
+                file_path = category_dir / filename
+                file.save(str(file_path))
+                c4_uploaded_files["Rec Target"] = str(file_path)
+                _emit_log(f"Uploaded Rec Target file: {filename}", important=True)
+
+                # Copy to latest C4 outputs folder
+                try:
+                    c4_outputs_dir = OUTPUTS_DIR / "NBD_MF_23_C4"
+                    _emit_log(f"C4 outputs directory: {c4_outputs_dir}", important=True)
+
+                    if c4_outputs_dir.exists():
+                        _emit_log(f"C4 outputs directory exists, finding latest completed date...", important=True)
+                        # Find latest completed date in C4
+                        _, c4_date_folder = find_latest_completed_date(c4_outputs_dir)
+
+                        if c4_date_folder and c4_date_folder.exists():
+                            _emit_log(f"Found C4 latest date folder: {c4_date_folder}", important=True)
+
+                            # Remove old Rec Target files (files starting with "Rec Target" and ending with ".xlsx")
+                            removed_count = 0
+                            for f in c4_date_folder.iterdir():
+                                if f.is_file() and f.suffix.lower() == ".xlsx":
+                                    if f.name.startswith("Rec Target"):
+                                        try:
+                                            _emit_log(f"Removing old Rec Target file: {f.name}", important=True)
+                                            f.unlink()
+                                            removed_count += 1
+                                        except Exception as e:
+                                            _emit_log(f"Failed to remove old Rec Target file {f.name}: {e}", important=True)
+
+                            if removed_count > 0:
+                                _emit_log(f"Removed {removed_count} old Rec Target file(s) from C4 outputs", important=True)
+                            else:
+                                _emit_log(f"No old Rec Target files found to remove", important=True)
+
+                            # Copy the new file
+                            dest_path = c4_date_folder / filename
+                            shutil.copy2(file_path, dest_path)
+                            _emit_log(f"Copied Rec Target file to C4 outputs: {dest_path}", important=True)
+                        else:
+                            _emit_log("No completed date folder found for C4", important=True)
+                    else:
+                        _emit_log(f"C4 outputs directory does not exist: {c4_outputs_dir}", important=True)
+                except Exception as e:
+                    _emit_log(f"Failed to copy Rec Target file to C4 outputs: {e}", important=True)
+                    import traceback
+                    _emit_log(f"Traceback: {traceback.format_exc()}", important=True)
+
+    # Handle file uploads for IA
+    ia_uploaded_files = {}
+    ia_months = {}
+    ia_years = {}
+    if show_ia:
+        categories = [
+            "Disbursement with Budget",
+            "Information Request from Credit",
+            "Net Portfolio"
+        ]
+        
+        for category in categories:
+            field_name = category.lower().replace(' ', '_')
+            month_field = f"{field_name}_month"
+            year_field = f"{field_name}_year"
+
+            # Get month and year selection
+            month = request.form.get(month_field, "").strip()
+            year = request.form.get(year_field, "").strip()
+
+            # Handle file upload
+            if f"{field_name}_file" in request.files:
+                file = request.files[f"{field_name}_file"]
+                if file and file.filename:
+                    # Month and Year are REQUIRED when file is uploaded
+                    if not month or not year:
+                        flash(f"Month and Year are required when uploading {category} file.", "error")
+                        return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                    # Validate year - must be exactly 4 digits, no symbols or characters
+                    if not year.isdigit() or len(year) != 4:
+                        flash(f"Invalid year for {category}: {year}. Please enter a valid 4-digit year (e.g., 2025).", "error")
+                        return redirect(url_for("master_data_form", **request.form.to_dict()))
+                    year_int = int(year)
+                    if year_int < 2000 or year_int > 2100:
+                        flash(f"Invalid year for {category}: {year}. Please enter a year between 2000 and 2100.", "error")
+                        return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                    # Save month/year for later use
+                    ia_months[month_field] = month
+                    ia_years[year_field] = year
+
+                    # Save file to Master Inputs directory
+                    category_dir = MASTER_INPUTS_DIR / category
+                    category_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Generate filename with month and year (exact format as specified)
+                    if category == "Disbursement with Budget":
+                        full_month = get_full_month_name(month)
+                        filename = f"Disbursement with Budget - {full_month} {year}.xlsx"
+                    elif category == "Information Request from Credit":
+                        full_month = get_full_month_name(month)
+                        filename = f"Information Request from Credit-{full_month} {year}.xlsx"
+                    elif category == "Net Portfolio":
+                        full_month = get_full_month_name(month)
+                        filename = f"Net Portfolio-{full_month}-{year}.xlsx"
+                    else:
+                        filename = file.filename
+
+                    file_path = category_dir / filename
+                    file.save(str(file_path))
+                    ia_uploaded_files[category] = str(file_path)
+                    _emit_log(f"Uploaded {category} file: {filename}", important=True)
+            elif month and year:
+                # Month/year provided but no file - validate and save
+                # Validate year - must be exactly 4 digits, no symbols or characters
+                if not year.isdigit() or len(year) != 4:
+                    flash(f"Invalid year for {category}: {year}. Please enter a valid 4-digit year (e.g., 2025).", "error")
+                    return redirect(url_for("master_data_form", **request.form.to_dict()))
+                year_int = int(year)
+                if year_int < 2000 or year_int > 2100:
+                    flash(f"Invalid year for {category}: {year}. Please enter a year between 2000 and 2100.", "error")
+                    return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                ia_months[month_field] = month
+                ia_years[year_field] = year
+    
+    # Handle file uploads for C1-C2
+    c1c2_uploaded_files = {}
+    c1c2_dates = {}
+    c1c2_months = {}
+    c1c2_years = {}
+    if show_c1c2:
+        categories = [
+            ("Cadre", "date"),
+            ("Unutilized Amount", "month_year")
+        ]
+        
+        for category, type_info in categories:
+            field_name = category.lower().replace(' ', '_')
+            
+            if type_info == "date":
+                # Handle Cadre with date picker
+                date_field = f"{field_name}_date"
+                date_value = request.form.get(date_field, "").strip()
+
+                # Handle file upload
+                if f"{field_name}_file" in request.files:
+                    file = request.files[f"{field_name}_file"]
+                    if file and file.filename:
+                        # Date is REQUIRED when file is uploaded
+                        if not date_value:
+                            flash(f"Date is required when uploading {category} file.", "error")
+                            return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                        # Save date for later use
+                        c1c2_dates[date_field] = date_value
+
+                        # Save file to Master Inputs directory
+                        category_dir = MASTER_INPUTS_DIR / category
+                        category_dir.mkdir(parents=True, exist_ok=True)
+
+                        # Generate filename with date (format: Cadre 31 07 2025.xlsx)
+                        # Convert date from YYYY-MM-DD to DD MM YYYY format
+                        date_obj = datetime.strptime(date_value, "%Y-%m-%d")
+                        formatted_date = date_obj.strftime("%d %m %Y")
+                        filename = f"Cadre {formatted_date}.xlsx"
+
+                        file_path = category_dir / filename
+                        file.save(str(file_path))
+                        c1c2_uploaded_files[category] = str(file_path)
+                        _emit_log(f"Uploaded {category} file: {filename}", important=True)
+                elif date_value:
+                    # Date provided but no file - still save the date
+                    c1c2_dates[date_field] = date_value
+            
+            elif type_info == "month_year":
+                # Handle Unutilized Amount with month/year
+                month_field = f"{field_name}_month"
+                year_field = f"{field_name}_year"
+
+                month = request.form.get(month_field, "").strip()
+                year = request.form.get(year_field, "").strip()
+
+                # Handle file upload
+                if f"{field_name}_file" in request.files:
+                    file = request.files[f"{field_name}_file"]
+                    if file and file.filename:
+                        # Month and Year are REQUIRED when file is uploaded
+                        if not month or not year:
+                            flash(f"Month and Year are required when uploading {category} file.", "error")
+                            return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                        # Validate year - must be exactly 4 digits, no symbols or characters
+                        if not year.isdigit() or len(year) != 4:
+                            flash(f"Invalid year for {category}: {year}. Please enter a valid 4-digit year (e.g., 2025).", "error")
+                            return redirect(url_for("master_data_form", **request.form.to_dict()))
+                        year_int = int(year)
+                        if year_int < 2000 or year_int > 2100:
+                            flash(f"Invalid year for {category}: {year}. Please enter a year between 2000 and 2100.", "error")
+                            return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                        # Save month/year for later use
+                        c1c2_months[month_field] = month
+                        c1c2_years[year_field] = year
+
+                        # Save file to Master Inputs directory
+                        category_dir = MASTER_INPUTS_DIR / category
+                        category_dir.mkdir(parents=True, exist_ok=True)
+
+                        # Generate filename with month and year (format: Unutilized Amount JULY 2025.xlsx)
+                        full_month = get_full_month_name(month)
+                        filename = f"Unutilized Amount {full_month.upper()} {year}.xlsx"
+
+                        file_path = category_dir / filename
+                        file.save(str(file_path))
+                        c1c2_uploaded_files[category] = str(file_path)
+                        _emit_log(f"Uploaded {category} file: {filename}", important=True)
+                elif month and year:
+                    # Month/year provided but no file - validate and save
+                    # Validate year - must be exactly 4 digits, no symbols or characters
+                    if not year.isdigit() or len(year) != 4:
+                        flash(f"Invalid year for {category}: {year}. Please enter a valid 4-digit year (e.g., 2025).", "error")
+                        return redirect(url_for("master_data_form", **request.form.to_dict()))
+                    year_int = int(year)
+                    if year_int < 2000 or year_int > 2100:
+                        flash(f"Invalid year for {category}: {year}. Please enter a year between 2000 and 2100.", "error")
+                        return redirect(url_for("master_data_form", **request.form.to_dict()))
+
+                    c1c2_months[month_field] = month
+                    c1c2_years[year_field] = year
+
+    # Save to Master_Data.xlsx
+    success, msg = save_master_data(sofp_data, ia_data, c1c6_data)
+    if not success:
+        flash(f"Failed to save master data: {msg}", "error")
+        return redirect(url_for("master_data_form"))
+    
+    # Get report data from session
+    report_ids_with_dates = session.get('report_ids_with_dates', {})
+    if not report_ids_with_dates:
+        flash("No report data found. Please start again.", "error")
+        return redirect(url_for("index"))
+    
+    # Clear session data
+    session.pop('report_ids_with_dates', None)
+    
+    # Copy uploaded files to SOFP outputs before starting automation
+    if show_sofp and uploaded_files and months:
+        try:
+            _emit_log("Copying uploaded files to SOFP outputs before automation starts", important=True)
+            copy_uploaded_files_to_sofp_outputs(uploaded_files, months)
+        except Exception as e:
+            _emit_log(f"Failed to copy uploaded files before automation: {e}", important=True)
+    
+    # Copy uploaded files to IA outputs before starting automation
+    if show_ia and ia_uploaded_files and ia_months and ia_years:
+        try:
+            _emit_log("Copying uploaded files to IA outputs before automation starts", important=True)
+            # Clean up any existing duplicate files first
+            cleanup_duplicate_ia_files()
+            copy_uploaded_files_to_ia_outputs(ia_uploaded_files, ia_months, ia_years)
+        except Exception as e:
+            _emit_log(f"Failed to copy IA uploaded files before automation: {e}", important=True)
+    
+    # Copy uploaded files to C1-C2 outputs before starting automation
+    if show_c1c2 and c1c2_uploaded_files and (c1c2_dates or (c1c2_months and c1c2_years)):
+        try:
+            _emit_log("Copying uploaded files to C1-C2 outputs before automation starts", important=True)
+            # Clean up any existing duplicate files first
+            cleanup_duplicate_c1c2_files()
+            copy_uploaded_files_to_c1c2_outputs(c1c2_uploaded_files, c1c2_dates, c1c2_months, c1c2_years)
+        except Exception as e:
+            _emit_log(f"Failed to copy C1-C2 uploaded files before automation: {e}", important=True)
+    
+    # Copy uploaded files to GA IS outputs before starting automation
+    if show_ga_is and ga_is_uploaded_files and ga_is_dates:
+        try:
+            _emit_log("Copying uploaded files to GA IS outputs before automation starts", important=True)
+            copy_uploaded_files_to_ga_is_outputs(ga_is_uploaded_files, ga_is_dates)
+        except Exception as e:
+            _emit_log(f"Failed to copy GA IS uploaded files before automation: {e}", important=True)
+    
+    # Validate SOFP file exists for IA automation (IA and C1C2 run together)
+    if show_ia or show_c1c2:
+        try:
+            _emit_log("Validating SOFP file exists for IA automation (IA and C1C2 run together)", important=True)
+            is_valid, validation_msg = validate_sofp_file_for_ia(report_ids_with_dates)
+            if not is_valid:
+                flash(f"Validation failed: {validation_msg}", "error")
+                return redirect(url_for("index"))
+        except Exception as e:
+            _emit_log(f"Failed to validate SOFP file for IA: {e}", important=True)
+            flash(f"Validation error: {e}", "error")
+            return redirect(url_for("index"))
+    
+    # Validate SOFP file exists for GA IS automation
+    if show_ga_is:
+        try:
+            _emit_log("Validating SOFP file exists for GA IS automation", important=True)
+            is_valid, validation_msg = validate_sofp_file_for_ga_is(report_ids_with_dates)
+            if not is_valid:
+                flash(f"Validation failed: {validation_msg}", "error")
+                return redirect(url_for("index"))
+        except Exception as e:
+            _emit_log(f"Failed to validate SOFP file for GA IS: {e}", important=True)
+            flash(f"Validation error: {e}", "error")
+            return redirect(url_for("index"))
+    
+    # Validate Set 7 reports (C2-C6) - must select all together and check required files
+    set7_reports = {"NBD-MF-20-C2", "NBD-MF-20-C3", "NBD-MF-20-C4", "NBD-MF-20-C5", "NBD-MF-20-C6"}
+    selected_set7_reports = set(report_ids_with_dates.keys()) & set7_reports
+    
+    if selected_set7_reports:
+        # Check if all Set 7 reports are selected
+        if len(selected_set7_reports) != len(set7_reports):
+            missing_reports = set7_reports - selected_set7_reports
+            flash(f"Set 7 reports must be selected together. Missing: {', '.join(missing_reports)}", "error")
+            return redirect(url_for("index"))
+        
+        # Validate required files exist
+        try:
+            _emit_log("Validating required files for Set 7 automation", important=True)
+            is_valid, validation_msg = validate_set7_required_files(report_ids_with_dates)
+            if not is_valid:
+                flash(f"Validation failed: {validation_msg}", "error")
+                return redirect(url_for("index"))
+        except Exception as e:
+            _emit_log(f"Failed to validate Set 7 required files: {e}", important=True)
+            flash(f"Validation error: {e}", "error")
+            return redirect(url_for("index"))
+    
+    # Start automation
+    return start_automation_with_data(report_ids_with_dates, sofp_data, ia_data, uploaded_files, months)
+
+
+@app.route("/mark-completed", methods=["POST"])
+def mark_completed():
+    """Mark a report as completed by appending date to completed_dates.txt"""
+    report_id = request.form.get("report_id", "").strip()
     date_str = request.form.get("date", "").strip()
-    _set_status(running=True, stage="starting", frequency=frequency, date=date_str, message="Starting automation")
-    # Initialize new run with timestamped logs
+    
+    if not report_id or not date_str:
+        flash("Please select a report and date.", "error")
+        return redirect(url_for("index"))
+    
+    if report_id not in REPORT_STRUCTURE:
+        flash("Invalid report selected.", "error")
+        return redirect(url_for("index"))
+    
+    try:
+        # Convert date from YYYY-MM-DD to DD-MM-YYYY format
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        formatted_date = dt.strftime("%d-%m-%Y")
+        
+        # Get the report folder name
+        folder_name = REPORT_STRUCTURE[report_id]["folder"]
+        completed_file = OUTPUTS_DIR / folder_name / "completed_dates.txt"
+        
+        # Ensure the directory exists
+        completed_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Append the date to completed_dates.txt
+        with open(completed_file, "a", encoding="utf-8") as f:
+            f.write(formatted_date + "\n")
+        
+        flash(f"Marked {REPORT_STRUCTURE[report_id]['name']} as completed for {formatted_date}.", "success")
+        
+    except ValueError:
+        flash("Invalid date format. Please use the date picker.", "error")
+    except Exception as e:
+        flash(f"Failed to mark as completed: {e}", "error")
+    
+    return redirect(url_for("index"))
+
+
+def start_automation_with_data(report_ids_with_dates: dict, sofp_data: dict, ia_data: dict, uploaded_files: dict = None, months: dict = None):
+    """Start automation with master data."""
+    # Initialize new run
     _initialize_new_run()
-    # Reset per-run buffers
-    _clear_logs()
-    _status_feed.clear()
-    global _report_checklist, _report_messages, _last_output_dir, _stop_requested
+    global _report_checklist, _report_messages, _last_output_dirs, _stop_requested, _download_files, _sofp_download_file
     _report_checklist = []
     _report_messages = {}
-    _last_output_dir = None
+    _last_output_dirs = {}
+    _download_files = []
+    _sofp_download_file = None
     _stop_requested = False
-    # Clear running processes and threads
-    with _proc_lock:
-        _running_processes.clear()
-    _running_threads.clear()
     
-    if frequency not in {"weekly", "monthly", "quarterly", "annually"}:
-        flash("Invalid frequency.", "error")
-        return redirect(url_for("index"))
-    
-    # Get the last completed date for this frequency
-    last_ui_date = get_last_completed_date(frequency)
-    if not last_ui_date:
-        flash(f"No completed {frequency} date found. Use Complete first.", "warning")
-        _set_status(stage="error", running=False, message="No completed date found")
-        return redirect(url_for("index"))
+    # Clean up any existing duplicate files before starting automation
+    _emit_log("Cleaning up duplicate files before starting automation", important=True)
+    cleanup_duplicate_ia_files()
+    cleanup_duplicate_c1c2_files()
 
-    safe_name = ui_date_to_folder_name(last_ui_date)
-    _set_status(stage="copying", date=last_ui_date, message=f"Copying latest {safe_name} folder to working")
+    _set_status(running=True, stage="starting", message=f"Starting {len(report_ids_with_dates)} reports")
 
-    # Always copy the latest versioned folder for the last completed date to working
-    ok, message = copy_latest_for_date_to_working(frequency, last_ui_date, clean_working=True)
-    flash(message, "success" if ok else "warning")
-    if not ok:
-        _set_status(stage="error", running=False, message=message)
-        return redirect(url_for("index"))
+    # Run reports in background thread
+    def run_in_background():
+        _set_status(stage="running", message="Running selected reports")
+        success, msg = run_selected_reports(report_ids_with_dates)
+        _set_status(running=False, stage="done" if success else "error", message=msg)
 
-    # Determine working date folder for bot/report steps
-    working_freq_dir = WORKING_DIR / frequency
-    subdirs = [p for p in working_freq_dir.iterdir() if p.is_dir()]
-    if len(subdirs) != 1:
-        _set_status(stage="error", running=False, message=f"Expected one folder under {working_freq_dir}, found {len(subdirs)}")
-        return redirect(url_for("index"))
-    date_folder = subdirs[0]
+    thread = threading.Thread(target=run_in_background, daemon=True)
+    thread.start()
 
-    # 1) Run download bot first
-    # ok_bot, msg_bot = _run_download_bot(date_folder)
-    # flash(msg_bot, "success" if ok_bot else "warning")
-    # if not ok_bot:
-    #     _set_status(stage="error", running=False, message=msg_bot)
-    #     return redirect(url_for("index"))
-
-    # 2) Run reports after bot completes
-    _set_status(stage="running", message="Running automation scripts in parallel")
-    ok_reports, msg_reports = run_reports_for_frequency(frequency, last_ui_date)
-    flash(msg_reports, "success" if ok_reports else "warning")
-
-    # Compute references to the single working date folder (for rename/download setup in both success/failure)
-    safe_name = ui_date_to_folder_name(last_ui_date)
-    parent = OUTPUTS_DIR / frequency
-    working_freq_dir = WORKING_DIR / frequency
-    subdirs = [p for p in working_freq_dir.iterdir() if p.is_dir()]
-
-    if ok_reports:
-        # Save and download only if reports were successful
-        if len(subdirs) == 1:
-            source_folder = subdirs[0]
-            # 1) Rename working folder to picked date base name first (so download matches picked date)
-            try:
-                desired_name = safe_name
-                if source_folder.name != desired_name:
-                    desired_path = working_freq_dir / desired_name
-                    if desired_path.exists():
-                        shutil.rmtree(desired_path, ignore_errors=True)
-                    old_name = source_folder.name
-                    source_folder = source_folder.rename(desired_path)
-                    _emit_log(f"Renamed working folder '{old_name}' to '{source_folder.name}'", important=True)
-            except Exception:
-                _emit_log("Rename of working folder failed; proceeding with existing name", important=True)
-
-            # 2) Signal browser download is ready from the renamed working folder
-            _last_output_dir = source_folder
-            _set_status(stage="download_ready", message="Preparing download")
-
-            # 3) Compute outputs target and copy after signaling download readiness
-            existing = find_latest_versioned_folder(parent, safe_name)
-            if existing is None:
-                target = parent / safe_name
-            else:
-                last = existing.name
-                if last == safe_name:
-                    target = parent / f"{safe_name}(1)"
-                else:
-                    middle = last[len(safe_name) + 1 : -1]
-                    next_n = int(middle) + 1 if middle.isdigit() else 1
-                    target = parent / f"{safe_name}({next_n})"
-
-            try:
-                shutil.copytree(source_folder, target)
-                flash(
-                    f"Saved working folder '{source_folder.name}' to outputs/{frequency} as '{target.name}'.",
-                    "success",
-                )
-                _emit_log(f"Copied working folder to outputs: {target}", important=True)
-                
-                # Zip creation is handled via the /download-latest endpoint for browser-only download
-            except FileExistsError:
-                flash(f"Destination already exists: {target}.", "warning")
-                _emit_log(f"Destination already exists: {target}", important=True)
-            except Exception as exc:
-                flash(f"Failed to save to outputs: {exc}", "warning")
-                _emit_log(f"Failed to save to outputs: {exc}", important=True)
-        else:
-            flash(
-                f"Expected one folder under {working_freq_dir}, found {len(subdirs)}. Skipped saving to outputs.",
-                "warning",
-            )
-            _emit_log(f"Save skipped: expected one folder under {working_freq_dir}, found {len(subdirs)}", important=True)
-
-        # Append history record (use working folder path set in _last_output_dir)
-        try:
-            script_names = [it["name"] + ".py" for it in _report_checklist]
-            _append_run_history(frequency, last_ui_date, script_names, _report_checklist, _last_output_dir)
-        except Exception as exc:
-            _emit_log(f"Failed to write history: {exc}", important=True)
-
-        # Mark completion
-        _set_status(stage="done", running=False, message="Completed")
-    else:
-        # Even on failure, prepare the download from the working folder and record history
-        if len(subdirs) == 1:
-            source_folder = subdirs[0]
-            try:
-                desired_name = safe_name
-                if source_folder.name != desired_name:
-                    desired_path = working_freq_dir / desired_name
-                    if desired_path.exists():
-                        shutil.rmtree(desired_path, ignore_errors=True)
-                    old_name = source_folder.name
-                    source_folder = source_folder.rename(desired_path)
-                    _emit_log(f"Renamed working folder '{old_name}' to '{source_folder.name}' (failed run)", important=True)
-            except Exception:
-                _emit_log("Rename of working folder failed on error path; proceeding with existing name", important=True)
-            # Make the failed run available for download
-            _last_output_dir = source_folder
-            _set_status(stage="download_ready", message="Preparing download (partial)")
-        else:
-            _emit_log(f"Download prep skipped: expected one folder under {working_freq_dir}, found {len(subdirs)}", important=True)
-        # Append history even for failed runs
-        try:
-            script_names = [it["name"] + ".py" for it in _report_checklist]
-            _append_run_history(frequency, last_ui_date, script_names, _report_checklist, _last_output_dir)
-        except Exception as exc:
-            _emit_log(f"Failed to write history: {exc}", important=True)
-        # Do not override stage so auto-download can trigger; only mark running False and include message
-        _set_status(running=False, message=msg_reports)
-    
-    # Clean up thread pool
-    global _thread_pool
-    if _thread_pool:
-        try:
-            _thread_pool.shutdown(wait=True)
-        except Exception:
-            pass
-        _thread_pool = None
-    
+    flash(f"Started running {len(report_ids_with_dates)} reports", "success")
     return redirect(url_for("index"))
 
-@app.route("/complete", methods=["POST"]) 
-def mark_complete():
-    ensure_directories_exist()
-    frequency = request.form.get("frequency", "").strip().lower()
-    date_str = request.form.get("date", "").strip()
-    if frequency not in {"weekly", "monthly", "quarterly", "annually"}:
-        flash("Invalid frequency.", "error")
-        return redirect(url_for("index"))
-    if not date_str:
-        flash("Please pick a date.", "error")
-        return redirect(url_for("index"))
-    
-    # Only append the picked date to completed_dates.txt (no copying)
-    append_completed_date(frequency, date_str)
-    flash(f"Marked {frequency} as completed for {ui_date_to_display(date_str)}.", "success")
 
-    # Reset status to idle (no copying or processing)
-    _reset_status()
-    return redirect(url_for("index"))
-    
-
-@app.route("/status", methods=["GET"]) 
+@app.route("/status", methods=["GET"])
 def status():
     with _status_lock:
         return jsonify(_status)
 
 
-@app.route("/logs", methods=["GET"]) 
+@app.route("/logs", methods=["GET"])
 def logs():
     with _log_lock:
         content = "\n".join(_log_buffer)
     return app.response_class(content, mimetype="text/plain")
 
 
-@app.route("/status-feed", methods=["GET"]) 
+@app.route("/status-feed", methods=["GET"])
 def status_feed():
     content = "\n".join(_status_feed)
     return app.response_class(content, mimetype="text/plain")
 
 
-@app.route("/report-checklist", methods=["GET"]) 
-def report_checklist():
-    return jsonify(_report_checklist)
-
-
-@app.route("/report-messages/<report_stem>", methods=["GET"]) 
-def report_messages(report_stem: str):
-    buf = _report_messages.get(report_stem)
-    if buf is None:
+@app.route("/report-messages/<report_id>", methods=["GET"])
+def report_messages(report_id: str):
+    buf = _report_messages.get(report_id)
+    if not buf:
         return app.response_class("", mimetype="text/plain")
     return app.response_class("\n".join(buf), mimetype="text/plain")
 
 
-@app.route("/history")
-def history():
-    if not HISTORY_XLSX.exists():
-        return jsonify([])
-    wb = openpyxl.load_workbook(HISTORY_XLSX, read_only=True)
-    ws = wb.active
-    data = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        data.append(dict(
-            timestamp=row[0],
-            frequency=row[1],
-            picked_date=row[2],
-            reports=row[3],
-            statuses=row[4],
-            output_folder=row[5]
-        ))
-    wb.close()
-    return jsonify(data)
+@app.route("/report-checklist", methods=["GET"])
+def report_checklist():
+    # Update elapsed times for running reports
+    for item in _report_checklist:
+        if item["status"] == "running":
+            _update_report_elapsed_time(item["name"])
+    return jsonify(_report_checklist)
 
 
-@app.route("/stop", methods=["POST"]) 
+@app.route("/stop", methods=["POST"])
 def stop():
-    _request_stop()
+    global _stop_requested
+    _stop_requested = True
     _set_status(stage="stopping", message="Stopping requested")
+
+    with _proc_lock:
+        for report_id, proc in _running_processes.items():
+            try:
+                proc.terminate()
+                _emit_log(f"Stopped {report_id}", important=True)
+            except Exception:
+                pass
+        _running_processes.clear()
+
     return jsonify({"ok": True})
-
-
-@app.route("/stop-script", methods=["POST"])
-def stop_individual_script():
-    data = request.get_json()
-    report_name = data.get("report_name", "").strip()
-    
-    if not report_name:
-        return jsonify({"success": False, "message": "Report name required"}), 400
-    
-    success = _stop_individual_script(report_name)
-    if success:
-        # Update the report status to stopped
-        for item in _report_checklist:
-            if item["name"] == report_name:
-                item["status"] = "stopped"
-                break
-        return jsonify({"success": True, "message": f"Stopped {report_name}"})
-    else:
-        return jsonify({"success": False, "message": f"Report {report_name} not found or already stopped"})
 
 
 @app.route("/download-latest", methods=["GET"])
 def download_latest():
-    # Create zip with specific output files only
-    global _last_output_dir
-    if _last_output_dir is None or not _last_output_dir.exists():
-        return jsonify({"error": "No output to download."}), 400
-
-    base_name = _last_output_dir.name
-    temp_zip_dir = BASE_DIR / "temp_zips"
+    """Download the prepared zip file with completed report files."""
+    global _download_files
+    
+    _emit_log(f"Download requested. Current _download_files: {len(_download_files) if _download_files else 0} files", important=True)
+    
+    if not _download_files or not _download_files[0].exists():
+        _emit_log("No valid files in _download_files, attempting to prepare files", important=True)
+        # If no prepared zip exists, create one on-demand
+        try:
+            auto_download_files()
+        except Exception as e:
+            _emit_log(f"Failed to prepare files for download: {e}", important=True)
+            return jsonify({"error": "No files available for download."}), 400
+    
+    if not _download_files or not _download_files[0].exists():
+        _emit_log("Still no files available after auto_download_files()", important=True)
+        return jsonify({"error": "No files available for download."}), 400
+    
+    path = _download_files[0]
+    # If the queued item is a single .xlsx, send as-is; otherwise send the zip
     try:
-        temp_zip_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
-    zip_path = temp_zip_dir / f"{base_name}.zip"
-
-    # Define specific files to include in the zip
-    # These paths are relative to the working directory
-    files_to_zip = [
-        ("NBD_MF_23_C4", "Loan CF Analysis*.xlsb"),
-        ("NBD_MF_23_IA", "Prod. wise Class. of Loans*.xlsb"),
-        ("NBD-MF-10-GA & NBD-MF-11-IS", "NBD-MF-10-GA & NBD-MF-11-IS*.xlsx"),
-        ("", "NBD_MF_20_C2_*_report.xlsx"),  # Root of date folder
-        ("", "NBD_NBL_MF_20_C5_*_report.xlsx"),  # Root of date folder
-    ]
-
-    import zipfile
-    import glob as glob_module
-
-    try:
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            files_added = 0
-            for subfolder, pattern in files_to_zip:
-                # Build search path
-                if subfolder:
-                    search_path = _last_output_dir / subfolder / pattern
-                else:
-                    search_path = _last_output_dir / pattern
-
-                # Find matching files
-                matches = glob_module.glob(str(search_path))
-
-                for file_path in matches:
-                    file_path = Path(file_path)
-                    if file_path.exists() and file_path.is_file():
-                        # Add to zip with just the filename (no folder structure)
-                        arcname = file_path.name
-                        zipf.write(file_path, arcname=arcname)
-                        files_added += 1
-                        _emit_log(f"Added to zip: {file_path.name}", important=False, skip_web_log=True)
-
-            _emit_log(f"Created zip with {files_added} files", important=True)
-
-            if files_added == 0:
-                return jsonify({"error": "No output files found to download."}), 400
-
-        return send_file(str(zip_path), as_attachment=True, download_name=f"{base_name}.zip")
-
+        if path.suffix.lower() == ".xlsx" or path.suffix.lower() == ".xlsb":
+            return send_file(str(path), as_attachment=True, download_name=path.name)
+        else:
+            timestamp = path.stem.replace("reports_", "")
+            return send_file(str(path), as_attachment=True, download_name=f"reports_{timestamp}.zip")
     except Exception as e:
-        _emit_log(f"Failed to create zip: {e}", important=True)
-        return jsonify({"error": f"Failed to create zip: {e}"}), 500
+        _emit_log(f"Failed to send file: {e}", important=True)
+        return jsonify({"error": f"Failed to send file: {e}"}), 500
 
 
 if __name__ == "__main__":

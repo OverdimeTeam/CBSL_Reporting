@@ -109,46 +109,69 @@ def is_valid_value(value):
         return False
 
 # ==================== FILE OPERATIONS ====================
-
 def find_dynamic_folder(base_path):
-    """Find the dynamic date folder inside monthly directory"""
-    monthly_path = os.path.join(base_path, 'working', 'monthly')
+    """
+    Locate the latest date folder inside working/NBD_MF_23_IA.
+    Example:
+        base_path/
+            working/
+                NBD_MF_23_IA/
+                    30-09-2025
+                    31-10-2025
+                    31-1-2025(1)  <- latest
+    """
+    report_name = "NBD_MF_23_IA"
+    working_path = os.path.join(base_path, "working", report_name)
     
-    if not os.path.exists(monthly_path):
-        print(f"ERROR: Monthly folder not found at {monthly_path}")
+    if not os.path.exists(working_path):
+        print(f"ERROR: Working folder not found at {working_path}")
         return None
+
+    # List subfolders (date folders)
+    subfolders = [
+        f for f in os.listdir(working_path)
+        if os.path.isdir(os.path.join(working_path, f))
+    ]
     
-    folders = [f for f in os.listdir(monthly_path) if os.path.isdir(os.path.join(monthly_path, f))]
-    
-    if not folders:
-        print("ERROR: No folders found in monthly directory")
+    if not subfolders:
+        print(f"ERROR: No date folders found under {working_path}")
         return None
+
+    # Sort by last modified date, newest first
+    subfolders.sort(
+        key=lambda f: os.path.getmtime(os.path.join(working_path, f)),
+        reverse=True
+    )
     
-    if len(folders) > 1:
-        print(f"WARNING: Multiple folders found. Using: {folders[0]}")
-    
-    target_folder = os.path.join(monthly_path, folders[0], 'NBD_MF_23_IA')
-    
-    if os.path.exists(target_folder):
-        print(f"Found folder: {folders[0]}/NBD_MF_23_IA")
-        return target_folder
-    
-    print(f"ERROR: NBD_MF_23_IA subfolder not found")
-    return None
+    latest_folder = subfolders[0]
+    target_folder = os.path.join(working_path, latest_folder)
+
+    print(f"Found latest working folder: {report_name}/{latest_folder}")
+    return target_folder
+
 
 def find_files(folder_path):
-    """Find all required files using keywords"""
+    """Locate all required files under the given folder by keyword matching."""
     files = {
         'summary': None, 'net': None, 'prod': None, 'loan_base': None,
         'reschedule': None, 'yard_stock': None, 'cbsl_provision': None, 
-        'cadre': None, 'unutilized': None, 'po_listing': None, 'portfolio_recovery': None
+        'cadre': None, 'unutilized': None, 'po_listing': None, 'portfolio_recovery': None,
+        'sofp': None
     }
+
     keywords = {
-        'summary': 'Summary', 'net': 'Net Portfolio', 'prod': 'Prod. wise Class. of Loans',
-        'loan_base': 'Loan Base', 'reschedule': 'Reschedule Contract Details',
-        'yard_stock': 'YARD STOCK', 'cbsl_provision': 'CBSL Provision Comparison',
-        'cadre': 'Cadre', 'unutilized': 'Unutilized Amount',
-        'po_listing': 'Po Listing - Internal', 'portfolio_recovery': 'Portfolio Report Recovery - Internal'
+        'summary': 'Summary',
+        'net': 'Net Portfolio',
+        'prod': 'Prod. wise Class. of Loans',
+        'loan_base': 'Loan Base',
+        'reschedule': 'Reschedule Contract Details',
+        'yard_stock': 'YARD STOCK',
+        'cbsl_provision': 'CBSL Provision Comparison',
+        'cadre': 'Cadre',
+        'unutilized': 'Unutilized Amount',
+        'po_listing': 'Po Listing - Internal',
+        'portfolio_recovery': 'Portfolio Report Recovery - Internal',
+        'sofp': 'AFL Monthly FS'
     }
     
     for root, _, file_list in os.walk(folder_path):
@@ -159,9 +182,23 @@ def find_files(folder_path):
                 if keyword in f and files[key] is None:
                     files[key] = os.path.join(root, f)
     
-    return (files['summary'], files['net'], files['prod'], files['loan_base'],
-            files['reschedule'], files['yard_stock'], files['cbsl_provision'], 
-            files['cadre'], files['unutilized'], files['po_listing'], files['portfolio_recovery'])
+    return (
+        files['summary'], files['net'], files['prod'], files['loan_base'],
+        files['reschedule'], files['yard_stock'], files['cbsl_provision'],
+        files['cadre'], files['unutilized'], files['po_listing'], files['portfolio_recovery'],
+        files['sofp']
+    )
+
+
+def locate_latest_report_files(base_path):
+    """Wrapper function: find latest working folder and extract report files."""
+    target_folder = find_dynamic_folder(base_path)
+    if not target_folder:
+        print("ERROR: Could not locate target working folder.")
+        return None
+
+    print(f"Searching for files inside: {target_folder}")
+    return find_files(target_folder)
 
 # ==================== EXCEPTION FILE ====================
 
@@ -258,9 +295,16 @@ def read_net_portfolio_data(net_file, matching_contracts):
     for col in ['GROSS_PORTFOLIO', 'PROVISION', 'DP_PROVISION', 'CONTRACT_AMOUNT']:
         df[col] = df[col].apply(lambda x: f"{float(x):,.0f}" if pd.notna(x) and x != '' else '')
     
-    df['CON_INTRATE'] = df['CON_INTRATE'].apply(
-        lambda x: f"{float(x):.2f}%" if pd.notna(x) and x != '' else ''
-    )
+    def safe_format_rate(x):
+        """Safely format interest rate, handling invalid data"""
+        if pd.notna(x) and x != '':
+            try:
+                return f"{float(x):.2f}%"
+            except (ValueError, TypeError):
+                return ''
+        return ''
+
+    df['CON_INTRATE'] = df['CON_INTRATE'].apply(safe_format_rate)
     
     for col in ['CLIENT_CODE', 'EQT_DESC', 'PURPOSE', 'CON_RNTFREQ', 'CONTRACT_PERIOD']:
         df[col] = df[col].fillna('').astype(str).str.strip()
@@ -569,7 +613,7 @@ def build_bulk3_dataframe(net_file, unutilized_file, exception_tracker):
             
             icam_codes = target_sheet.range(f'C1:C{last_row}').value
             closing_balances = target_sheet.range(f'G1:G{last_row}').value
-            interest_rates = target_sheet.range(f'H1:H{last_row}').value
+            interest_rates = target_sheet.range(f'E1:E{last_row}').value
             
             wb.close()
             app.quit()
@@ -620,9 +664,18 @@ def build_bulk3_dataframe(net_file, unutilized_file, exception_tracker):
         lambda x: f"{float(x):,.0f}" if pd.notna(x) else ''
     )
     
-    df_bulk3['CON_INTRATE'] = df_bulk3['CON_INTRATE'].apply(
-        lambda x: f"{float(x):.2f}%" if pd.notna(x) and x != '' else ''
-    )
+    def safe_format_rate(x):
+        """Safely format interest rate, handling invalid data"""
+        if pd.notna(x) and x != '':
+            try:
+                return f"{float(x):.2f}%"
+            except (ValueError, TypeError):
+                # Log invalid value but don't crash
+                print(f"  Warning: Invalid interest rate value: {x}")
+                return ''
+        return ''
+
+    df_bulk3['CON_INTRATE'] = df_bulk3['CON_INTRATE'].apply(safe_format_rate)
     
     return df_bulk3, values_tally
 
@@ -944,6 +997,52 @@ def process_mgt_acc(summary_file, prod_file):
             else:
                 raise
 
+def process_sofp(sofp_file, prod_file):
+    """Process SOFP value from NBD-MF-01-SOFP sheet to FORM1 Working"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            app = xw.App(visible=False)
+            app.display_alerts = False
+            
+            # Read from SOFP file
+            wb_sofp = app.books.open(sofp_file)
+            sofp_sheet = wb_sofp.sheets['NBD-MF-01-SOFP']
+            last_row = sofp_sheet.used_range.last_cell.row
+            
+            col_a = sofp_sheet.range(f'A1:A{last_row}').value
+            col_e = sofp_sheet.range(f'E1:E{last_row}').value
+            
+            col_a_list = col_a if isinstance(col_a, list) else [col_a]
+            col_e_list = col_e if isinstance(col_e, list) else [col_e]
+            
+            sofp_value = None
+            for i, val in enumerate(col_a_list):
+                if val and str(val).strip() == '1.1.6.1.0.0':
+                    sofp_value = col_e_list[i]
+                    break
+            
+            wb_sofp.close()
+            
+            # Write to FORM1 Working
+            wb_prod = app.books.open(prod_file)
+            form1_sheet = wb_prod.sheets['FORM1 Working']
+            
+            if sofp_value is not None:
+                form1_sheet.range('B34').value = sofp_value
+            
+            wb_prod.save()
+            wb_prod.close()
+            app.quit()
+            break
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                kill_excel_processes()
+                time.sleep(3)
+            else:
+                raise
+
 # ==================== BULK OPERATIONS ====================
 
 def find_bulk_rows_in_prod(prod_file, pattern):
@@ -1209,7 +1308,7 @@ def main():
     
     (summary_file, net_file, prod_file, loan_base_file, reschedule_file, 
      yard_stock_file, cbsl_provision_file, cadre_file, unutilized_file,
-     po_listing_file, portfolio_recovery_file) = find_files(folder)
+     po_listing_file, portfolio_recovery_file, sofp_file) = find_files(folder)
     
     missing = []
     if not summary_file: missing.append("Summary")
@@ -1223,6 +1322,7 @@ def main():
     if not unutilized_file: missing.append("Unutilized Amount")
     if not po_listing_file: missing.append("Po Listing - Internal")
     if not portfolio_recovery_file: missing.append("Portfolio Report Recovery - Internal")
+    if not sofp_file: missing.append("NBD-MF-01-SOFP & SOCI AFL Monthly FS")
     
     if missing:
         print(f"\nERROR: Missing files: {', '.join(missing)}")
@@ -1309,6 +1409,14 @@ def main():
     step = time.time()
     process_mgt_acc(summary_file, prod_file)
     log_step("Step 16", step)
+
+    # Step 17: SOFP
+    print("\n" + "="*60)
+    print("STEP 17: SOFP PROCESSING")
+    print("="*60)
+    step = time.time()
+    process_sofp(sofp_file, prod_file)
+    log_step("Step 17", step)
     
     # Write exceptions
     print("\n" + "="*60)

@@ -44,51 +44,59 @@ def main():
     # Get the base directory (parent of report_automations)
     base_dir = Path(__file__).resolve().parent.parent
     
-    # Based on your file structure, input files are in working/monthly/09-19-2025(1)/
+    # New folder structure: working/NBD_MF_20_C1_C6/<dated-folder>/
     working_dir = base_dir / "working"
-    monthly_working_dir = working_dir / "monthly"
-    outputs_monthly_dir = base_dir / "outputs" / "monthly"
+    c1_c6_working_dir = working_dir / "NBD_MF_20_C1_C6"
     
     print(f"Base directory: {base_dir}")
     print(f"Working directory: {working_dir}")
-    print(f"Monthly working directory: {monthly_working_dir}")
+    print(f"C1-C6 working directory: {c1_c6_working_dir}")
     print(f"Current working directory: {Path.cwd()}")
     
-    # Create outputs monthly directory if it doesn't exist
-    outputs_monthly_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Search in the working/monthly directory first
+    # Search only in the new C1-C6 working directory structure
     search_dirs = [
-        monthly_working_dir,
-        working_dir,
-        base_dir
+        c1_c6_working_dir
     ]
     
     file_c1_c6 = None
     
-    # Search for C1-C6 file in multiple locations
-    for search_dir in search_dirs:
-        if search_dir.exists():
-            print(f"\nSearching in: {search_dir}")
-            
-            # Look for the specific file you have
-            c1_c6_pattern = "**/NBD-MF-20-C1 to C6*.xlsx"
-            files = list(search_dir.glob(c1_c6_pattern))
-            
-            if files:
-                file_c1_c6 = files[0]
-                print(f"Found C1-C6 file: {file_c1_c6}")
-                break
+    # Search for C1-C6 file in the new structure only
+    if not c1_c6_working_dir.exists():
+        print(f"\nError: C1-C6 working directory does not exist: {c1_c6_working_dir}")
+        print("Please ensure the working/NBD_MF_20_C1_C6 directory exists with dated folders.")
+        return
+    
+    print(f"\nSearching in C1-C6 working directory: {c1_c6_working_dir}")
+    
+    # Look for dated folders in C1-C6 working directory
+    dated_folders = [d for d in c1_c6_working_dir.iterdir() if d.is_dir()]
+    print(f"Found {len(dated_folders)} dated folders: {[d.name for d in dated_folders]}")
+    
+    if not dated_folders:
+        print("No dated folders found in C1-C6 working directory.")
+        return
+    
+    for dated_folder in dated_folders:
+        print(f"\nSearching in dated folder: {dated_folder}")
+        
+        # Look for the specific file in this dated folder
+        c1_c6_pattern = "NBD-MF-20-C1 to C6*.xlsx"
+        files = list(dated_folder.glob(c1_c6_pattern))
+        
+        if files:
+            file_c1_c6 = files[0]
+            print(f"Found C1-C6 file: {file_c1_c6}")
+            break
     
     if file_c1_c6 is None:
-        print("\nCould not find C1 to C6 file. Looking for any similar files...")
-        for search_dir in search_dirs:
-            if search_dir.exists():
-                xlsx_files = list(search_dir.rglob("*.xlsx"))
-                if xlsx_files:
-                    print(f"Excel files in {search_dir}:")
-                    for f in xlsx_files:
-                        print(f"  - {f.relative_to(base_dir)}")
+        print("\nCould not find C1-C6 file in any dated folder.")
+        print("Looking for any Excel files in dated folders...")
+        for dated_folder in dated_folders:
+            xlsx_files = list(dated_folder.glob("*.xlsx"))
+            if xlsx_files:
+                print(f"Excel files in {dated_folder.name}:")
+                for f in xlsx_files:
+                    print(f"  - {f.name}")
         return
     
     # Extract month and year from filename
@@ -100,31 +108,15 @@ def main():
     
     print(f"\nParsed month: {month}, year: {year}")
     
-    # Find the exact working folder structure to replicate in outputs
+    # Find the dated folder that contains our file (for logging purposes)
     working_folder_name = None
-    for search_dir in search_dirs:
-        if search_dir.exists():
-            # Look for the folder containing our files
-            for subfolder in search_dir.iterdir():
-                if subfolder.is_dir():
-                    # Check if this folder contains our target files
-                    c1_c6_files = list(subfolder.glob("**/NBD-MF-20-C1 to C6*.xlsx"))
-                    if c1_c6_files:
-                        working_folder_name = subfolder.name
-                        print(f"Found working folder: {working_folder_name}")
-                        break
-            if working_folder_name:
-                break
-    
-    # Create output folder structure matching working folder
-    if working_folder_name:
-        out_folder = outputs_monthly_dir / working_folder_name
-    else:
-        # Fallback to date-based folder if working folder not found
-        out_folder = outputs_monthly_dir / f"{year}_{month}"
-    
-    out_folder.mkdir(parents=True, exist_ok=True)
-    print(f"Output folder: {out_folder}")
+    for dated_folder in dated_folders:
+        # Check if this folder contains our target files
+        c1_c6_files = list(dated_folder.glob("NBD-MF-20-C1 to C6*.xlsx"))
+        if c1_c6_files:
+            working_folder_name = dated_folder.name
+            print(f"Found working folder: {working_folder_name}")
+            break
     
     try:
         # Load workbook
@@ -175,11 +167,41 @@ def main():
                 print(f"  Error reading {cell_ref}: {e} - using 0")
                 return 0
         
-        # Hardcoded value for "Guarantees" (dummy data from work hub integration)
-        print(f"\nSetting hardcoded value for 'Guarantees'...")
-        guarantees_hardcoded_value = 2500000  # Hardcoded dummy value
-        print(f"DUMMY DATA: Using hardcoded value {guarantees_hardcoded_value} for 'Guarantees'")
-        print(f"NOTE: This value comes from work hub integration as master data (dummy purpose)")
+        # Read "Guarantees" value from Master_Data.xlsx → NBD-MF-20-C1-C6 sheet (last row, column B)
+        print(f"\nFetching 'Guarantees' value from Master_Data.xlsx (sheet: NBD-MF-20-C1-C6)...")
+        guarantees_value = None
+        try:
+            # Master_Data.xlsx is at project root (parent of report_automations)
+            project_root = Path(__file__).resolve().parents[1]
+            master_path = project_root / "Master_Data.xlsx"
+            if not master_path.exists():
+                print(f"Master_Data.xlsx not found at {master_path}")
+            else:
+                md_wb = openpyxl.load_workbook(master_path, data_only=True)
+                if "NBD-MF-20-C1-C6" in md_wb.sheetnames:
+                    md_ws = md_wb["NBD-MF-20-C1-C6"]
+                    if md_ws.max_row >= 2:
+                        last_row = md_ws.max_row
+                        val = md_ws[f"B{last_row}"] .value
+                        if val is not None and str(val).strip() != "":
+                            try:
+                                guarantees_value = float(str(val).replace(",", "").strip())
+                            except Exception:
+                                print(f"Warning: Could not convert guarantees '{val}' to number; using 0")
+                                guarantees_value = 0.0
+                        else:
+                            print("Warning: Latest guarantees cell is empty; using 0")
+                            guarantees_value = 0.0
+                    else:
+                        print("Warning: No data rows in NBD-MF-20-C1-C6 sheet; using 0")
+                        guarantees_value = 0.0
+                    md_wb.close()
+                else:
+                    print("Warning: Sheet 'NBD-MF-20-C1-C6' not found in Master_Data.xlsx; using 0")
+                    guarantees_value = 0.0
+        except Exception as e:
+            print(f"Error reading Master_Data.xlsx: {e}")
+            guarantees_value = 0.0
         
         # Find "Guarantees" row in C5 sheet
         print(f"\nSearching for 'Guarantees' in C5 sheet...")
@@ -208,17 +230,16 @@ def main():
         # Update the Guarantees value
         # Assuming the value goes in column C (3rd column)
         guarantees_cell = f"C{guarantees_row}"
-        print(f"Updating cell {guarantees_cell} with hardcoded value: {guarantees_hardcoded_value}")
-        tgt_ws[guarantees_cell] = guarantees_hardcoded_value
+        print(f"Updating cell {guarantees_cell} with value from Master_Data.xlsx: {guarantees_value}")
+        tgt_ws[guarantees_cell] = guarantees_value
         
         print(f"Data processing completed")
         print(f"Updated C5 sheet:")
-        print(f"  - Guarantees: {guarantees_hardcoded_value} (HARDCODED DUMMY DATA)")
+        print(f"  - Guarantees: {guarantees_value} (from Master_Data.xlsx)")
         
-        # Save updated workbook
-        out_path = out_folder / f"NBD_NBL_MF_20_C5_{month}_{year}_report.xlsx"
-        wb_c1_c6.save(out_path)
-        print(f"\nReport saved successfully to: {out_path}")
+        # Save updated workbook back to the same location (like Ctrl+S)
+        wb_c1_c6.save(file_c1_c6)
+        print(f"\nReport saved successfully to original location: {file_c1_c6}")
         
     except FileNotFoundError as e:
         print(f"File not found: {e}")

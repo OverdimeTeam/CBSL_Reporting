@@ -11,7 +11,6 @@ def get_month_year_from_filename(filename):
             month = part
             year = parts[i+1].replace(".xlsx","")
             return month, year
-    return None, None
 
 def find_files_safely(base_dir, pattern, description):
     """Safely find files and provide detailed error messages"""
@@ -40,111 +39,75 @@ def find_files_safely(base_dir, pattern, description):
     
     return files[0]  # Return the first match
 
+def find_latest_working_folder(base_dir, report_name):
+    """Return the latest date folder inside working/<report_name>."""
+    working_report_dir = base_dir / "working" / report_name
+    if not working_report_dir.exists():
+        print(f"ERROR: Working folder not found: {working_report_dir}")
+        return None
+
+    subfolders = [f for f in working_report_dir.iterdir() if f.is_dir()]
+    if not subfolders:
+        print(f"ERROR: No subfolders found under {working_report_dir}")
+        return None
+
+    # Since there is only one date folder in working, just return it
+    latest_folder = subfolders[0]
+    print(f"Working folder for {report_name}: {latest_folder}")
+    return latest_folder
+
+
+def find_file(base_dir, pattern, description):
+    """Safely find a single file using glob and provide detailed errors."""
+    print(f"\nLooking for {description} in: {base_dir}")
+    files = list(base_dir.glob(pattern))
+    if not files:
+        print(f"No files found for {description} with pattern: {pattern}")
+        all_files = [f.name for f in base_dir.iterdir() if f.is_file()]
+        if all_files:
+            print("Available files in this folder:")
+            for f in sorted(all_files):
+                print(f"  - {f}")
+        else:
+            print("No files found in this folder.")
+        return None
+    print(f"Found {description}: {files[0].name}")
+    return files[0]
+
+
+def prepare_output_folder(base_dir, report_name, working_folder):
+    """Create output folder matching working folder name under outputs/<report_name>/"""
+    output_report_dir = base_dir / "outputs" / report_name
+    output_folder = output_report_dir / working_folder.name
+    output_folder.mkdir(parents=True, exist_ok=True)
+    print(f"Output folder created: {output_folder}")
+    return output_folder
+
 def main():
-    # Get the base directory (parent of report_automations)
+
     base_dir = Path(__file__).resolve().parent.parent
-    
-    # Based on your file structure, input files are in working/monthly/09-19-2025(1)/
-    working_dir = base_dir / "working"
-    monthly_working_dir = working_dir / "monthly"
-    outputs_monthly_dir = base_dir / "outputs" / "monthly"
-    
-    print(f"Base directory: {base_dir}")
-    print(f"Working directory: {working_dir}")
-    print(f"Monthly working directory: {monthly_working_dir}")
-    print(f"Current working directory: {Path.cwd()}")
-    
-    # Create outputs monthly directory if it doesn't exist
-    outputs_monthly_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Search in the working/monthly directory first
-    search_dirs = [
-        monthly_working_dir,
-        working_dir,
-        base_dir
-    ]
-    
-    file_c1_c6 = None
-    file_afl = None
-    
-    # Search for C1-C6 file in multiple locations
-    for search_dir in search_dirs:
-        if search_dir.exists():
-            print(f"\nSearching in: {search_dir}")
-            
-            # Look for the specific file you have
-            c1_c6_pattern = "**/NBD-MF-20-C1 to C6*.xlsx"
-            files = list(search_dir.glob(c1_c6_pattern))
-            
-            if files:
-                file_c1_c6 = files[0]
-                print(f"Found C1-C6 file: {file_c1_c6}")
-                break
-    
-    if file_c1_c6 is None:
-        print("\nCould not find C1 to C6 file. Looking for any similar files...")
-        for search_dir in search_dirs:
-            if search_dir.exists():
-                xlsx_files = list(search_dir.rglob("*.xlsx"))
-                if xlsx_files:
-                    print(f"Excel files in {search_dir}:")
-                    for f in xlsx_files:
-                        print(f"  - {f.relative_to(base_dir)}")
+    report_name = "NBD_MF_20_C1_C6"  # Example report
+
+    # Get the latest working folder (single date folder)
+    working_folder = find_latest_working_folder(base_dir, report_name)
+    if not working_folder:
         return
-    
-    # Search for AFL file
-    for search_dir in search_dirs:
-        if search_dir.exists():
-            afl_pattern = "**/NBD-MF-01-SOFP & SOCI AFL Monthly FS*.xlsx"
-            files = list(search_dir.glob(afl_pattern))
-            
-            if files:
-                file_afl = files[0]
-                print(f"Found AFL file: {file_afl}")
-                break
-    
-    if file_afl is None:
-        print("\nCould not find AFL file in any search directory")
-        print("Please ensure the AFL file exists in one of these locations:")
-        for search_dir in search_dirs:
-            print(f"  - {search_dir}")
+
+    # Find files inside the working folder
+    file_c1_c6 = find_file(working_folder, "**/NBD-MF-20-C1 to C6*.xlsx", "C1-C6 file")
+    file_afl = find_file(working_folder, "**/NBD-MF-01-SOFP & SOCI AFL Monthly FS*.xlsx", "AFL file")
+
+    if not file_c1_c6 or not file_afl:
+        print("Required files not found. Cannot continue.")
         return
-    
-    # Extract month and year from filename
-    month, year = get_month_year_from_filename(file_c1_c6.name)
-    if not month or not year:
-        print(f"Could not parse month/year from filename: {file_c1_c6.name}")
-        print("Expected format: 'NBD-MF-20-C1 to C6 [Month] [Year].xlsx'")
-        return
-    
-    print(f"\nParsed month: {month}, year: {year}")
-    
-    # Find the exact working folder structure to replicate in outputs
-    working_folder_name = None
-    for search_dir in search_dirs:
-        if search_dir.exists():
-            # Look for the folder containing our files
-            for subfolder in search_dir.iterdir():
-                if subfolder.is_dir():
-                    # Check if this folder contains our target files
-                    c1_c6_files = list(subfolder.glob("**/NBD-MF-20-C1 to C6*.xlsx"))
-                    afl_files = list(subfolder.glob("**/NBD-MF-01-SOFP & SOCI AFL Monthly FS*.xlsx"))
-                    if c1_c6_files and afl_files:
-                        working_folder_name = subfolder.name
-                        print(f"Found working folder: {working_folder_name}")
-                        break
-            if working_folder_name:
-                break
-    
-    # Create output folder structure matching working folder
-    if working_folder_name:
-        out_folder = outputs_monthly_dir / working_folder_name
-    else:
-        # Fallback to date-based folder if working folder not found
-        out_folder = outputs_monthly_dir / f"{year}_{month}"
-    
-    out_folder.mkdir(parents=True, exist_ok=True)
-    print(f"Output folder: {out_folder}")
+
+    # Prepare output folder
+    output_folder = prepare_output_folder(base_dir, report_name, working_folder)
+
+    print("\n--- Summary ---")
+    print(f"C1-C6 File: {file_c1_c6}")
+    print(f"AFL File: {file_afl}")
+    print(f"Output folder: {output_folder}")
     
     try:
         # Load workbooks
@@ -390,10 +353,9 @@ def main():
         else:
             print(f"  - Instruments qualified as Tier 2 capital: NOT FOUND IN SHEET")
         
-        # Save updated workbook
-        out_path = out_folder / f"NBD_MF_20_C2_{month}_{year}_report.xlsx"
-        wb_c1_c6.save(out_path)
-        print(f"\nReport saved successfully to: {out_path}")
+        # Save updated workbook back to the same original file (in-place like Ctrl+S)
+        wb_c1_c6.save(file_c1_c6)
+        print(f"\nReport saved successfully to original location: {file_c1_c6}")
         
     except FileNotFoundError as e:
         print(f"File not found: {e}")

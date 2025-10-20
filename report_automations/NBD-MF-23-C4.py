@@ -36,17 +36,15 @@ def setup_logging():
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # Create organized log directory: logs/YYYY-MM-DD/frequency/report_name.log
+    # Create organized log directory: report_automations/logs/
     try:
-        frequency = "monthly"
-        date_folder = datetime.now().strftime('%Y-%m-%d')
         run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-        # Get script directory (c:\CBSL\Script)
-        script_dir = Path(__file__).resolve().parent.parent
+        # Get script directory (c:\CBSL\Script\report_automations)
+        script_dir = Path(__file__).resolve().parent
 
-        # Create log directory structure: logs/YYYY-MM-DD/monthly/
-        logs_dir = script_dir / "logs" / date_folder / frequency
+        # Create log directory structure: report_automations/logs/
+        logs_dir = script_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         run_log_file = logs_dir / f"NBD_MF_23_C4_{run_timestamp}.log"
 
@@ -69,25 +67,25 @@ def setup_logging():
 logger = setup_logging()
 
 def get_working_directory():
-    """Find the working directory dynamically: working/monthly/<date>/NBD_MF_23_C4"""
+    """Find the working directory dynamically: working/NBD_MF_23_C4/<date>"""
     # Get script's parent directory (c:\CBSL\Script)
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    monthly_path = os.path.join(script_dir, "working", "monthly")
+    report_path = os.path.join(script_dir, "working", "NBD_MF_23_C4")
 
-    if not os.path.exists(monthly_path):
-        raise FileNotFoundError(f"Monthly path not found: {monthly_path}")
+    if not os.path.exists(report_path):
+        raise FileNotFoundError(f"Report path not found: {report_path}")
 
-    # Get the single subdirectory inside monthly folder
-    subdirs = [d for d in os.listdir(monthly_path) if os.path.isdir(os.path.join(monthly_path, d))]
+    # Get the single subdirectory inside NBD_MF_23_C4 folder (the date folder)
+    subdirs = [d for d in os.listdir(report_path) if os.path.isdir(os.path.join(report_path, d))]
     if not subdirs:
-        raise FileNotFoundError(f"No subdirectory found in {monthly_path}")
+        raise FileNotFoundError(f"No date subdirectory found in {report_path}")
 
     # Use the first (and should be only) subdirectory
     date_folder = subdirs[0]
-    working_dir = os.path.join(monthly_path, date_folder, "NBD_MF_23_C4")
+    working_dir = os.path.join(report_path, date_folder)
 
     if not os.path.exists(working_dir):
-        raise FileNotFoundError(f"NBD_MF_23_C4 folder not found at: {working_dir}")
+        raise FileNotFoundError(f"Date folder not found at: {working_dir}")
 
     logger.info(f"Working directory found: {working_dir}")
     return working_dir
