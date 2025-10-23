@@ -10,11 +10,33 @@ python NBD_MF_15_LA.py 10/07/2025
 python NBD_MF_15_LA.py 07/10/2025 --no-bots
 
 INTEGRATED BOT EXECUTION:
-0a. Run TB from ERP bot (Selenium) - downloads TB-COA file for specified date
+0a. Run TB from ERP bot (Selenium) - downloads TB-COA file for specified date (retries indefinitely until downloaded)
 0b. Run M2M from SASIA bot (Selenium) - downloads M2M file to Input folder
 
-DATE-DRIVEN FILE MANAGEMENT:
-- Creates: AFL Liquidity - Week_41.xlsx (week number calculated from date)
+FILE MANAGEMENT LOGIC:
+- FIXED Master Data Folder: working/weekly/07-06-2025/NBD_MF_04_LA/Input
+  * ALL source files are ALWAYS read from here (TB-COA, Loan Schedule, Bank Balances, etc.)
+  * Bot downloads go here
+
+- Starting Template: working/weekly/07-06-2025/NBD_MF_04_LA/Inputs/AFL Liquidity - Week_27.xlsx
+  * Used only on first run if no other AFL files exist
+
+- Latest AFL Detection:
+  * Searches ALL date folders for most recent AFL Liquidity file (by modification time)
+  * Uses latest AFL as working file for updates
+
+- Versioned Output Folders: working/weekly/{MM-DD-YYYY}/NBD_MF_04_LA/Inputs
+  * Creates new versioned folder if date folder exists: 07-13-2025, 07-13-2025(2), 07-13-2025(3), etc.
+  * Saves updated AFL file to the new versioned folder
+
+EXAMPLE WORKFLOW:
+Run 1 (07-06-2025): Use Week_27.xlsx → Save to 07-06-2025/NBD_MF_04_LA/Inputs
+Run 2 (07-06-2025): Use AFL from 07-06-2025 → Save to 07-06-2025(2)/NBD_MF_04_LA/Inputs
+Run 3 (07-13-2025): Use latest AFL from 07-06-2025(2) → Save to 07-13-2025/NBD_MF_04_LA/Inputs
+Run 4 (07-20-2025): Use latest AFL from 07-13-2025 → Save to 07-20-2025/NBD_MF_04_LA/Inputs
+
+DATE UPDATES IN FILE:
+- Creates: AFL Liquidity - Week_XX.xlsx (week number calculated from date)
 - Updates all date cells inside the file:
   * Treasury Input C1: Oct-07
   * Liquid Assets D1: Oct-07
@@ -23,25 +45,34 @@ DATE-DRIVEN FILE MANAGEMENT:
   * ALCO C1, D1, E1: 07-Oct-25
 
 DATA PROCESSING (ALL FILES REQUIRED):
-1. Determine working file (latest AFL Test X or AFL Liquidity file)
-2. Copy TB-COA data to working file's TB sheet (REQUIRED)
-3. Extract M2M values and update Treasury Input C23, C24, C25 (OPTIONAL)
-4. Extract Loan Summary values from Loan Schedule file (REQUIRED)
-5. Update working file's Treasury Input sheet with Loan Summary values (REQUIRED)
-6. Extract bank balances from Daily Bank Balances file (for specified date) (REQUIRED)
-7. Update working file's Treasury Input sheet with bank balances (REQUIRED)
-8. Extract Deposit Liability data and update working file (REQUIRED)
+1. Run TB bot (retries until TB-COA downloaded to FIXED Input folder)
+2. Find latest AFL file across all folders (or use starting template)
+3. Copy TB-COA data to working file's TB sheet (REQUIRED)
+4. Extract M2M values and update Treasury Input C23, C24, C25 (OPTIONAL)
+5. Extract Loan Summary values from Loan Schedule file (REQUIRED)
+6. Update working file's Treasury Input sheet with Loan Summary values (REQUIRED)
+7. Extract bank balances from Daily Bank Balances file (for specified date) (REQUIRED)
+8. Update working file's Treasury Input sheet with bank balances (REQUIRED)
+9. Extract Deposit Liability data and update working file (REQUIRED)
 
 VALIDATION & OUTPUT:
-9. Validate Liquid Assets sheet (C93 and D93 must be 0)
-10. Create new AFL Liquidity - Week_XX.xlsx file with updated dates (only if validation passes)
-11. Generate exceptions report if validation fails
-12. Trigger monthly report generation if 4+ weekly files exist
+10. Validate Liquid Assets sheet (C93 and D93 must be 0)
+11. Create new AFL Liquidity - Week_XX.xlsx file with updated dates (only if validation passes)
+12. Generate exceptions report if validation fails
+13. Trigger monthly report generation if 5+ weekly files exist
 
-FOLDERS:
-- Input folder (no 's'): Contains source files (TB-COA, Loan Schedule, etc.)
-- Inputs folder (with 's'): Contains AFL Liquidity file and test versions
-- Bots folder: Contains Selenium automation scripts
+MONTHLY REPORT GENERATION (AUTO-TRIGGERED WHEN 5 AFL FILES EXIST):
+1. Find 5 most recent AFL Liquidity files across all folders
+2. Copy NBD-WF-15-LA sheet A3:C25 from each AFL file to NBD-MF-04-LA Week 1-5 sheets
+3. Fill NBD-MF-04-LA sheet columns C-H with H column data from Week 1-5 sheets:
+   - Column C ← Week 1 H column
+   - Column D ← Week 2 H column
+   - Column E ← Week 3 H column
+   - Column F ← Week 4 H column
+   - Column G ← Week 5 H column
+   - Column H ← Week 5 H column (duplicate)
+4. Save updated NBD-MF-04-LA file to template location
+5. Copy completed monthly report to last week's folder (e.g., 07-31-2025/NBD_MF_04_LA/)
 
 COMMAND-LINE OPTIONS:
 date              : Report date in MM/DD/YYYY or DD/MM/YYYY format (default: yesterday)
@@ -106,25 +137,16 @@ class AFLLiquidityAutomation:
         self.year = self.report_date.strftime("%Y")  # e.g., "2025"
         self.mmdd = self.report_date.strftime("%m%d")  # e.g., "0809"
 
-        # WORKING folders (new structure - single date folder per report)
-        self.working_nbd_folder = self.base_dir / "working" / "NBD_MF_15_LA"
+        # WORKING folders - NEW STRUCTURE (no weekly folders)
+        # When run from app.py, working directory is already set to the date folder
+        # Use current working directory as the base
+        self.working_folder = Path.cwd()
 
-        # Check if working directory exists
-        if not self.working_nbd_folder.exists():
-            raise FileNotFoundError(f"Working directory not found: {self.working_nbd_folder}")
+        # Input subfolder (singular) for bot downloads and master data files
+        self.input_folder = self.working_folder / "Input"
 
-        # Find the single date folder inside NBD_MF_15_LA
-        date_folders = [f for f in self.working_nbd_folder.iterdir() if f.is_dir()]
-        if not date_folders:
-            raise FileNotFoundError(f"No date folder found inside '{self.working_nbd_folder}' directory.")
-
-        # Use the first (and should be only) date folder
-        if len(date_folders) > 1:
-            logger.warning(f"Multiple date folders found: {[f.name for f in date_folders]}. Using the first one: {date_folders[0].name}")
-
-        self.working_date_folder = date_folders[0]
-        self.input_folder = self.working_date_folder / "Input"  # Master data location
-        self.output_inputs_folder = self.working_date_folder / "Inputs"  # AFL output location
+        # Inputs subfolder (plural) for AFL files
+        self.output_inputs_folder = self.working_folder / "Inputs"
 
         # Bots folder
         self.bots_folder = self.base_dir / "bots"
@@ -134,9 +156,8 @@ class AFLLiquidityAutomation:
 
         logger.info(f"Initialized AFL Liquidity Automation for date: {self.report_date.strftime('%Y-%m-%d')}")
         logger.info(f"Week of month: {self.week_of_month}")
-        logger.info(f"Working folder: {self.working_date_folder}")
-        logger.info(f"Input folder (master data - read from): {self.input_folder}")
-        logger.info(f"Output Inputs folder (AFL files - write to): {self.output_inputs_folder}")
+        logger.info(f"FIXED Input folder (master data - read from): {self.input_folder}")
+        logger.info(f"DYNAMIC Output folder (AFL files - write to): {self.output_inputs_folder}")
         logger.info(f"Bots folder: {self.bots_folder}")
 
         # Verify folders exist
@@ -177,31 +198,58 @@ class AFLLiquidityAutomation:
         week_number = ((day_of_month - 1) // 7) + 1
         return min(week_number, 5)  # Cap at 5 weeks
 
-    def setup_folder_structure(self):
+    def get_versioned_folder_path(self, base_folder_path):
         """
-        Create folder structure for weekly reports
-        Creates:
-        - working/weekly/{MM-DD-YYYY}/NBD_MF_04_LA/Input (master data - read from here)
-        - working/weekly/{MM-DD-YYYY}/NBD_MF_04_LA/Inputs (AFL files - write here)
+        Get a versioned folder path if the folder already exists
+        Returns: Path object for the folder (either original or versioned)
 
-        Folders are dynamic based on input date parameter.
+        Examples:
+        - 07-06-2025 -> 07-06-2025 (if doesn't exist)
+        - 07-06-2025 -> 07-06-2025(2) (if exists)
+        - 07-06-2025 -> 07-06-2025(3) (if (2) also exists)
         """
         try:
-            logger.info(f"Setting up folder structure for {self.date_folder_name}...")
+            original_path = Path(base_folder_path)
 
-            # Create WORKING folders (DYNAMIC based on input date)
-            self.working_date_folder.mkdir(parents=True, exist_ok=True)
-            logger.info(f"✓ Created working date folder: {self.working_date_folder}")
+            # If folder doesn't exist, use it as-is
+            if not original_path.exists():
+                return original_path
 
-            self.working_nbd_folder.mkdir(exist_ok=True)
-            logger.info(f"✓ Created working NBD folder: {self.working_nbd_folder}")
+            # Folder exists, find next available version number
+            version = 2
+            while True:
+                versioned_path = Path(f"{base_folder_path}({version})")
+                if not versioned_path.exists():
+                    logger.info(f"Folder {original_path.name} exists, creating versioned folder: {versioned_path.name}")
+                    return versioned_path
+                version += 1
 
-            self.input_folder.mkdir(exist_ok=True)
-            logger.info(f"✓ Created Input folder (master data): {self.input_folder}")
+        except Exception as e:
+            logger.error(f"Error getting versioned folder path: {e}")
+            return Path(base_folder_path)
 
-            # Create Inputs folder for AFL output files
-            self.output_inputs_folder.mkdir(exist_ok=True)
-            logger.info(f"✓ Created Inputs folder (AFL files): {self.output_inputs_folder}")
+    def setup_folder_structure(self):
+        """
+        Create folder structure for weekly reports (NEW STRUCTURE - no weekly folders)
+        Working folder is already set to working/NBD_MF_15_LA/{DD-MM-YYYY} by app.py
+        Structure: working/NBD_MF_15_LA/{DD-MM-YYYY}/
+                   ├── Input/  (bot downloads and master data)
+                   └── Inputs/ (AFL files)
+        """
+        try:
+            logger.info(f"Setting up folder structure (NEW - simplified)...")
+
+            # Ensure working folder exists
+            self.working_folder.mkdir(parents=True, exist_ok=True)
+            logger.info(f"✓ Working folder: {self.working_folder}")
+
+            # Ensure Input subfolder exists (singular - for bot downloads and master data)
+            self.input_folder.mkdir(parents=True, exist_ok=True)
+            logger.info(f"✓ Input folder: {self.input_folder}")
+
+            # Ensure Inputs subfolder exists (plural - for AFL files)
+            self.output_inputs_folder.mkdir(parents=True, exist_ok=True)
+            logger.info(f"✓ Inputs folder (AFL files): {self.output_inputs_folder}")
 
             logger.info("Folder structure setup completed successfully")
 
@@ -210,10 +258,57 @@ class AFLLiquidityAutomation:
             import traceback
             logger.error(traceback.format_exc())
 
+    def get_5_most_recent_afl_files(self):
+        """
+        Find the 5 most recent AFL Liquidity files from outputs folder (completed weeks)
+        Returns: List of file paths sorted by modification time (oldest to newest)
+        """
+        try:
+            logger.info("Searching for 5 most recent AFL Liquidity files in outputs...")
+
+            all_afl_files = []
+
+            # NEW STRUCTURE: Search in outputs folder for completed date folders
+            outputs_dir = self.base_dir / "outputs" / "NBD_MF_15_LA"
+
+            if not outputs_dir.exists():
+                logger.warning(f"Outputs directory not found: {outputs_dir}")
+                return []
+
+            # Search through all date folders in outputs directory
+            for date_folder in outputs_dir.glob("*"):
+                if not date_folder.is_dir():
+                    continue
+
+                # Find AFL Liquidity files directly in date folder (new structure)
+                afl_files = list(date_folder.glob("AFL Liquidity - Week_*.xlsx"))
+                for afl_file in afl_files:
+                    all_afl_files.append(afl_file)
+
+            if len(all_afl_files) < 5:
+                logger.warning(f"Only found {len(all_afl_files)} AFL files in outputs. Need 5 for monthly report.")
+                return []
+
+            # Sort by modification time (oldest to newest) and take the 5 most recent
+            all_afl_files.sort(key=lambda f: f.stat().st_mtime)
+            five_most_recent = all_afl_files[-5:]  # Get last 5 (most recent)
+
+            logger.info(f"✓ Found 5 most recent AFL files (in chronological order):")
+            for idx, afl_file in enumerate(five_most_recent, 1):
+                mod_time = datetime.fromtimestamp(afl_file.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                logger.info(f"  {idx}. {afl_file.parent.name}/{afl_file.name} (modified: {mod_time})")
+
+            return five_most_recent
+
+        except Exception as e:
+            logger.error(f"Error finding 5 most recent AFL files: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
+
     def get_monthly_afl_files(self):
         """
-        Find all AFL Liquidity files for the current month across all week folders
-        Searches in working/weekly folders
+        Find all AFL Liquidity files for the current month from outputs folder
         Returns: List of tuples (week_number, file_path, date)
         """
         try:
@@ -222,27 +317,37 @@ class AFLLiquidityAutomation:
 
             afl_files = []
 
-            # Search through all date folders in working weekly directory
-            for date_folder in self.working_base.glob("*"):
+            # NEW STRUCTURE: Search in outputs folder for completed date folders
+            outputs_dir = self.base_dir / "outputs" / "NBD_MF_15_LA"
+
+            if not outputs_dir.exists():
+                logger.warning(f"Outputs directory not found: {outputs_dir}")
+                return []
+
+            # Search through all date folders in outputs directory
+            for date_folder in outputs_dir.glob("*"):
                 if not date_folder.is_dir():
                     continue
 
                 try:
-                    # Parse folder name (MM-DD-YYYY)
-                    folder_date = datetime.strptime(date_folder.name, "%m-%d-%Y")
+                    # Parse folder name (DD-MM-YYYY or DD-MM-YYYY(n))
+                    folder_name = date_folder.name
+                    # Remove version suffix if present
+                    if "(" in folder_name:
+                        folder_name = folder_name.split("(")[0]
+
+                    folder_date = datetime.strptime(folder_name, "%d-%m-%Y")
 
                     # Check if it's in the same month and year
                     if folder_date.month == current_month and folder_date.year == current_year:
                         # Calculate week of month for this folder
                         week_num = self.get_week_of_month(folder_date)
 
-                        # Look for AFL file in Inputs folder
-                        inputs_folder = date_folder / "NBD_MF_04_LA" / "Inputs"
-                        if inputs_folder.exists():
-                            afl_pattern = list(inputs_folder.glob("AFL Liquidity - Week_*.xlsx"))
-                            if afl_pattern:
-                                afl_files.append((week_num, afl_pattern[0], folder_date))
-                                logger.info(f"Found Week {week_num} AFL file: {afl_pattern[0].name}")
+                        # Look for AFL file directly in date folder (new structure)
+                        afl_pattern = list(date_folder.glob("AFL Liquidity - Week_*.xlsx"))
+                        if afl_pattern:
+                            afl_files.append((week_num, afl_pattern[0], folder_date))
+                            logger.info(f"Found Week {week_num} AFL file: {afl_pattern[0].name}")
                 except ValueError:
                     # Skip folders that don't match date format
                     continue
@@ -258,9 +363,301 @@ class AFLLiquidityAutomation:
             logger.error(traceback.format_exc())
             return []
 
+    def copy_cells_with_formatting(self, source_sheet, target_sheet, source_range, target_start_cell):
+        """
+        Copy cells from source to target with all formatting, formulas, and styles
+
+        Args:
+            source_sheet: Source worksheet object
+            target_sheet: Target worksheet object
+            source_range: String like "A3:C25"
+            target_start_cell: String like "A1"
+        """
+        try:
+            from openpyxl.utils import range_boundaries
+            from copy import copy
+
+            # Parse source range
+            min_col, min_row, max_col, max_row = range_boundaries(source_range)
+
+            # Parse target start cell
+            target_min_col, target_min_row, _, _ = range_boundaries(target_start_cell)
+
+            # Calculate offsets
+            row_offset = target_min_row - min_row
+            col_offset = target_min_col - min_col
+
+            logger.info(f"  Copying {source_range} → starting at {target_start_cell}")
+
+            # Copy cells with all properties
+            for row_idx in range(min_row, max_row + 1):
+                for col_idx in range(min_col, max_col + 1):
+                    source_cell = source_sheet.cell(row=row_idx, column=col_idx)
+                    target_cell = target_sheet.cell(row=row_idx + row_offset, column=col_idx + col_offset)
+
+                    # Copy value
+                    target_cell.value = source_cell.value
+
+                    # Copy formatting
+                    if source_cell.has_style:
+                        target_cell.font = copy(source_cell.font)
+                        target_cell.border = copy(source_cell.border)
+                        target_cell.fill = copy(source_cell.fill)
+                        target_cell.number_format = copy(source_cell.number_format)
+                        target_cell.protection = copy(source_cell.protection)
+                        target_cell.alignment = copy(source_cell.alignment)
+
+            # Copy row heights
+            for row_idx in range(min_row, max_row + 1):
+                if source_sheet.row_dimensions[row_idx].height:
+                    target_sheet.row_dimensions[row_idx + row_offset].height = source_sheet.row_dimensions[row_idx].height
+
+            # Copy column widths
+            for col_idx in range(min_col, max_col + 1):
+                col_letter = openpyxl.utils.get_column_letter(col_idx)
+                target_col_letter = openpyxl.utils.get_column_letter(col_idx + col_offset)
+                if source_sheet.column_dimensions[col_letter].width:
+                    target_sheet.column_dimensions[target_col_letter].width = source_sheet.column_dimensions[col_letter].width
+
+            logger.info(f"  ✓ Copied {(max_row - min_row + 1)} rows x {(max_col - min_col + 1)} columns")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error copying cells with formatting: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    def fill_nbd_mf_04_la_sheet(self, monthly_wb):
+        """
+        Fill NBD-MF-04-LA sheet columns C-H with H column values from Week 1-5 sheets
+
+        Mapping:
+        - C5:C15 ← Week 1 H3:H13
+        - C19 ← Week 1 H14
+        - C22:C27 ← Week 1 H15:H20
+        - Same pattern for D (Week 2), E (Week 3), F (Week 4), G (Week 5), H (Week 5 duplicate)
+
+        Args:
+            monthly_wb: The workbook with Week sheets already populated
+        """
+        try:
+            logger.info("\n--- Filling NBD-MF-04-LA Sheet ---")
+
+            # Check if NBD-MF-04-LA sheet exists
+            if "NBD-MF-04-LA" not in monthly_wb.sheetnames:
+                logger.error("Sheet 'NBD-MF-04-LA' not found in monthly report")
+                logger.info(f"Available sheets: {monthly_wb.sheetnames}")
+                return False
+
+            nbd_sheet = monthly_wb["NBD-MF-04-LA"]
+
+            # Column mapping: C=Week1, D=Week2, E=Week3, F=Week4, G=Week5, H=Week5
+            week_to_column = {
+                1: 'C',  # Week 1 → Column C
+                2: 'D',  # Week 2 → Column D
+                3: 'E',  # Week 3 → Column E
+                4: 'F',  # Week 4 → Column F
+                5: 'G',  # Week 5 → Column G
+            }
+
+            # Process weeks 1-5
+            for week_num in range(1, 6):
+                week_sheet_name = f"Week {week_num}"
+
+                if week_sheet_name not in monthly_wb.sheetnames:
+                    logger.warning(f"Sheet '{week_sheet_name}' not found, skipping...")
+                    continue
+
+                week_sheet = monthly_wb[week_sheet_name]
+                dest_col = week_to_column[week_num]
+
+                logger.info(f"  Processing Week {week_num} → Column {dest_col}...")
+
+                # Copy H3:H13 to C5:C15 (11 cells)
+                for i in range(11):
+                    source_row = 3 + i  # H3 to H13
+                    dest_row = 5 + i    # C5 to C15
+                    source_value = week_sheet[f"H{source_row}"].value
+                    nbd_sheet[f"{dest_col}{dest_row}"].value = source_value
+
+                # Copy H14 to C19 (1 cell)
+                source_value = week_sheet["H14"].value
+                nbd_sheet[f"{dest_col}19"].value = source_value
+
+                # Copy H15:H20 to C22:C27 (6 cells)
+                for i in range(6):
+                    source_row = 15 + i  # H15 to H20
+                    dest_row = 22 + i    # C22 to C27
+                    source_value = week_sheet[f"H{source_row}"].value
+                    nbd_sheet[f"{dest_col}{dest_row}"].value = source_value
+
+                logger.info(f"    ✓ Week {week_num} data copied to column {dest_col}")
+
+            # Duplicate Week 5 (column G) to column H
+            logger.info("  Duplicating Week 5 data from column G to column H...")
+
+            # Copy G5:G15 to H5:H15
+            for i in range(11):
+                row_num = 5 + i
+                nbd_sheet[f"H{row_num}"].value = nbd_sheet[f"G{row_num}"].value
+
+            # Copy G19 to H19
+            nbd_sheet["H19"].value = nbd_sheet["G19"].value
+
+            # Copy G22:G27 to H22:H27
+            for i in range(6):
+                row_num = 22 + i
+                nbd_sheet[f"H{row_num}"].value = nbd_sheet[f"G{row_num}"].value
+
+            logger.info("    ✓ Column H filled with Week 5 data")
+            logger.info("✓ NBD-MF-04-LA sheet filled successfully")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error filling NBD-MF-04-LA sheet: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    def generate_monthly_report_from_5_afl_files(self):
+        """
+        Generate monthly report by copying data from 5 most recent AFL files
+        to NBD-MF-04-LA Liquid Assets file
+
+        Process:
+        1. Find 5 most recent AFL files
+        2. For each AFL file, copy NBD-WF-15-LA sheet A3:C25
+        3. Paste into NBD-MF-04-LA file Week 1, Week 2, Week 3, Week 4, Week 5 sheets
+        4. Fill NBD-MF-04-LA sheet with data from Week sheets
+        5. Save and copy to last week's folder
+
+        Returns: True if successful, False otherwise
+        """
+        monthly_wb = None
+        try:
+            logger.info("\n" + "=" * 60)
+            logger.info("MONTHLY REPORT GENERATION - THE CELL PASTING GAME")
+            logger.info("=" * 60)
+
+            # Step 1: Get 5 most recent AFL files
+            five_afl_files = self.get_5_most_recent_afl_files()
+
+            if len(five_afl_files) < 5:
+                logger.warning("Cannot generate monthly report - need 5 AFL files")
+                return False
+
+            # Determine the last week's folder (5th AFL file's folder)
+            last_afl_file = five_afl_files[-1]  # Most recent (5th file)
+            last_week_folder = last_afl_file.parent.parent  # Go up to NBD_MF_04_LA folder
+
+            logger.info(f"Last week folder: {last_week_folder.parent.name}/NBD_MF_04_LA")
+
+            # Step 2: Path to monthly report template (NEW STRUCTURE - in current working folder)
+            monthly_report_path = self.working_folder / "NBD-MF-04-LA Liquid Assets - Jul 25.xlsm"
+
+            if not monthly_report_path.exists():
+                logger.error(f"Monthly report template not found: {monthly_report_path}")
+                return False
+
+            logger.info(f"Opening monthly report template: {monthly_report_path.name}")
+
+            # Step 3: Open the monthly report file
+            monthly_wb = openpyxl.load_workbook(monthly_report_path, keep_vba=True)
+
+            week_sheets = ["Week 1", "Week 2", "Week 3", "Week 4", "Week 5"]
+
+            # Step 4: Process each of the 5 AFL files
+            for idx, afl_file_path in enumerate(five_afl_files, 1):
+                week_sheet_name = week_sheets[idx - 1]
+
+                logger.info(f"\n--- Processing AFL File #{idx} ---")
+                logger.info(f"Source: {afl_file_path.parent.parent.parent.name}/{afl_file_path.name}")
+                logger.info(f"Target: {week_sheet_name} sheet")
+
+                # Open AFL file
+                afl_wb = openpyxl.load_workbook(afl_file_path, data_only=True)
+
+                # Check if NBD-WF-15-LA sheet exists
+                if "NBD-WF-15-LA" not in afl_wb.sheetnames:
+                    logger.error(f"Sheet 'NBD-WF-15-LA' not found in {afl_file_path.name}")
+                    logger.error(f"Available sheets: {afl_wb.sheetnames}")
+                    afl_wb.close()
+                    continue
+
+                # Check if target week sheet exists
+                if week_sheet_name not in monthly_wb.sheetnames:
+                    logger.error(f"Sheet '{week_sheet_name}' not found in monthly report")
+                    logger.error(f"Available sheets: {monthly_wb.sheetnames}")
+                    afl_wb.close()
+                    continue
+
+                # Get source and target sheets
+                source_sheet = afl_wb["NBD-WF-15-LA"]
+                target_sheet = monthly_wb[week_sheet_name]
+
+                # Copy A3:C25 from source to target (starting at A1)
+                success = self.copy_cells_with_formatting(
+                    source_sheet=source_sheet,
+                    target_sheet=target_sheet,
+                    source_range="A3:C25",
+                    target_start_cell="A1"
+                )
+
+                afl_wb.close()
+
+                if success:
+                    logger.info(f"✓ Successfully copied data to {week_sheet_name}")
+                else:
+                    logger.error(f"✗ Failed to copy data to {week_sheet_name}")
+
+            # Step 5: Fill NBD-MF-04-LA sheet with weekly data
+            logger.info("\n" + "=" * 60)
+            fill_success = self.fill_nbd_mf_04_la_sheet(monthly_wb)
+            if not fill_success:
+                logger.warning("Failed to fill NBD-MF-04-LA sheet, but continuing...")
+
+            # Step 6: Save the monthly report to template location
+            logger.info(f"\nSaving monthly report to template location...")
+            monthly_wb.save(monthly_report_path)
+            logger.info(f"✓ Saved: {monthly_report_path}")
+
+            # Step 7: Copy the completed monthly report to last week's folder
+            logger.info(f"\nCopying completed monthly report to last week's folder...")
+            destination_path = last_week_folder / monthly_report_path.name
+
+            # Close workbook before copying
+            monthly_wb.close()
+            monthly_wb = None
+
+            # Copy file
+            shutil.copy2(monthly_report_path, destination_path)
+            logger.info(f"✓ Copied to: {last_week_folder.parent.name}/NBD_MF_04_LA/{destination_path.name}")
+
+            logger.info("\n" + "=" * 60)
+            logger.info("✓ MONTHLY REPORT GENERATED SUCCESSFULLY")
+            logger.info(f"✓ Template updated: {monthly_report_path}")
+            logger.info(f"✓ Copy saved to: {destination_path}")
+            logger.info("=" * 60)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error generating monthly report: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+        finally:
+            if monthly_wb is not None:
+                try:
+                    monthly_wb.close()
+                except:
+                    pass
+
     def check_and_run_monthly_report(self):
         """
-        Check if 4 AFL files exist for current month and trigger monthly report generation
+        Check if 5 AFL files exist and trigger monthly report generation
         Returns: True if monthly report was generated, False otherwise
         """
         try:
@@ -268,18 +665,18 @@ class AFLLiquidityAutomation:
             logger.info("Checking for monthly report generation...")
             logger.info("=" * 60)
 
-            afl_files = self.get_monthly_afl_files()
+            # Check if 5 or more AFL files exist
+            five_afl_files = self.get_5_most_recent_afl_files()
 
-            logger.info(f"Found {len(afl_files)} AFL file(s) for current month")
-
-            if len(afl_files) < 4:
-                logger.info(f"Need 4 AFL files for monthly report, only have {len(afl_files)}. Skipping monthly report.")
+            if len(five_afl_files) < 5:
+                logger.info(f"Only {len(five_afl_files)} AFL file(s) found. Need 5 for monthly report.")
+                logger.info("Skipping monthly report generation.")
                 return False
 
-            logger.info("✓ Found 4 or more AFL files - triggering monthly report generation")
+            logger.info("✓ Found 5 or more AFL files - triggering monthly report generation")
 
-            # Run the monthly report script
-            return self.run_monthly_report_script(afl_files)
+            # Generate the monthly report
+            return self.generate_monthly_report_from_5_afl_files()
 
         except Exception as e:
             logger.error(f"Error checking monthly report: {e}")
@@ -343,38 +740,6 @@ class AFLLiquidityAutomation:
             if str(self.base_dir / "report_automations") in sys.path:
                 sys.path.remove(str(self.base_dir / "report_automations"))
 
-    def find_afl_liquidity_file(self):
-        """
-        Find the AFL Liquidity Excel file in Inputs folder
-        Looks for pattern: "AFL Liquidity*.xlsx"
-        """
-        try:
-            # Try multiple patterns
-            patterns = [
-                "AFL Liquidity*Week*.xlsx",
-                "AFL Liquidity*.xlsx"
-            ]
-
-            files = []
-            for pattern in patterns:
-                files = list(self.output_inputs_folder.glob(pattern))
-                if files:
-                    logger.info(f"Found file(s) with pattern: {pattern}")
-                    break
-
-            if not files:
-                logger.error(f"No AFL Liquidity file found in {self.output_inputs_folder}")
-                logger.info("Searched patterns: AFL Liquidity*Week*.xlsx, AFL Liquidity*.xlsx")
-                return None
-
-            # Use the first file found
-            self.afl_liquidity_file = files[0]
-            logger.info(f"Found AFL Liquidity file: {files[0].name}")
-            return files[0]
-
-        except Exception as e:
-            logger.error(f"Error finding AFL Liquidity file: {e}")
-            return None
     
     def find_loan_schedule_file(self):
         """
@@ -1170,7 +1535,7 @@ class AFLLiquidityAutomation:
         """
         try:
             # Find all AFL Test files
-            test_files = list(self.inputs_folder.glob("AFL Test *.xlsx"))
+            test_files = list(self.output_inputs_folder.glob("AFL Test *.xlsx"))
 
             if not test_files:
                 # No test files found, start with version 1
@@ -1193,34 +1558,56 @@ class AFLLiquidityAutomation:
             logger.error(f"Error finding next test version: {e}")
             return 1
 
-    def find_latest_test_file(self):
+    def find_latest_afl_file_across_all_folders(self):
         """
-        Find the latest AFL file to use as source for next run
-        Searches in working Inputs folder
+        Find the latest AFL Liquidity file from outputs folder (completed weeks)
         Returns: Path to latest AFL file, or None if not found
         """
         try:
-            # Find all AFL Liquidity Week files
-            afl_files = list(self.output_inputs_folder.glob("AFL Liquidity - Week_*.xlsx"))
+            logger.info("Searching for latest AFL Liquidity file in outputs...")
 
-            if not afl_files:
-                logger.info("No previous AFL Liquidity files found in Inputs folder")
+            all_afl_files = []
+
+            # NEW STRUCTURE: Search in outputs folder for completed date folders
+            outputs_dir = self.base_dir / "outputs" / "NBD_MF_15_LA"
+
+            if not outputs_dir.exists():
+                logger.warning(f"Outputs directory not found: {outputs_dir}")
+                return None
+
+            # Search through all date folders in outputs directory
+            for date_folder in outputs_dir.glob("*"):
+                if not date_folder.is_dir():
+                    continue
+
+                # Find AFL Liquidity files directly in date folder (new structure)
+                afl_files = list(date_folder.glob("AFL Liquidity - Week_*.xlsx"))
+                for afl_file in afl_files:
+                    all_afl_files.append(afl_file)
+                    logger.info(f"  Found: {date_folder.name}/{afl_file.name}")
+
+            if not all_afl_files:
+                logger.info("No AFL Liquidity files found in outputs folder")
                 return None
 
             # Get the most recent file by modification time
-            latest_file = max(afl_files, key=lambda f: f.stat().st_mtime)
-            logger.info(f"Found latest AFL file: {latest_file.name}")
+            latest_file = max(all_afl_files, key=lambda f: f.stat().st_mtime)
+            logger.info(f"✓ Latest AFL file: {latest_file.parent.name}/{latest_file.name}")
+            logger.info(f"  Modified: {datetime.fromtimestamp(latest_file.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
             return latest_file
 
         except Exception as e:
             logger.error(f"Error finding latest AFL file: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
     def create_afl_test_copy(self):
         """
         Create a new versioned AFL file from the currently updated working file.
         The working file (which was just updated) becomes the source for the new AFL file.
-        Saves to working Inputs folder and updates date cells inside the file.
+        Saves to the versioned output Inputs folder (e.g., 07-13-2025/NBD_MF_04_LA/Inputs or 07-13-2025(2)/NBD_MF_04_LA/Inputs)
+        and updates date cells inside the file.
         """
         wb = None
         try:
@@ -1323,12 +1710,29 @@ class AFLLiquidityAutomation:
     def run_tb_bot(self):
         """
         Run the TB from ERP bot to download TB-COA file
+        Retries indefinitely until the file is successfully downloaded
         Returns: True if successful, False otherwise
         """
         try:
             logger.info("\n" + "=" * 60)
             logger.info("Running TB from ERP Bot...")
             logger.info("=" * 60)
+
+            # Clean up old TB files before downloading (pattern: YYYY_MM_DD_HH_MM_Report.xlsx)
+            logger.info(f"Cleaning up old TB files in {self.input_folder}...")
+            try:
+                old_tb_files = list(self.input_folder.glob("*_*_*_*_*_Report.xlsx"))
+                for old_file in old_tb_files:
+                    try:
+                        old_file.unlink()
+                        logger.info(f"✓ Removed old TB file: {old_file.name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove {old_file.name}: {e}")
+
+                if not old_tb_files:
+                    logger.info("No old TB files found to clean up")
+            except Exception as e:
+                logger.warning(f"Failed to clean up old TB files: {e}")
 
             bot_script = self.bots_folder / "tb_from_erp_bot.py"
 
@@ -1357,23 +1761,35 @@ class AFLLiquidityAutomation:
                 # Format report date for bot (DD/MM/YYYY)
                 report_date = self.report_date.strftime('%d/%m/%Y')
 
-                # Create bot instance with Input folder as download location
-                bot = ERPLoginBot(download_folder=str(self.input_folder))
+                # Retry loop - keep trying until TB-COA file is downloaded
+                retry_count = 0
+                while True:
+                    retry_count += 1
+                    logger.info(f"\nAttempt #{retry_count} to download TB-COA file...")
 
-                # Run bot automation
-                success = bot.run_full_automation(ENC_USERNAME, ENC_PASSWORD, report_date)
+                    # Create bot instance with Input folder as download location
+                    bot = ERPLoginBot(download_folder=str(self.input_folder))
 
-                # Clean up
-                bot.close_browser()
+                    # Run bot automation
+                    success = bot.run_full_automation(ENC_USERNAME, ENC_PASSWORD, report_date)
 
-                if success:
-                    logger.info("✓ TB bot completed successfully")
-                    # Wait a bit for file to be fully written
-                    time.sleep(2)
-                    return True
-                else:
-                    logger.error("TB bot failed")
-                    return False
+                    # Clean up
+                    bot.close_browser()
+
+                    if success:
+                        logger.info("✓ TB bot completed successfully")
+
+                        # Verify TB-COA file actually exists
+                        tb_file = self.find_tb_coa_file()
+                        if tb_file:
+                            logger.info(f"✓ TB-COA file confirmed downloaded: {tb_file.name}")
+                            return True
+                        else:
+                            logger.warning("TB bot reported success but file not found. Retrying immediately...")
+                            continue
+                    else:
+                        logger.warning(f"TB bot failed on attempt #{retry_count}. Retrying immediately...")
+                        continue
 
             except ImportError as e:
                 logger.error(f"Failed to import TB bot: {e}")
@@ -1439,34 +1855,38 @@ class AFLLiquidityAutomation:
     def determine_working_file(self):
         """
         Determine which file to work on:
-        - If AFL files exist in Inputs folder, copy latest to working temp location and use it
-        - Otherwise, find template in working/Inputs folder
-        Always works in a temporary location and reads master data from working/Input
+        - Search ALL folders for latest AFL Liquidity file (by modification time)
+        - If found, copy it to temp working location
+        - If not found, use the starting template from FIXED folder (07-06-2025/NBD_MF_04_LA/Inputs/AFL Liquidity - Week_27.xlsx)
+        Always reads master data from FIXED Input folder (07-06-2025/NBD_MF_04_LA/Input)
         """
         try:
-            latest_afl = self.find_latest_test_file()
+            # Search across ALL folders for the latest AFL file
+            latest_afl = self.find_latest_afl_file_across_all_folders()
 
             if latest_afl:
-                # Copy latest AFL to temp working location for modifications
-                temp_working_file = self.working_nbd_folder / f"temp_{latest_afl.name}"
+                # Copy latest AFL to temp working location for modifications (NEW STRUCTURE)
+                temp_working_file = self.working_folder / f"temp_{latest_afl.name}"
                 shutil.copy2(latest_afl, temp_working_file)
                 self.working_file = temp_working_file
-                logger.info(f"Working file: copied {latest_afl.name} to working folder")
+                logger.info(f"✓ Working file: Using latest AFL from {latest_afl.parent.name}")
+                logger.info(f"  Copied {latest_afl.name} to working folder")
             else:
-                # First run - look for AFL template in working/Inputs folder (with 's')
-                working_inputs_folder = self.working_nbd_folder / "Inputs"
-                template_files = list(working_inputs_folder.glob("AFL Liquidity*.xlsx"))
+                # First run - look for starting template in current working folder (NEW STRUCTURE)
+                # Template should be in working/NBD_MF_15_LA/{DD-MM-YYYY}/ (copied from outputs by app.py)
+                starting_template = self.working_folder / "AFL Liquidity - Week_27.xlsx"
 
-                if not template_files:
-                    logger.error(f"No AFL Liquidity template found in {working_inputs_folder}")
-                    logger.info(f"Please place AFL Liquidity.xlsx template in {working_inputs_folder}")
+                if not starting_template.exists():
+                    logger.error(f"Starting template not found: {starting_template}")
+                    logger.info(f"Please place 'AFL Liquidity - Week_27.xlsx' in {self.working_folder}")
                     return None
 
-                template = template_files[0]
-                temp_working_file = self.working_nbd_folder / f"temp_{template.name}"
-                shutil.copy2(template, temp_working_file)
+                # Copy template to temp working location
+                temp_working_file = self.working_folder / f"temp_{starting_template.name}"
+                shutil.copy2(starting_template, temp_working_file)
                 self.working_file = temp_working_file
-                logger.info(f"Working file: using template {template.name} from {working_inputs_folder} (first run)")
+                logger.info(f"✓ Working file: Using starting template (first run)")
+                logger.info(f"  Copied {starting_template.name} from {self.working_folder}")
 
             return self.working_file
 
@@ -1569,7 +1989,7 @@ class AFLLiquidityAutomation:
 
             # Create exceptions report filename
             exceptions_filename = f"AFL Liquidity - week {week_number} - Exceptions.xlsx"
-            exceptions_path = self.inputs_folder / exceptions_filename
+            exceptions_path = self.output_inputs_folder / exceptions_filename
 
             logger.info(f"Creating exceptions report: {exceptions_filename}")
 
@@ -1635,13 +2055,15 @@ class AFLLiquidityAutomation:
         try:
             # Step 0: Run Selenium bots if enabled
             if self.run_bots:
-                # Run TB from ERP bot first
+                # Run TB from ERP bot first - CRITICAL: Will retry until successful
                 logger.info("\nStep 0a: Running TB from ERP Bot...")
+                logger.info("NOTE: TB download will retry indefinitely until successful")
                 tb_bot_success = self.run_tb_bot()
 
                 if not tb_bot_success:
-                    logger.warning("TB bot failed, but continuing with automation...")
-                    # Don't return False here - continue with existing files
+                    logger.error("TB bot failed to download TB-COA file after retries")
+                    logger.error("Cannot proceed without TB-COA file. Stopping automation.")
+                    return False
 
                 # Run M2M from SASIA bot
                 logger.info("\nStep 0b: Running M2M from SASIA Bot...")
@@ -1649,7 +2071,7 @@ class AFLLiquidityAutomation:
 
                 if not m2m_bot_success:
                     logger.warning("M2M bot failed, but continuing with automation...")
-                    # Don't return False here - continue with existing files
+                    # Don't return False here - M2M is optional
             else:
                 logger.info("\nBot execution disabled - skipping Selenium automation")
 
@@ -1692,7 +2114,7 @@ class AFLLiquidityAutomation:
 
             # Step 1.5: Determine which file to work on (latest AFL or template from working folder)
             logger.info("\nStep 1.5: Determining working file...")
-            logger.info(f"  - Will look for AFL template in: {self.working_nbd_folder / 'Inputs'}")
+            logger.info(f"  - Will look for NBD-MF-04-LA template in working folder: {self.working_folder}")
             working_file = self.determine_working_file()
 
             if not working_file:

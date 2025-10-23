@@ -3,13 +3,13 @@
 Monthly Liquidity Report Automation Script
 Central Bank Sri Lanka - NBD_MF_04_LA
 
-This script generates the monthly liquidity report by consolidating data from 4-5 weekly AFL files.
+This script generates the monthly liquidity report by consolidating data from 5 weekly AFL files.
 
 USAGE:
-    Called automatically by NBD_MF_15_LA.py when 4 weekly AFL files exist
+    Called automatically by NBD_MF_15_LA.py when 5 weekly AFL files exist
 
 WORKFLOW:
-1. Find all 4-5 weekly AFL Liquidity files for the current month
+1. Find all 5 weekly AFL Liquidity files for the current month
 2. Extract A3:C25 range from NBD-WF-15-LA sheet from each weekly file
 3. Copy data with formatting to respective Week 1-5 sheets (A1:H22 area)
 4. For Week 5, use Week 4 data if Week 5 file doesn't exist
@@ -17,8 +17,9 @@ WORKFLOW:
 6. Save the monthly report with date-based filename
 
 FOLDER STRUCTURE:
-- working/NBD_MF_04_LA/<date-folder>/Inputs/ - Contains weekly AFL files
-- working/NBD_MF_04_LA/<date-folder>/ - Output location for monthly report
+- working/weekly/07-06-2025/NBD_MF_04_LA/ - Template location (FIXED)
+- working/weekly/{MM-DD-YYYY}/NBD_MF_04_LA/Inputs/ - Contains weekly AFL files (DYNAMIC)
+- working/monthly/{MM}/{DD}/{YYYY}/ - Output location for monthly report (month-end date)
 
 COLUMN MAPPING FOR NBD_WF_04_LA SHEET:
 - C5:C15 ← Week 1 H3:H13
@@ -30,6 +31,7 @@ COLUMN MAPPING FOR NBD_WF_04_LA SHEET:
 import os
 import sys
 from datetime import datetime
+import calendar
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -63,33 +65,25 @@ class MonthlyLiquidityReport:
         self.report_date = report_date
         self.afl_files = afl_files or []
 
-        # Determine output folder using new structure: working/NBD_MF_04_LA/<date>/
-        if self.afl_files:
-            # Sort by date and get the latest
-            sorted_files = sorted(self.afl_files, key=lambda x: x[2], reverse=True)
-            latest_date = sorted_files[0][2]
-            self.date_folder_name = latest_date.strftime("%m-%d-%Y")
+        # Calculate month-end date for the report month
+        year = self.report_date.year
+        month = self.report_date.month
+        last_day = calendar.monthrange(year, month)[1]  # Get last day of month (28-31)
+        self.month_end_date = self.report_date.replace(day=last_day)
 
-            # New structure: working/NBD_MF_04_LA/<date>/
-            report_path = self.base_dir / "working" / "NBD_MF_04_LA"
+        # Determine output folder: working/monthly/{MM}/{DD}/{YYYY}
+        month_str = f"{self.month_end_date.month:02d}"
+        day_str = f"{self.month_end_date.day:02d}"
+        year_str = f"{self.month_end_date.year}"
+        self.output_folder = self.base_dir / "working" / "monthly" / month_str / day_str / year_str
 
-            # Find the single date folder inside NBD_MF_04_LA
-            if report_path.exists():
-                date_folders = [f for f in report_path.iterdir() if f.is_dir()]
-                if date_folders:
-                    if len(date_folders) > 1:
-                        logger.warning(f"Multiple date folders found: {[f.name for f in date_folders]}. Using the first one: {date_folders[0].name}")
-                    self.output_folder = date_folders[0]
-                else:
-                    logger.error(f"No date folder found inside '{report_path}' directory.")
-                    self.output_folder = None
-            else:
-                logger.error(f"Report path not found: {report_path}")
-                self.output_folder = None
-        else:
-            self.output_folder = None
+        # Template location (FIXED folder)
+        self.template_folder = self.base_dir / "working" / "weekly" / "07-06-2025" / "NBD_MF_04_LA"
 
         logger.info(f"Initialized Monthly Liquidity Report for {self.report_date.strftime('%B %Y')}")
+        logger.info(f"Month-end date: {self.month_end_date.strftime('%m/%d/%Y')}")
+        logger.info(f"Template folder: {self.template_folder}")
+        logger.info(f"Output folder: {self.output_folder}")
         logger.info(f"Found {len(self.afl_files)} weekly AFL files")
         for week_num, file_path, file_date in self.afl_files:
             logger.info(f"  Week {week_num}: {file_path.name} ({file_date.strftime('%m/%d/%Y')})")
@@ -186,32 +180,22 @@ class MonthlyLiquidityReport:
 
     def find_monthly_template(self):
         """
-        Find the NBD-MF-04-LA monthly template file
+        Find the NBD-MF-04-LA monthly template file in FIXED folder (07-06-2025)
 
         Returns:
             Path to template file, or None if not found
         """
         try:
-            # Look for template in multiple locations
-            search_paths = [
-                self.base_dir / "templates" / "NBD-MF-04-LA*.xlsx",
-                self.base_dir / "working" / "templates" / "NBD-MF-04-LA*.xlsx",
-                self.output_folder / "NBD-MF-04-LA*.xlsx"
-            ]
+            # Look for template in FIXED folder
+            template_files = list(self.template_folder.glob("NBD-MF-04-LA*.xlsx"))
 
-            for search_path in search_paths:
-                if search_path.parent.exists():
-                    files = list(search_path.parent.glob(search_path.name))
-                    if files:
-                        logger.info(f"Found monthly template: {files[0]}")
-                        return files[0]
+            if not template_files:
+                logger.error(f"Monthly template NBD-MF-04-LA not found in {self.template_folder}")
+                return None
 
-            logger.error("Monthly template NBD-MF-04-LA not found")
-            logger.info("Searched locations:")
-            for path in search_paths:
-                logger.info(f"  - {path}")
-
-            return None
+            template_file = template_files[0]
+            logger.info(f"Found monthly template: {template_file.name}")
+            return template_file
 
         except Exception as e:
             logger.error(f"Error finding monthly template: {e}")
@@ -321,9 +305,9 @@ class MonthlyLiquidityReport:
             logger.info("GENERATING MONTHLY LIQUIDITY REPORT")
             logger.info("=" * 60)
 
-            # Validate we have at least 4 weekly files
-            if len(self.afl_files) < 4:
-                logger.error(f"Need at least 4 weekly files, only have {len(self.afl_files)}")
+            # Validate we have at least 5 weekly files
+            if len(self.afl_files) < 5:
+                logger.error(f"Need at least 5 weekly files, only have {len(self.afl_files)}")
                 return False
 
             # Find monthly template
@@ -336,6 +320,11 @@ class MonthlyLiquidityReport:
             month_name = self.report_date.strftime("%B")  # e.g., "July"
             year = self.report_date.strftime("%Y")  # e.g., "2025"
             output_filename = f"NBD-MF-04-LA Liquid Assets - {month_name} {year}.xlsx"
+
+            # Create output folder if it doesn't exist
+            self.output_folder.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Output folder: {self.output_folder}")
+
             output_path = self.output_folder / output_filename
 
             # Copy template to output location
